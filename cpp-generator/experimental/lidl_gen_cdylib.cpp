@@ -29,13 +29,48 @@ bool typeSupported(const TypeExpr& te, bool isReturn)
     }
     if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
         const TypeExpr& e = te.elements[0];
+        // `bstr` elements are the one array kind that cannot ride nlohmann's
+        // blanket get<>(): each element is the tagged {"_bytes": base64url}
+        // OBJECT, not a number array, so it needs the emitted per-element
+        // codec (lidlBytesListFromJson / lidlBytesListToJson) below.
         return e.kind == TypeExpr::Primitive
             && (e.name == "tstr" || e.name == "int" || e.name == "uint"
-                || e.name == "float64" || e.name == "bool" || e.name == "any");
+                || e.name == "float64" || e.name == "bool" || e.name == "any"
+                || e.name == "bstr");
     }
     // Maps ({k: v}, i.e. LogosMap) round-trip through nlohmann too.
     if (te.kind == TypeExpr::Map)
         return true;
+    return false;
+}
+
+// `[bstr]` — an array of byte strings (std::vector<std::vector<uint8_t>>).
+// Every place scalar `bstr` needs the tagged-bytes codec, this needs the list
+// form of it, so the check lives in one place.
+bool isBytesArray(const TypeExpr& te)
+{
+    return te.kind == TypeExpr::Array && te.elements.size() == 1
+        && te.elements[0].kind == TypeExpr::Primitive
+        && te.elements[0].name == "bstr";
+}
+
+// True when the module mentions `[bstr]` anywhere the emitted TU has to encode
+// or decode it — method params, method returns, or event payloads. Gates the
+// list codec so modules that never use it don't carry an unused static function
+// (the same reason hasBytesEventParam() gates the scalar encoder).
+bool usesBytesArray(const ModuleDecl& module)
+{
+    for (const MethodDecl& md : module.methods) {
+        if (isBytesArray(md.returnType))
+            return true;
+        for (const ParamDecl& pd : md.params)
+            if (isBytesArray(pd.type))
+                return true;
+    }
+    for (const EventDecl& ed : module.events)
+        for (const ParamDecl& pd : ed.params)
+            if (isBytesArray(pd.type))
+                return true;
     return false;
 }
 
@@ -56,6 +91,12 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr)
         if (te.name == "bool")    return expr + ".get<bool>()";
     }
     if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
+        // `[bstr]` cannot go through get<std::vector<std::vector<uint8_t>>>():
+        // its elements arrive as tagged {"_bytes": …} objects, which nlohmann
+        // would refuse (and a raw number-array element would silently bypass
+        // the base64 decode). Route it through the per-element codec instead.
+        if (isBytesArray(te))
+            return "lidlBytesListFromJson(" + expr + ")";
         // Qt-free spelling: `[any]` must decode as LogosList, NOT QVariantList
         // (lidlTypeToStd's Qt fallback), which is undeclared in this TU. Typed
         // scalar arrays ([tstr]/[int]/…) are unaffected — Cdylib defers to the
@@ -82,6 +123,10 @@ QString stdReturnToJson(const MethodDecl& md, const QString& var)
         if (te.name == "bstr") return "lidlBytesToJson(" + var + ")";
         return "nlohmann::json(" + var + ")";
     }
+    // `[bstr]`: nlohmann::json(std::vector<std::vector<uint8_t>>) would emit
+    // nested number arrays, which no consumer decodes as bytes. Tag each element.
+    if (isBytesArray(te))
+        return "lidlBytesListToJson(" + var + ")";
     return "nlohmann::json(" + var + ")";
 }
 
@@ -112,7 +157,19 @@ bool hasBytesEventParam(const ModuleDecl& module)
 {
     for (const EventDecl& ed : module.events)
         for (const ParamDecl& pd : ed.params)
-            if (pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
+            if ((pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
+                || isBytesArray(pd.type))
+                return true;
+    return false;
+}
+
+// True when an EVENT carries `[bstr]`, so the sidecar needs the list encoder on
+// top of the scalar one. Method params/returns are handled in the impl TU.
+bool hasBytesArrayEventParam(const ModuleDecl& module)
+{
+    for (const EventDecl& ed : module.events)
+        for (const ParamDecl& pd : ed.params)
+            if (isBytesArray(pd.type))
                 return true;
     return false;
 }
@@ -130,7 +187,10 @@ bool hasJsonEventParam(const ModuleDecl& module)
     return false;
 }
 
-void emitBytesEncodeHelpers(QTextStream& s)
+// `withList` additionally emits lidlBytesListToJson for `[bstr]`. Off by
+// default so a module that never carries a byte-string array does not gain an
+// unused static function.
+void emitBytesEncodeHelpers(QTextStream& s, bool withList = false)
 {
     s << "// Canonical tagged bytes form {\"_bytes\": base64url} (see logos_protocol.h)\n";
     s << "std::string lidlB64UrlEncode(const std::vector<uint8_t>& bytes)\n{\n";
@@ -151,6 +211,14 @@ void emitBytesEncodeHelpers(QTextStream& s)
 
     s << "nlohmann::json lidlBytesToJson(const std::vector<uint8_t>& bytes)\n{\n";
     s << "    return nlohmann::json{{\"_bytes\", lidlB64UrlEncode(bytes)}};\n}\n\n";
+
+    if (withList) {
+        s << "nlohmann::json lidlBytesListToJson(const std::vector<std::vector<uint8_t>>& list)\n{\n";
+        s << "    nlohmann::json out = nlohmann::json::array();\n";
+        s << "    for (const std::vector<uint8_t>& bytes : list)\n";
+        s << "        out.push_back(lidlBytesToJson(bytes));\n";
+        s << "    return out;\n}\n\n";
+    }
 }
 
 void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
@@ -305,7 +373,8 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    if (out) std::memcpy(out, str.data(), str.size() + 1);\n";
     s << "    return out;\n}\n\n";
 
-    emitBytesEncodeHelpers(s);
+    const bool bytesList = usesBytesArray(module);
+    emitBytesEncodeHelpers(s, bytesList);
 
     s << "int lidlB64Idx(char ch)\n{\n";
     s << "    if (ch >= 'A' && ch <= 'Z') return ch - 'A';\n";
@@ -361,6 +430,21 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "            n |= uint32_t(c2) << 6;\n";
     s << "            out.push_back((n >> 8) & 0xff);\n";
     s << "        }\n    }\n    return out;\n}\n\n";
+
+    if (bytesList) {
+        s << "std::vector<std::vector<uint8_t>> lidlBytesListFromJson(const nlohmann::json& j)\n{\n";
+        s << "    std::vector<std::vector<uint8_t>> out;\n";
+        s << "    // Each element runs through the lenient scalar decode above, so a\n";
+        s << "    // caller may send tagged {\"_bytes\": base64url} objects, plain\n";
+        s << "    // strings or number arrays — element by element. A non-array arg\n";
+        s << "    // yields an empty list rather than throwing, matching the scalar\n";
+        s << "    // decoder's behaviour on an unexpected shape.\n";
+        s << "    if (!j.is_array()) return out;\n";
+        s << "    out.reserve(j.size());\n";
+        s << "    for (const auto& e : j)\n";
+        s << "        out.push_back(lidlBytesFromJson(e));\n";
+        s << "    return out;\n}\n\n";
+    }
 
     s << "nlohmann::json lidlResultToJson(const StdLogosResult& r)\n{\n";
     s << "    nlohmann::json obj;\n";
@@ -548,7 +632,7 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
     // encoder; emitting it everywhere would leave it unused (and warned about).
     if (hasBytesEventParam(module)) {
         s << "namespace {\n\n";
-        emitBytesEncodeHelpers(s);
+        emitBytesEncodeHelpers(s, hasBytesArrayEventParam(module));
         s << "} // namespace\n\n";
     }
 
@@ -570,6 +654,8 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
         for (const ParamDecl& pd : ed.params) {
             if (pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
                 s << "    args.push_back(lidlBytesToJson(" << pd.name << "));\n";
+            else if (isBytesArray(pd.type))
+                s << "    args.push_back(lidlBytesListToJson(" << pd.name << "));\n";
             else
                 s << "    args.push_back(" << pd.name << ");\n";
         }
