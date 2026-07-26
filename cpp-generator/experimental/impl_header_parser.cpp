@@ -67,9 +67,10 @@ static TypeExpr cppTypeToLidl(const QString& raw)
         }
         // std::vector<std::vector<uint8_t>> — an array of byte strings. Spelled
         // out so it lands on `[bstr]` rather than the opaque `any` fallback
-        // below: `any` would make the cdylib gate admit it and then emit a bare
-        // QVariant into the Qt-free TU. As `[bstr]` the gate rejects it with a
-        // message naming the offending parameter.
+        // below, which would emit a bare QVariant into the Qt-free TU. As
+        // `[bstr]` it goes through the cdylib list codec
+        // (lidlBytesListFromJson / lidlBytesListToJson), so each element keeps
+        // the canonical tagged {"_bytes": base64url} form on the wire.
         if (inner == "std::vector<uint8_t>") {
             TypeExpr elem = { TypeExpr::Primitive, "bstr", {} };
             return { TypeExpr::Array, "", { elem } };

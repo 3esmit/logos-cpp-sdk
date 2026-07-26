@@ -44,6 +44,29 @@ QString eventsSourceFor(const ModuleDecl& m)
     return lidlMakeEventsSourceCdylib(m, "DeliveryModuleImpl", "delivery_module_plugin.h");
 }
 
+MethodDecl method(const char* name, const TypeExpr& returnType,
+                  const std::vector<ParamDecl>& params)
+{
+    MethodDecl md;
+    md.name = name;
+    md.returnType = returnType;
+    md.params = params;
+    return md;
+}
+
+ModuleDecl moduleWithMethod(const MethodDecl& md)
+{
+    ModuleDecl m;
+    m.name = "delivery_module";
+    m.methods.push_back(md);
+    return m;
+}
+
+QString implSourceFor(const ModuleDecl& m)
+{
+    return lidlMakeModuleImplExports(m, "DeliveryModuleImpl", "delivery_module_plugin.h");
+}
+
 } // namespace
 
 // logos-cpp-sdk#99: `payload` was replaced by an empty tagged value, so a module
@@ -118,19 +141,84 @@ TEST(LidlGenCdylib, JsonEventPayloadIsQtFree)
     EXPECT_FALSE(source.contains("QVariant"));
 }
 
-// An array of byte strings is outside the cdylib-supported subset. It must be
-// rejected by name at generation time rather than admitted and then emitted as
-// a QVariant that fails to compile.
-TEST(LidlGenCdylib, ArrayOfBytesEventParamIsRejected)
+// `[bstr]` is in the supported subset: each element carries the canonical tagged
+// form, so a module can take or return a list of blobs (e.g. a program plus its
+// dependency ELFs) instead of hand-encoding them as hex strings.
+TEST(LidlGenCdylib, ArrayOfBytesEventParamIsEligibleAndTagsEachElement)
 {
     const ModuleDecl m = moduleWithEvent("batchReceived", {
         param("payloads", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
     });
 
     QString error;
-    EXPECT_FALSE(lidlCdylibSupported(m, &error));
-    EXPECT_TRUE(error.contains("batchReceived"));
-    EXPECT_TRUE(error.contains("payloads"));
+    EXPECT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = eventsSourceFor(m);
+
+    // Each element is tagged, not emitted as a nested number array — which is
+    // what nlohmann::json(std::vector<std::vector<uint8_t>>) would have produced
+    // and no consumer decodes as bytes.
+    EXPECT_TRUE(source.contains("args.push_back(lidlBytesListToJson(payloads));"));
+    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesListToJson"));
+    EXPECT_TRUE(source.contains("out.push_back(lidlBytesToJson(bytes));"));
+
+    // Qt-free, and taken by const-ref like the other composite payloads.
+    EXPECT_TRUE(source.contains("const std::vector<std::vector<uint8_t>>& payloads"));
+    EXPECT_FALSE(source.contains("QVariant"));
+}
+
+// The method path: a `[bstr]` parameter must be DECODED per element, never via
+// nlohmann's blanket get<>(). get<std::vector<std::vector<uint8_t>>>() throws on
+// the tagged {"_bytes": …} object form, and would silently skip the base64
+// decode for a number-array element.
+TEST(LidlGenCdylib, ArrayOfBytesMethodParamDecodesPerElement)
+{
+    const ModuleDecl m = moduleWithMethod(method("send", prim("tstr"), {
+        param("program_elf",          prim("bstr")),
+        param("program_dependencies", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
+    }));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = implSourceFor(m);
+
+    EXPECT_TRUE(source.contains("lidlBytesListFromJson("));
+    EXPECT_TRUE(source.contains("std::vector<std::vector<uint8_t>> lidlBytesListFromJson"));
+    EXPECT_TRUE(source.contains("out.push_back(lidlBytesFromJson(e));"));
+    // The scalar param still uses the scalar decoder.
+    EXPECT_TRUE(source.contains("lidlBytesFromJson("));
+    // The blanket container decode must not be used for this type.
+    EXPECT_FALSE(source.contains(".get<std::vector<std::vector<uint8_t>>>()"));
+}
+
+// The return path: nlohmann::json(std::vector<std::vector<uint8_t>>) would emit
+// nested number arrays, which no consumer decodes as bytes.
+TEST(LidlGenCdylib, ArrayOfBytesReturnTagsEachElement)
+{
+    const ModuleDecl m = moduleWithMethod(
+        method("dependencies", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}, {}));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = implSourceFor(m);
+    EXPECT_TRUE(source.contains("lidlBytesListToJson("));
+    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesListToJson"));
+}
+
+// The list encoder is gated the same way the scalar one is: a module whose
+// events carry only a single blob must not gain an unused static function.
+TEST(LidlGenCdylib, BytesListEncoderOmittedWhenNoEventCarriesAnArray)
+{
+    const ModuleDecl m = moduleWithEvent("messageReceived", {
+        param("payload", prim("bstr")),
+    });
+
+    const QString source = eventsSourceFor(m);
+
+    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesToJson"));
+    EXPECT_FALSE(source.contains("lidlBytesListToJson"));
 }
 
 // The supported scalar / bytes payloads stay eligible.
