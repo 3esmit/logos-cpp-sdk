@@ -286,3 +286,54 @@ TEST(LidlGenCdylib, TooFewArgumentsReportsInvalidArgs)
     EXPECT_TRUE(source.contains("expected 2 arguments, got"));
     EXPECT_FALSE(source.contains("if (args.size() < 2) return nullptr;"));
 }
+
+// Records: a module declares a struct in its impl header and uses it like any
+// other type. LIDL has carried TypeDecl all along; this is the impl-header path
+// producing one, so an author writes a real shape instead of an untyped LogosMap.
+TEST(LidlGenCdylib, DeclaredRecordIsSupportedAndGetsACodec)
+{
+    ModuleDecl m;
+    m.name = "info_module";
+
+    TypeDecl rec;
+    rec.name = "Status";
+    FieldDecl a; a.name = "port"; a.type = prim("uint");
+    FieldDecl b; b.name = "blob"; b.type = prim("bstr");
+    rec.fields = {a, b};
+    m.types.push_back(rec);
+
+    // Used as a param, as a return, and nested in a container.
+    m.methods.push_back(method("setStatus", prim("bool"), {
+        param("s", TypeExpr{TypeExpr::Named, "Status", {}}),
+    }));
+    m.methods.push_back(method("all", TypeExpr{TypeExpr::Array, "", {TypeExpr{TypeExpr::Named, "Status", {}}}}, {}));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = lidlMakeModuleImplExports(m, "InfoImpl", "info_impl.h");
+
+    // A codec specialisation, addressing fields through decltype rather than
+    // spelling their C++ types.
+    EXPECT_TRUE(source.contains("struct Codec<Status, void>"));
+    EXPECT_TRUE(source.contains("decltype(v.port)"));
+    EXPECT_TRUE(source.contains("decltype(out.blob)"));
+    // A missing field decodes as null so the leaf codec reports the field path.
+    EXPECT_TRUE(source.contains("j.contains(\"port\")"));
+    EXPECT_TRUE(source.contains(".port"));
+    // Nothing extra is emitted for the [Status] return — the existing recursion
+    // in logos_codec.h handles it.
+    EXPECT_TRUE(source.contains("logos::toJson(result)"));
+}
+
+// An UNDECLARED name is still a build error naming the type: records are opt-in,
+// not a reopening of the old opaque fallback.
+TEST(LidlGenCdylib, UndeclaredNamedTypeIsStillRejected)
+{
+    const ModuleDecl m = moduleWithMethod(method("f", prim("tstr"), {
+        param("s", TypeExpr{TypeExpr::Named, "NotDeclared", {}}),
+    }));
+    QString error;
+    EXPECT_FALSE(lidlCdylibSupported(m, &error));
+    EXPECT_TRUE(error.contains("NotDeclared")) << error.toStdString();
+}

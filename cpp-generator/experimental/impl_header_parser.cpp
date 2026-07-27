@@ -365,6 +365,10 @@ ImplParseResult parseImplHeader(const QString& headerPath,
     QStringList pendingDoc;
     bool inBlockComment = false;
 
+    // Record being accumulated (see LookingForClass below).
+    TypeDecl record;
+    bool inRecord = false;
+
     QRegularExpression classRe("\\bclass\\s+" + QRegularExpression::escape(className) + "\\b");
     QRegularExpression accessRe("^\\s*(public|private|protected)\\s*:");
     QRegularExpression eventsRe("^\\s*logos_events\\s*:");
@@ -375,6 +379,41 @@ ImplParseResult parseImplHeader(const QString& headerPath,
 
         switch (state) {
         case LookingForClass:
+            // A plain `struct Foo { T a; U b; };` ahead of the impl class is a
+            // RECORD: a named wire shape the module's methods can take and
+            // return. LIDL has carried TypeDecl/FieldDecl all along (chat_module
+            // declares records in a hand-written .lidl) — this is the
+            // impl-header path finally producing them, so an author writes a
+            // struct instead of an untyped LogosMap.
+            if (inRecord) {
+                if (line.startsWith("}")) {
+                    if (!record.fields.empty())
+                        result.module.types.push_back(record);
+                    inRecord = false;
+                } else {
+                    static QRegularExpression fieldRe(
+                        "^([A-Za-z_][A-Za-z0-9_:<>,\\s\\*&]*?)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;$");
+                    const QRegularExpressionMatch fm = fieldRe.match(line);
+                    if (fm.hasMatch()) {
+                        FieldDecl f;
+                        f.name = fm.captured(2).toStdString();
+                        f.type = cppTypeToLidl(fm.captured(1).trimmed());
+                        record.fields.push_back(f);
+                    }
+                }
+                break;
+            }
+            {
+                static QRegularExpression recordRe(
+                    "^struct\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\{\\s*$");
+                const QRegularExpressionMatch rm = recordRe.match(line);
+                if (rm.hasMatch()) {
+                    record = TypeDecl();
+                    record.name = rm.captured(1).toStdString();
+                    inRecord = true;
+                    break;
+                }
+            }
             if (classRe.match(line).hasMatch()) {
                 state = InClass;
                 for (QChar c : line) {

@@ -13,8 +13,18 @@ namespace {
 // The cdylib-supported subset: std-convertible LIDL types only — the same
 // Qt-free set the std apiStyle handled, so any universal module that built
 // under std also builds as a header-first cdylib.
+// Records declared by the module, so a Named type can be resolved. Set for the
+// duration of lidlCdylibSupported / the emitters — the alternative is threading
+// the module through typeSupported's several recursive call sites.
+QSet<QString> g_declaredRecords;
+
 bool typeSupported(const TypeExpr& te, bool isReturn)
 {
+    // A record the module declares is a first-class type: the generated codec
+    // specialisation below encodes it, and because that plugs into
+    // logos::detail::Codec, records compose inside [T] and {tstr: T} for free.
+    if (te.kind == TypeExpr::Named && g_declaredRecords.contains(qs(te.name)))
+        return true;
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "tstr" || te.name == "bstr" || te.name == "int"
             || te.name == "uint" || te.name == "float64" || te.name == "bool")
@@ -211,6 +221,9 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
 
 bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
 {
+    g_declaredRecords.clear();
+    for (const TypeDecl& t : module.types)
+        g_declaredRecords.insert(qs(t.name));
     for (const MethodDecl& md : module.methods) {
         for (const ParamDecl& pd : md.params) {
             if (!typeSupported(pd.type, /*isReturn=*/false)) {
@@ -310,6 +323,41 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    obj[\"value\"] = r.value;\n";
     s << "    obj[\"error\"] = r.error.empty() ? nlohmann::json() : nlohmann::json(r.error);\n";
     s << "    return obj;\n}\n\n";
+
+    // One Codec specialisation per declared record. Fields are addressed through
+    // decltype, so no C++ type name has to be spelled — the same trick JsonArg
+    // uses — and because these plug into logos::detail::Codec, a record nested in
+    // [T] or {tstr: T} is handled by the existing recursion with nothing further
+    // emitted. A missing field decodes as null, which the leaf codec then rejects
+    // with the field's path.
+    if (!module.types.empty()) {
+        s << "} // namespace\n\n";
+        s << "namespace logos { namespace detail {\n\n";
+        for (const TypeDecl& t : module.types) {
+            const QString n = qs(t.name);
+            s << "template <> struct Codec<" << n << ", void> {\n";
+            s << "    static nlohmann::json to(const " << n << "& v)\n    {\n";
+            s << "        nlohmann::json o = nlohmann::json::object();\n";
+            for (const FieldDecl& f : t.fields) {
+                const QString fn = qs(f.name);
+                s << "        o[\"" << fn << "\"] = Codec<std::decay_t<decltype(v." << fn
+                  << ")>>::to(v." << fn << ");\n";
+            }
+            s << "        return o;\n    }\n";
+            s << "    static " << n << " from(const nlohmann::json& j, const std::string& path)\n    {\n";
+            s << "        if (!j.is_object()) typeError(path, \"object\", j);\n";
+            s << "        " << n << " out;\n";
+            for (const FieldDecl& f : t.fields) {
+                const QString fn = qs(f.name);
+                s << "        out." << fn << " = Codec<std::decay_t<decltype(out." << fn
+                  << ")>>::from(j.contains(\"" << fn << "\") ? j.at(\"" << fn
+                  << "\") : nlohmann::json(), joinPath(path, \"." << fn << "\"));\n";
+            }
+            s << "        return out;\n    }\n};\n\n";
+        }
+        s << "}} // namespace logos::detail\n\n";
+        s << "namespace {\n\n";
+    }
 
     emitInterfaceJson(s, module);
     s << "} // namespace\n\n";
