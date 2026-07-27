@@ -72,15 +72,25 @@ QString toQVariantConversion(const QString& type, const QString& argExpr);
 // runtime-bound interface wrapper (Bound) — see BindMode above. In Bound
 // mode `moduleName` is used only for the class/file naming the caller
 // already decided; the emitted code never bakes it into a call.
-QString makeHeader(const QString& moduleName, const QString& className, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static);
-QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static);
+//
+// `records` carries the contract's `type Foo { ... }` declarations, as
+//   [ { "name": "Foo", "fields": [ { "name": "...", "type": "<QtTypeName>" } ] } ]
+// Each becomes a struct NESTED in the wrapper class (`<Class>::Foo`, so two
+// deps may both declare a `Status`), and every method / event that mentions
+// one is typed with it instead of falling back to QVariant / LogosMap. Field
+// types use the same Qt type-name spelling as methods, so a field can name
+// another record, `QList<Record>`, or `QMap<QString, Record>`. Empty (the
+// default, and what the metaobject-introspection path passes) leaves the
+// generated output exactly as it was.
+QString makeHeader(const QString& moduleName, const QString& className, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
+QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 
 // Qt-free (ApiStyle::Lp) wrapper emission. Same std-typed surface as the Std
 // flavor, but the generated body calls the logos-protocol C ABI through
 // logos::LpClient instead of LogosAPIClient — no Qt in the wrapper's TU.
 // makeHeader/makeSource dispatch here when apiStyle == ApiStyle::Lp.
-QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static);
-QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static);
+QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
+QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 QVector<ParsedMethod> parseProviderHeader(const QString& headerPath, QTextStream& err);
 
 #endif // GENERATOR_LIB_H

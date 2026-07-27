@@ -37,8 +37,12 @@ static QString lidlTypeExprToQtTypeName(const TypeExpr& te)
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "tstr")    return "QString";
         if (te.name == "bstr")    return "QByteArray";
-        if (te.name == "int")     return "int";
-        if (te.name == "uint")    return "int";       // wire-as-int for now
+        // 64-bit, and unsigned stays unsigned. LIDL int/uint are int64_t /
+        // uint64_t in every other binding; spelling them `int` here handed a
+        // Qt-style consumer a signed 32-bit value (silent truncation above
+        // 2^31) and a std/lp consumer a SIGNED int64_t for a `uint`.
+        if (te.name == "int")     return "qlonglong";
+        if (te.name == "uint")    return "qulonglong";
         if (te.name == "float64") return "double";
         if (te.name == "bool")    return "bool";
         if (te.name == "result")  return "LogosResult";
@@ -49,20 +53,33 @@ static QString lidlTypeExprToQtTypeName(const TypeExpr& te)
         const TypeExpr& elem = te.elements[0];
         if (elem.kind == TypeExpr::Primitive && elem.name == "tstr")
             return "QStringList";
+        // A list of records keeps its element type — the wrapper emits a
+        // typed container, not a bag of QVariants.
+        if (elem.kind == TypeExpr::Named)
+            return "QList<" + qs(elem.name) + ">";
         return "QVariantList";
     }
-    if (te.kind == TypeExpr::Map)      return "QVariantMap";
+    if (te.kind == TypeExpr::Map) {
+        if (te.elements.size() == 2 && te.elements[1].kind == TypeExpr::Named)
+            return "QMap<QString, " + qs(te.elements[1].name) + ">";
+        return "QVariantMap";
+    }
     if (te.kind == TypeExpr::Optional) return "QVariant";
-    if (te.kind == TypeExpr::Named)    return "QVariant";
+    // A record declared by the contract: generator_lib emits the struct and
+    // types every mention of it with the struct.
+    if (te.kind == TypeExpr::Named)    return qs(te.name);
     return "QVariant";
 }
+
+static QJsonArray moduleRecordsToJson(const ModuleDecl& mod);
 
 // Load events from a `.lidl` sidecar shipped alongside a module's
 // pre-built headers. Returns a JSON array of
 //   { name, params: [ { name, type } ] }
 // using Qt-typed type names — same shape generator_lib's makeHeader /
 // makeSource already consume for methods.
-static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err)
+static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err,
+                                     QJsonArray* outRecords = nullptr)
 {
     QJsonArray result;
     QFile f(lidlPath);
@@ -80,6 +97,7 @@ static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err)
         return result;
     }
 
+    if (outRecords) *outRecords = moduleRecordsToJson(pr.module);
     for (const EventDecl& ed : pr.module.events) {
         QJsonObject obj;
         obj["name"] = qs(ed.name);
@@ -166,6 +184,28 @@ static QJsonArray moduleMethodsToJson(const ModuleDecl& mod)
             params.append(po);
         }
         o["parameters"] = params;
+        arr.append(o);
+    }
+    return arr;
+}
+
+// Build the records QJsonArray ({ name, fields:[{name,type}] }) from a parsed
+// ModuleDecl — the contract's `type Foo { ... }` declarations, which
+// generator_lib turns into structs nested in the wrapper class.
+static QJsonArray moduleRecordsToJson(const ModuleDecl& mod)
+{
+    QJsonArray arr;
+    for (const TypeDecl& td : mod.types) {
+        QJsonObject o;
+        o["name"] = qs(td.name);
+        QJsonArray fields;
+        for (const FieldDecl& fd : td.fields) {
+            QJsonObject f;
+            f["name"] = qs(fd.name);
+            f["type"] = lidlTypeExprToQtTypeName(fd.type);
+            fields.append(f);
+        }
+        o["fields"] = fields;
         arr.append(o);
     }
     return arr;
@@ -276,11 +316,12 @@ static bool generateInterfaceWrappers(const QVector<InterfaceSpec>& ifaces,
         const QString className = toPascalCase(spec.name);
         const QJsonArray methods = moduleMethodsToJson(mod);
         const QJsonArray events  = moduleEventsToJson(mod);
+        const QJsonArray records = moduleRecordsToJson(mod);
         const QString headerRel = spec.name + "_api.h";
         const QString sourceRel = spec.name + "_api.cpp";
 
-        const QString header = makeHeader(spec.name, className, methods, apiStyle, events, bindMode);
-        const QString source = makeSource(spec.name, className, headerRel, methods, apiStyle, events, bindMode);
+        const QString header = makeHeader(spec.name, className, methods, apiStyle, events, bindMode, records);
+        const QString source = makeSource(spec.name, className, headerRel, methods, apiStyle, events, bindMode, records);
 
         {
             QFile f(QDir(genDirPath).filePath(headerRel));
@@ -773,7 +814,7 @@ static int generateProviderDispatch(const QString& headerPath, const QString& ou
     return 0;
 }
 
-static int generateFromPlugin(const QString& pluginInputPath, const QString& outputDir, bool moduleOnly, ApiStyle apiStyle, const QJsonArray& events, QTextStream& out, QTextStream& err)
+static int generateFromPlugin(const QString& pluginInputPath, const QString& outputDir, bool moduleOnly, ApiStyle apiStyle, const QJsonArray& events, QTextStream& out, QTextStream& err, const QJsonArray& records = {})
 {
     QFileInfo fi(pluginInputPath);
     if (!fi.exists()) {
@@ -841,8 +882,8 @@ static int generateFromPlugin(const QString& pluginInputPath, const QString& out
     // doesn't need to know which style was picked. `events` (loaded
     // from a sibling `.lidl` sidecar via --events-from) adds typed
     // `on<EventName>(callback)` accessors next to the existing methods.
-    QString header = makeHeader(moduleName, className, methods, apiStyle, events);
-    QString source = makeSource(moduleName, className, headerRel, methods, apiStyle, events);
+    QString header = makeHeader(moduleName, className, methods, apiStyle, events, BindMode::Static, records);
+    QString source = makeSource(moduleName, className, headerRel, methods, apiStyle, events, BindMode::Static, records);
 
     {
         QFile f(headerAbs);
@@ -1195,6 +1236,7 @@ int legacy_main(int argc, char* argv[])
     // `on<EventName>(callback)` accessors next to the existing
     // generic `onEvent(name, callback)` channel.
     QJsonArray eventsFromSidecar;
+    QJsonArray recordsFromSidecar;
     {
         const int evIdx = args.indexOf("--events-from");
         QString evPath;
@@ -1209,10 +1251,10 @@ int legacy_main(int argc, char* argv[])
             }
         }
         if (!evPath.isEmpty() && QFileInfo(evPath).exists()) {
-            eventsFromSidecar = loadEventsFromLidl(evPath, err);
+            eventsFromSidecar = loadEventsFromLidl(evPath, err, &recordsFromSidecar);
         }
     }
 
     QString argPath = args.at(1);
-    return generateFromPlugin(argPath, outputDir, moduleOnly, apiStyle, eventsFromSidecar, out, err);
+    return generateFromPlugin(argPath, outputDir, moduleOnly, apiStyle, eventsFromSidecar, out, err, recordsFromSidecar);
 }
