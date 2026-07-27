@@ -250,3 +250,61 @@ TEST(LidlGenClient, VoidReturnMethod)
     // The source should just call the method without capturing return
     EXPECT_FALSE(s.contains("QVariant _result = m_client->invokeRemoteMethod(\"test\", \"doStuff\""));
 }
+
+// Records: a `type` decl becomes a real C++ struct in the generated header, so a
+// Qt consumer says `Status s = client.makeStatus();` rather than digging fields
+// out of a QVariantMap. Additive — nothing generated records before this.
+static ModuleDecl makeRecordModule()
+{
+    ModuleDecl m;
+    m.name = "info_module";
+    m.version = "1.0.0";
+
+    TypeDecl rec;
+    rec.name = "Status";
+    FieldDecl a; a.name = "port"; a.type = { TypeExpr::Primitive, "uint", {} };
+    FieldDecl b; b.name = "blob"; b.type = { TypeExpr::Primitive, "bstr", {} };
+    rec.fields = {a, b};
+    m.types.push_back(rec);
+
+    {
+        MethodDecl md;
+        md.name = "describeStatus";
+        md.returnType = { TypeExpr::Primitive, "tstr", {} };
+        ParamDecl p; p.name = "s"; p.type = { TypeExpr::Named, "Status", {} };
+        md.params.push_back(p);
+        m.methods.push_back(md);
+    }
+    {
+        MethodDecl md;
+        md.name = "makeStatuses";
+        TypeExpr elem = { TypeExpr::Named, "Status", {} };
+        md.returnType = { TypeExpr::Array, "", { elem } };
+        m.methods.push_back(md);
+    }
+    return m;
+}
+
+TEST(LidlGenClient, RecordsBecomeStructsWithConversions)
+{
+    const QString h = lidlMakeHeader(makeRecordModule(), BindMode::Bound);
+
+    // The struct, at the 1-1 Qt spellings: 64-bit unsigned, QByteArray for bytes.
+    EXPECT_TRUE(h.contains("struct Status {")) << h.toStdString();
+    EXPECT_TRUE(h.contains("qulonglong port{};")) << h.toStdString();
+    EXPECT_TRUE(h.contains("QByteArray blob{};")) << h.toStdString();
+
+    // Conversions both ways.
+    EXPECT_TRUE(h.contains("inline QVariant StatusToVariant(const Status& v)")) << h.toStdString();
+    EXPECT_TRUE(h.contains("inline Status StatusFromVariant(const QVariant& value)")) << h.toStdString();
+    // A bstr field is a QByteArray: logos-protocol's QVariant<->JSON conversion
+    // already materialises the tagged {"_bytes":…} form as QByteArray, so binary
+    // survives without record-specific bytes handling.
+    EXPECT_TRUE(h.contains("__out.blob = __m.value(\"blob\").toByteArray();")) << h.toStdString();
+
+    // Methods speak the record: by const& in, typed list out. A QVariantList
+    // could not hold a Status without Q_DECLARE_METATYPE.
+    EXPECT_TRUE(h.contains("describeStatus(const Status& s")) << h.toStdString();
+    EXPECT_TRUE(h.contains("QList<Status> makeStatuses(")) << h.toStdString();
+}
+

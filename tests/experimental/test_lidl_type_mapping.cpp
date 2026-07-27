@@ -86,10 +86,13 @@ TEST(LidlTypeToQt, OptionalType)
     EXPECT_EQ(lidlTypeToQt(te), "QVariant");
 }
 
-TEST(LidlTypeToQt, NamedType)
+// A Named type is a RECORD declared by the contract, and the client generator
+// emits a struct of that name — so the Qt spelling is the struct, not an opaque
+// QVariant. One LIDL type, one type per language.
+TEST(LidlTypeToQt, NamedTypeIsItsRecordStruct)
 {
     TypeExpr te = { TypeExpr::Named, "MyStruct", {} };
-    EXPECT_EQ(lidlTypeToQt(te), "QVariant");
+    EXPECT_EQ(lidlTypeToQt(te), "MyStruct");
 }
 
 // ---------------------------------------------------------------------------

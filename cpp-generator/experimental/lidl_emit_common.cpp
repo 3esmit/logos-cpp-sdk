@@ -33,18 +33,27 @@ QString lidlTypeToQt(const TypeExpr& te)
         if (te.name == "result")  return "LogosResult";
         if (te.name == "any")     return "QVariant";
         return "QVariant";
+    case TypeExpr::Named:
+        // A record declared by the contract: its generated struct. One LIDL
+        // type, one type per language — a record is not a QVariant blob.
+        return QString::fromStdString(te.name);
     case TypeExpr::Array:
         if (te.elements.size() == 1
             && te.elements[0].kind == TypeExpr::Primitive
             && te.elements[0].name == "tstr") {
             return "QStringList";
         }
+        // A list of records is a typed list: QVariantList could not hold a
+        // record without Q_DECLARE_METATYPE, and the point of a record is that
+        // the consumer gets the struct.
+        if (te.elements.size() == 1 && te.elements[0].kind == TypeExpr::Named)
+            return "QList<" + QString::fromStdString(te.elements[0].name) + ">";
         return "QVariantList";
     case TypeExpr::Map:
+        if (te.elements.size() == 2 && te.elements[1].kind == TypeExpr::Named)
+            return "QMap<QString, " + QString::fromStdString(te.elements[1].name) + ">";
         return "QVariantMap";
     case TypeExpr::Optional:
-        return "QVariant";
-    case TypeExpr::Named:
         return "QVariant";
     }
     return "QVariant";
