@@ -44,53 +44,44 @@ static TypeExpr cppTypeToLidl(const QString& raw)
 
     // Primitives
     if (t == "bool")     return { TypeExpr::Primitive, "bool", {} };
+    if (t == "void")     return { TypeExpr::Primitive, "void", {} };
+
+    // Numbers are 64-bit ONLY: int64_t, uint64_t, double. Narrower spellings are
+    // NOT auto-widened — a uint32_t parameter is a build error telling the author
+    // to write uint64_t, rather than a silent widening that makes the declared
+    // C++ type and the published LIDL contract disagree about range. uint8_t has
+    // exactly one meaning in this contract, and it is std::vector<uint8_t> =
+    // bstr, handled below.
     if (t == "int64_t")  return { TypeExpr::Primitive, "int", {} };
     if (t == "uint64_t") return { TypeExpr::Primitive, "uint", {} };
     if (t == "double")   return { TypeExpr::Primitive, "float64", {} };
-    if (t == "void")     return { TypeExpr::Primitive, "void", {} };
 
     // std::string
     if (t == "std::string")
         return { TypeExpr::Primitive, "tstr", {} };
 
-    // std::vector<T>
+    // std::vector<T> — recursive: the element is parsed by the same function, so
+    // [T] composes to any depth ([[bstr]], [{tstr: [int]}], …) without this
+    // table having to enumerate the combinations. std::vector<uint8_t> is the
+    // one exception: it IS `bstr`, not an array of uint.
     static QRegularExpression vecRe("^std::vector\\s*<\\s*(.+)\\s*>$");
     QRegularExpressionMatch m = vecRe.match(t);
     if (m.hasMatch()) {
-        QString inner = m.captured(1).trimmed();
-        if (inner == "std::string") {
-            TypeExpr elem = { TypeExpr::Primitive, "tstr", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
-        if (inner == "uint8_t") {
+        const QString inner = m.captured(1).trimmed();
+        if (inner == "uint8_t")
             return { TypeExpr::Primitive, "bstr", {} };
-        }
-        // std::vector<std::vector<uint8_t>> — an array of byte strings. Spelled
-        // out so it lands on `[bstr]` rather than the opaque `any` fallback
-        // below, which would emit a bare QVariant into the Qt-free TU. As
-        // `[bstr]` it goes through the cdylib list codec
-        // (lidlBytesListFromJson / lidlBytesListToJson), so each element keeps
-        // the canonical tagged {"_bytes": base64url} form on the wire.
-        if (inner == "std::vector<uint8_t>") {
-            TypeExpr elem = { TypeExpr::Primitive, "bstr", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
-        if (inner == "int64_t") {
-            TypeExpr elem = { TypeExpr::Primitive, "int", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
-        if (inner == "uint64_t") {
-            TypeExpr elem = { TypeExpr::Primitive, "uint", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
-        if (inner == "double") {
-            TypeExpr elem = { TypeExpr::Primitive, "float64", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
-        if (inner == "bool") {
-            TypeExpr elem = { TypeExpr::Primitive, "bool", {} };
-            return { TypeExpr::Array, "", { elem } };
-        }
+        return { TypeExpr::Array, "", { cppTypeToLidl(inner) } };
+    }
+
+    // std::map / std::unordered_map<std::string, T> — recursive on the value.
+    // Only string-keyed maps are representable ({tstr: T}); any other key type
+    // falls through to the unsupported marker below.
+    static QRegularExpression mapRe(
+        "^std::(?:unordered_)?map\\s*<\\s*std::string\\s*,\\s*(.+)\\s*>$");
+    QRegularExpressionMatch mm = mapRe.match(t);
+    if (mm.hasMatch()) {
+        return { TypeExpr::Map, "",
+                 { { TypeExpr::Primitive, "tstr", {} }, cppTypeToLidl(mm.captured(1).trimmed()) } };
     }
 
     // Qt collection types — pass through directly (non-std-convertible)
@@ -108,13 +99,34 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     if (t == "LogosList")
         return { TypeExpr::Array, "", { {TypeExpr::Primitive, "any", {}} } };
 
+    // The alias spelled out. LogosMap/LogosList ARE nlohmann::json, and modules
+    // do write the underlying name (test_fullapi_cpp's echoAny, the full_api
+    // interface headers). It only survived via the opaque fallback below, so it
+    // has to be named explicitly now that the fallback is an error.
+    if (t == "nlohmann::json" || t == "json")
+        return { TypeExpr::Primitive, "any", {} };
+
     // StdLogosResult — pure C++ result type for universal impls. The generator
     // emits a StdLogosResult→Qt LogosResult conversion in the glue layer.
     if (t == "StdLogosResult")
         return { TypeExpr::Primitive, "result", {} };
 
-    // Fallback: treat as opaque
-    return { TypeExpr::Primitive, "any", {} };
+    // Anything else is UNSUPPORTED, and says so by name.
+    //
+    // This used to return the opaque primitive `any`, which the cdylib gate
+    // admits — so an unrecognised spelling was silently accepted and then either
+    // worked by luck through nlohmann's implicit conversions, threw at call time,
+    // or (worst) emitted a non-canonical wire value: a
+    // std::vector<std::vector<std::vector<uint8_t>>> return went out as untagged
+    // nested number arrays that no consumer decodes as bytes.
+    //
+    // `Named` carries the offending C++ spelling, and no backend accepts a Named
+    // type, so the module fails to BUILD with the parameter and the type in the
+    // message. Compatible spellings are enumerated above; the composition rule
+    // (vector<T>, map<string,T>) is recursive, so this fires only for types that
+    // genuinely have no canonical JSON form (std::pair, std::set, std::optional,
+    // custom structs, pointers, Qt types in a Qt-free module).
+    return { TypeExpr::Named, t.toStdString(), {} };
 }
 
 // ---------------------------------------------------------------------------

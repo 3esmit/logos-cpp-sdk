@@ -82,26 +82,29 @@ TEST(LidlGenCdylib, BinaryEventPayloadUsesCanonicalBytesEncoding)
 
     const QString source = eventsSourceFor(m);
 
-    // The real argument is serialized, through the canonical encoder...
-    EXPECT_TRUE(source.contains("args.push_back(lidlBytesToJson(payload));"));
-    EXPECT_TRUE(source.contains("std::string lidlB64UrlEncode"));
-    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesToJson"));
+    // The real argument is serialized through the canonical encoder, which now
+    // lives in logos-protocol instead of being emitted into every module.
+    EXPECT_TRUE(source.contains("args.push_back(logos::toJson(payload));"));
+    EXPECT_TRUE(source.contains("#include <logos_codec.h>"));
+    EXPECT_FALSE(source.contains("lidlB64UrlEncode"));
+    EXPECT_FALSE(source.contains("lidlBytesToJson"));
 
     // ...and the empty tagged value is gone.
     EXPECT_FALSE(source.contains("nlohmann::json{{\"_bytes\", \"\"}}"));
 
-    // The other parameters are still passed straight through.
-    EXPECT_TRUE(source.contains("args.push_back(messageHash);"));
-    EXPECT_TRUE(source.contains("args.push_back(timestamp);"));
+    // Every parameter goes through the same call — no per-type special cases.
+    EXPECT_TRUE(source.contains("args.push_back(logos::toJson(messageHash));"));
+    EXPECT_TRUE(source.contains("args.push_back(logos::toJson(timestamp));"));
 
     // Bytes are taken by const-ref, matching the author's logos_events: block.
     EXPECT_TRUE(source.contains("const std::vector<uint8_t>& payload"));
 }
 
-// The encoder is only needed by modules that actually emit binary payloads.
-// Emitted unconditionally it is an unused static function in every other
-// module's sidecar (-Wunused-function).
-TEST(LidlGenCdylib, BytesEncoderOmittedWhenNoEventCarriesBytes)
+// No module carries a codec copy any more: the base64/tagged-bytes
+// implementation lives once in logos-protocol (logos_codec.h) and modules call
+// it. This also retires the gating that existed only to avoid emitting an
+// unused static function.
+TEST(LidlGenCdylib, NoCodecIsEmittedIntoTheModule)
 {
     const ModuleDecl m = moduleWithEvent("fault", {
         param("code",    prim("int")),
@@ -113,7 +116,9 @@ TEST(LidlGenCdylib, BytesEncoderOmittedWhenNoEventCarriesBytes)
 
     EXPECT_FALSE(source.contains("lidlB64UrlEncode"));
     EXPECT_FALSE(source.contains("lidlBytesToJson"));
-    EXPECT_TRUE(source.contains("args.push_back(code);"));
+    EXPECT_FALSE(source.contains("lidlB64Idx"));
+    EXPECT_TRUE(source.contains("#include <logos_codec.h>"));
+    EXPECT_TRUE(source.contains("args.push_back(logos::toJson(code));"));
 }
 
 // The sidecar is compiled into the module's Qt-free cdylib, so a JSON payload
@@ -158,9 +163,7 @@ TEST(LidlGenCdylib, ArrayOfBytesEventParamIsEligibleAndTagsEachElement)
     // Each element is tagged, not emitted as a nested number array — which is
     // what nlohmann::json(std::vector<std::vector<uint8_t>>) would have produced
     // and no consumer decodes as bytes.
-    EXPECT_TRUE(source.contains("args.push_back(lidlBytesListToJson(payloads));"));
-    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesListToJson"));
-    EXPECT_TRUE(source.contains("out.push_back(lidlBytesToJson(bytes));"));
+    EXPECT_TRUE(source.contains("args.push_back(logos::toJson(payloads));"));
 
     // Qt-free, and taken by const-ref like the other composite payloads.
     EXPECT_TRUE(source.contains("const std::vector<std::vector<uint8_t>>& payloads"));
@@ -183,13 +186,13 @@ TEST(LidlGenCdylib, ArrayOfBytesMethodParamDecodesPerElement)
 
     const QString source = implSourceFor(m);
 
-    EXPECT_TRUE(source.contains("lidlBytesListFromJson("));
-    EXPECT_TRUE(source.contains("std::vector<std::vector<uint8_t>> lidlBytesListFromJson"));
-    EXPECT_TRUE(source.contains("out.push_back(lidlBytesFromJson(e));"));
-    // The scalar param still uses the scalar decoder.
-    EXPECT_TRUE(source.contains("lidlBytesFromJson("));
-    // The blanket container decode must not be used for this type.
-    EXPECT_FALSE(source.contains(".get<std::vector<std::vector<uint8_t>>>()"));
+    // Both params decode through the proxy, which converts itself into the
+    // author's own parameter type — so no type name is emitted at all and the
+    // scalar/array distinction needs no special case.
+    EXPECT_TRUE(source.contains("logos::JsonArg{args.at(0), \"arg0\"}"));
+    EXPECT_TRUE(source.contains("logos::JsonArg{args.at(1), \"arg1\"}"));
+    // The blanket container decode must not be used for any type.
+    EXPECT_FALSE(source.contains(".get<std::vector<"));
 }
 
 // The return path: nlohmann::json(std::vector<std::vector<uint8_t>>) would emit
@@ -203,23 +206,9 @@ TEST(LidlGenCdylib, ArrayOfBytesReturnTagsEachElement)
     ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
 
     const QString source = implSourceFor(m);
-    EXPECT_TRUE(source.contains("lidlBytesListToJson("));
-    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesListToJson"));
+    EXPECT_TRUE(source.contains("logos::toJson(result)"));
 }
 
-// The list encoder is gated the same way the scalar one is: a module whose
-// events carry only a single blob must not gain an unused static function.
-TEST(LidlGenCdylib, BytesListEncoderOmittedWhenNoEventCarriesAnArray)
-{
-    const ModuleDecl m = moduleWithEvent("messageReceived", {
-        param("payload", prim("bstr")),
-    });
-
-    const QString source = eventsSourceFor(m);
-
-    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesToJson"));
-    EXPECT_FALSE(source.contains("lidlBytesListToJson"));
-}
 
 // The supported scalar / bytes payloads stay eligible.
 TEST(LidlGenCdylib, SupportedEventParamsRemainEligible)
@@ -232,4 +221,49 @@ TEST(LidlGenCdylib, SupportedEventParamsRemainEligible)
 
     QString error;
     EXPECT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+}
+
+// Numbers are 64-bit only. A narrower spelling is NOT auto-widened: widening
+// would make the declared C++ type and the published LIDL contract disagree
+// about range, so it is a build error that names the type and the fix.
+TEST(LidlGenCdylib, NarrowNumericSpellingsAreRejectedWithTheFix)
+{
+    struct Case { const char* cpp; const char* hint; };
+    const Case cases[] = {
+        {"uint32_t", "uint64_t"},
+        {"int",      "int64_t"},
+        {"size_t",   "uint64_t"},
+        {"float",    "double"},
+    };
+
+    for (const Case& c : cases) {
+        const ModuleDecl m = moduleWithMethod(method("f", prim("tstr"), {
+            param("n", TypeExpr{TypeExpr::Named, c.cpp, {}}),
+        }));
+        QString error;
+        EXPECT_FALSE(lidlCdylibSupported(m, &error)) << c.cpp;
+        EXPECT_TRUE(error.contains(c.cpp)) << error.toStdString();
+        EXPECT_TRUE(error.contains(c.hint)) << error.toStdString();
+    }
+
+    // uint8_t names its one legitimate use rather than just the width rule.
+    const ModuleDecl m = moduleWithMethod(method("f", prim("tstr"), {
+        param("b", TypeExpr{TypeExpr::Named, "uint8_t", {}}),
+    }));
+    QString error;
+    EXPECT_FALSE(lidlCdylibSupported(m, &error));
+    EXPECT_TRUE(error.contains("std::vector<uint8_t>")) << error.toStdString();
+}
+
+// A narrow spelling nested inside a supported container is rejected too, and the
+// message still names it — the recursion must not lose the offender.
+TEST(LidlGenCdylib, NarrowNumericInsideAContainerIsRejected)
+{
+    const ModuleDecl m = moduleWithMethod(method("f", prim("tstr"), {
+        param("counters", TypeExpr{TypeExpr::Array, "", {TypeExpr{TypeExpr::Named, "uint32_t", {}}}}),
+    }));
+    QString error;
+    EXPECT_FALSE(lidlCdylibSupported(m, &error));
+    EXPECT_TRUE(error.contains("uint32_t")) << error.toStdString();
+    EXPECT_TRUE(error.contains("counters")) << error.toStdString();
 }
