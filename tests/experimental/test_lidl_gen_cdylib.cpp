@@ -267,3 +267,22 @@ TEST(LidlGenCdylib, NarrowNumericInsideAContainerIsRejected)
     EXPECT_TRUE(error.contains("uint32_t")) << error.toStdString();
     EXPECT_TRUE(error.contains("counters")) << error.toStdString();
 }
+
+// A call with too few arguments reports why. It used to return nullptr, which the
+// Qt glue converts to an empty QVariant — so a malformed call was
+// indistinguishable from a method that returned nothing. Rust's generated
+// dispatch emits the same code and the same message.
+TEST(LidlGenCdylib, TooFewArgumentsReportsInvalidArgs)
+{
+    const ModuleDecl m = moduleWithMethod(method("send", prim("tstr"), {
+        param("a", prim("tstr")),
+        param("b", prim("int")),
+    }));
+
+    const QString source = implSourceFor(m);
+
+    EXPECT_TRUE(source.contains("if (args.size() < 2)"));
+    EXPECT_TRUE(source.contains("\"invalid_args\""));
+    EXPECT_TRUE(source.contains("expected 2 arguments, got"));
+    EXPECT_FALSE(source.contains("if (args.size() < 2) return nullptr;"));
+}

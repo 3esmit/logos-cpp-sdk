@@ -388,7 +388,19 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
 
     for (const MethodDecl& md : module.methods) {
         s << "        if (m == \"" << md.name << "\") {\n";
-        s << "            if (args.size() < " << md.params.size() << ") return nullptr;\n";
+        // A malformed call reports WHY. This used to return nullptr, which the Qt
+        // glue turns into an empty QVariant — indistinguishable from a method
+        // that legitimately returned nothing, so "you passed 2 of 4 arguments"
+        // looked like a successful empty answer. dispatch_failed objects already
+        // travel this path, so a structured reply here is nothing new for hosts.
+        // Rust's generated dispatch emits the same code and message.
+        s << "            if (args.size() < " << md.params.size() << ") {\n";
+        s << "                nlohmann::json err{{\"code\", \"invalid_args\"},\n";
+        s << "                    {\"message\", \"expected " << md.params.size()
+          << " arguments, got \" + std::to_string(args.size())},\n";
+        s << "                    {\"origin\", \"" << module.name << "\"}};\n";
+        s << "                return lidlStrdup(err.dump());\n";
+        s << "            }\n";
         QString call = "lidlImpl()." + qs(md.name) + "(";
         for (int i = 0; i < md.params.size(); ++i) {
             // logos::JsonArg converts itself into whatever the impl's parameter
