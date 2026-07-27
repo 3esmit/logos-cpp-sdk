@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "lidl_compat.h"
 #include "lidl_gen_cdylib.h"
 
 namespace {
@@ -336,4 +337,32 @@ TEST(LidlGenCdylib, UndeclaredNamedTypeIsStillRejected)
     QString error;
     EXPECT_FALSE(lidlCdylibSupported(m, &error));
     EXPECT_TRUE(error.contains("NotDeclared")) << error.toStdString();
+}
+
+// The PUBLISHED contract has to carry the record, or a consumer has nothing to
+// generate a typed wrapper from. lidl::serialize already emitted `type` blocks
+// (that is how chat_module's hand-written contract round-trips) — the missing
+// half was the impl-header parser producing them. This pins the whole path.
+TEST(LidlGenCdylib, PublishedContractCarriesRecords)
+{
+    ModuleDecl m;
+    m.name = "info_module";
+
+    TypeDecl rec;
+    rec.name = "Status";
+    FieldDecl a; a.name = "port"; a.type = prim("uint");
+    FieldDecl b; b.name = "blob"; b.type = prim("bstr");
+    rec.fields = {a, b};
+    m.types.push_back(rec);
+
+    m.methods.push_back(method("makeStatuses",
+        TypeExpr{TypeExpr::Array, "", {TypeExpr{TypeExpr::Named, "Status", {}}}}, {}));
+
+    const QString lidl = lidlSerialize(m);
+
+    EXPECT_TRUE(lidl.contains("type Status")) << lidl.toStdString();
+    EXPECT_TRUE(lidl.contains("port: uint")) << lidl.toStdString();
+    EXPECT_TRUE(lidl.contains("blob: bstr")) << lidl.toStdString();
+    // ...and the method refers to it by name, not as an opaque map.
+    EXPECT_TRUE(lidl.contains("makeStatuses() -> [Status]")) << lidl.toStdString();
 }
