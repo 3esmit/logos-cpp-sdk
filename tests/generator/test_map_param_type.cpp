@@ -33,3 +33,16 @@ TEST(MapParamTypeTest, LogosResultFallsBack)
     // LogosResult is NOT in the param known set
     EXPECT_EQ(mapParamType("LogosResult"), "QVariant");
 }
+
+// LIDL int/uint are 64-bit, and since the Qt spelling became qlonglong/qulonglong
+// they have to be in the known set — otherwise every int/uint method silently
+// degrades to an opaque QVariant in the generated lp/std consumer wrappers.
+TEST(MapParamType, SixtyFourBitIntegersAreKnown)
+{
+    EXPECT_EQ(mapParamType("qlonglong"), "qlonglong");
+    EXPECT_EQ(mapParamType("qulonglong"), "qulonglong");
+    EXPECT_EQ(mapParamType("const qlonglong&"), "qlonglong");
+    // An unknown spelling still falls back.
+    EXPECT_EQ(mapParamType("SomeRecord"), "QVariant");
+}
+

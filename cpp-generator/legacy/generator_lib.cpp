@@ -34,7 +34,7 @@ QString mapParamType(const QString& qtType)
 {
     const QString base = normalizeType(qtType);
     static const QSet<QString> known = {
-        "void","bool","int","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant"
+        "void","bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant"
     };
     if (known.contains(base)) return base;
     // Fallback to QVariant for unknown types
@@ -46,7 +46,7 @@ QString mapReturnType(const QString& qtType)
     const QString base = normalizeType(qtType);
     if (base.isEmpty() || base == "void") return QString("void");
     static const QSet<QString> known = {
-        "bool","int","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant","LogosResult"
+        "bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant","LogosResult"
     };
     if (known.contains(base)) return base;
     return QString("QVariant");
@@ -55,6 +55,9 @@ QString mapReturnType(const QString& qtType)
 QString toQVariantConversion(const QString& type, const QString& argExpr)
 {
     if (type == "int") return argExpr + ".toInt()";
+    // LIDL int/uint are 64-bit; toInt() would truncate and re-sign them.
+    if (type == "qlonglong") return argExpr + ".toLongLong()";
+    if (type == "qulonglong") return argExpr + ".toULongLong()";
     if (type == "bool") return argExpr + ".toBool()";
     if (type == "double") return argExpr + ".toDouble()";
     if (type == "float") return argExpr + ".toFloat()";
@@ -91,6 +94,8 @@ static QString mapParamTypeStd(const QString& qtType)
     if (base == "QVariantMap")  return "LogosMap";
     if (base == "QVariant")     return "LogosMap";
     if (base == "int")          return "int64_t";
+    if (base == "qlonglong")    return "int64_t";
+    if (base == "qulonglong")   return "uint64_t";
     return base;
 }
 
@@ -107,6 +112,8 @@ static QString mapReturnTypeStd(const QString& qtType)
     if (base == "QVariant")     return "LogosMap";
     if (base == "LogosResult")  return "StdLogosResult";
     if (base == "int")          return "int64_t";
+    if (base == "qlonglong")    return "int64_t";
+    if (base == "qulonglong")   return "uint64_t";
     return base;
 }
 
@@ -155,6 +162,10 @@ static QString qVariantToStdReturn(const QString& qtType, const QString& varExpr
         return varExpr + ".toBool()";
     if (base == "int")
         return "static_cast<int64_t>(" + varExpr + ".toInt())";
+    if (base == "qlonglong")
+        return varExpr + ".toLongLong()";
+    if (base == "qulonglong")
+        return varExpr + ".toULongLong()";
     if (base == "double" || base == "float")
         return varExpr + ".toDouble()";
     if (base == "QString")
@@ -636,6 +647,10 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             s << "    return " << qVariantToStdReturn(qtRet, "_result") << ";\n";
         } else if (ret == "bool") {
             s << "    return _result.toBool();\n";
+        } else if (ret == "qlonglong") {
+            s << "    return _result.toLongLong();\n";
+        } else if (ret == "qulonglong") {
+            s << "    return _result.toULongLong();\n";
         } else if (ret == "int") {
             s << "    return _result.toInt();\n";
         } else if (ret == "double") {
@@ -709,7 +724,8 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         } else {
             QString defaultVal;
             if (ret == "bool") defaultVal = "false";
-            else if (ret == "int" || ret == "double" || ret == "float") defaultVal = "0";
+            else if (ret == "int" || ret == "qlonglong" || ret == "qulonglong"
+                     || ret == "double" || ret == "float") defaultVal = "0";
             else if (ret == "QString") defaultVal = "QString()";
             else if (ret == "QStringList") defaultVal = "QStringList()";
             else if (ret == "QJsonArray") defaultVal = "QJsonArray()";
