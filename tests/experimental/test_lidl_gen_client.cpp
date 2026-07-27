@@ -66,7 +66,7 @@ TEST(LidlGenClient, HeaderHasSyncMethods)
     auto m = makeTestModule();
     QString h = lidlMakeHeader(m);
     EXPECT_TRUE(h.contains("QString createAccount("));
-    EXPECT_TRUE(h.contains("int getBalance("));
+    EXPECT_TRUE(h.contains("qulonglong getBalance("));
     EXPECT_TRUE(h.contains("QStringList listAccounts("));
 }
 
@@ -149,8 +149,9 @@ TEST(LidlGenClient, SourceHasReturnConversion)
     QString s = lidlMakeSource(m);
     // createAccount returns tstr → QString, should use .toString()
     EXPECT_TRUE(s.contains("_result.toString()"));
-    // getBalance returns uint → int, should use .toInt()
-    EXPECT_TRUE(s.contains("_result.toInt()"));
+    // getBalance returns uint → qulonglong, so the accessor must be the 64-bit
+    // unsigned one; toInt() truncated and re-signed it.
+    EXPECT_TRUE(s.contains("_result.toULongLong()"));
     // listAccounts returns [tstr] → QStringList, should use .toStringList()
     EXPECT_TRUE(s.contains("_result.toStringList()"));
 }

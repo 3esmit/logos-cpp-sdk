@@ -20,8 +20,14 @@ QString lidlTypeToQt(const TypeExpr& te)
         if (te.name == "void")    return "void";
         if (te.name == "tstr")    return "QString";
         if (te.name == "bstr")    return "QByteArray";
-        if (te.name == "int")     return "int";
-        if (te.name == "uint")    return "int";
+        // 64-bit, and unsigned stays unsigned. LIDL int/uint are int64_t/uint64_t
+        // everywhere else (C++ impls, Rust's i64/u64), so spelling them `int`
+        // here broke the 1-1 mapping and truncated: a Qt consumer reading a
+        // `uint` return got a SIGNED 32-bit value. qlonglong/qulonglong rather
+        // than qint64/quint64 so the generated introspection matches the names
+        // Qt's own metaobject normalisation produces.
+        if (te.name == "int")     return "qlonglong";
+        if (te.name == "uint")    return "qulonglong";
         if (te.name == "float64") return "double";
         if (te.name == "bool")    return "bool";
         if (te.name == "result")  return "LogosResult";

@@ -32,7 +32,10 @@ static void emitParam(QTextStream& s, const QString& qtType, const std::string& 
 static QString returnConversion(const QString& qt)
 {
     if (qt == "bool")        return "return _result.toBool();";
-    if (qt == "int")         return "return _result.toInt();";
+    // 64-bit, matching lidlTypeToQt: toInt() truncated a LIDL int/uint, and for
+    // uint it also read the value as signed.
+    if (qt == "qlonglong")   return "return _result.toLongLong();";
+    if (qt == "qulonglong")  return "return _result.toULongLong();";
     if (qt == "double")      return "return _result.toDouble();";
     if (qt == "float")       return "return _result.toFloat();";
     if (qt == "QString")     return "return _result.toString();";

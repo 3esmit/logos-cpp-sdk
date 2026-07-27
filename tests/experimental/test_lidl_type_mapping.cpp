@@ -18,16 +18,19 @@ TEST(LidlTypeToQt, Bstr)
     EXPECT_EQ(lidlTypeToQt(te), "QByteArray");
 }
 
+// LIDL int/uint are 64-bit everywhere (int64_t/uint64_t in C++ impls, i64/u64 in
+// Rust), so the Qt spelling has to be 64-bit too — one LIDL type, one type per
+// language. `int` truncated, and for `uint` it also flipped the signedness.
 TEST(LidlTypeToQt, Int)
 {
     TypeExpr te = { TypeExpr::Primitive, "int", {} };
-    EXPECT_EQ(lidlTypeToQt(te), "int");
+    EXPECT_EQ(lidlTypeToQt(te), "qlonglong");
 }
 
 TEST(LidlTypeToQt, Uint)
 {
     TypeExpr te = { TypeExpr::Primitive, "uint", {} };
-    EXPECT_EQ(lidlTypeToQt(te), "int");
+    EXPECT_EQ(lidlTypeToQt(te), "qulonglong");
 }
 
 TEST(LidlTypeToQt, Float64)
