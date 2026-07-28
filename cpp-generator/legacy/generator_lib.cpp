@@ -34,7 +34,7 @@ QString mapParamType(const QString& qtType)
 {
     const QString base = normalizeType(qtType);
     static const QSet<QString> known = {
-        "void","bool","int","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant"
+        "void","bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant"
     };
     if (known.contains(base)) return base;
     // Fallback to QVariant for unknown types
@@ -46,7 +46,7 @@ QString mapReturnType(const QString& qtType)
     const QString base = normalizeType(qtType);
     if (base.isEmpty() || base == "void") return QString("void");
     static const QSet<QString> known = {
-        "bool","int","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant","LogosResult"
+        "bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant","LogosResult"
     };
     if (known.contains(base)) return base;
     return QString("QVariant");
@@ -55,6 +55,9 @@ QString mapReturnType(const QString& qtType)
 QString toQVariantConversion(const QString& type, const QString& argExpr)
 {
     if (type == "int") return argExpr + ".toInt()";
+    // LIDL int/uint are 64-bit; toInt() would truncate and re-sign them.
+    if (type == "qlonglong") return argExpr + ".toLongLong()";
+    if (type == "qulonglong") return argExpr + ".toULongLong()";
     if (type == "bool") return argExpr + ".toBool()";
     if (type == "double") return argExpr + ".toDouble()";
     if (type == "float") return argExpr + ".toFloat()";
@@ -91,6 +94,8 @@ static QString mapParamTypeStd(const QString& qtType)
     if (base == "QVariantMap")  return "LogosMap";
     if (base == "QVariant")     return "LogosMap";
     if (base == "int")          return "int64_t";
+    if (base == "qlonglong")    return "int64_t";
+    if (base == "qulonglong")   return "uint64_t";
     return base;
 }
 
@@ -107,6 +112,8 @@ static QString mapReturnTypeStd(const QString& qtType)
     if (base == "QVariant")     return "LogosMap";
     if (base == "LogosResult")  return "StdLogosResult";
     if (base == "int")          return "int64_t";
+    if (base == "qlonglong")    return "int64_t";
+    if (base == "qulonglong")   return "uint64_t";
     return base;
 }
 
@@ -155,6 +162,10 @@ static QString qVariantToStdReturn(const QString& qtType, const QString& varExpr
         return varExpr + ".toBool()";
     if (base == "int")
         return "static_cast<int64_t>(" + varExpr + ".toInt())";
+    if (base == "qlonglong")
+        return varExpr + ".toLongLong()";
+    if (base == "qulonglong")
+        return varExpr + ".toULongLong()";
     if (base == "double" || base == "float")
         return varExpr + ".toDouble()";
     if (base == "QString")
@@ -181,10 +192,171 @@ static QString qVariantToStdReturn(const QString& qtType, const QString& varExpr
     return varExpr + ".toString().toStdString()";
 }
 
+// ─── Records ─────────────────────────────────────────────────────────────
+//
+// A contract's `type Status { port: uint }` is a REAL C++ struct on the
+// consumer side, not a QVariant / LogosMap the caller picks apart by string
+// key. Without this a `bstr` field is the worst case: the caller receives the
+// canonical `{"_bytes": "..."}` envelope and has to know to unwrap it, while
+// every other language's consumer hands back plain bytes.
+//
+// main.cpp passes the declarations alongside the methods:
+//   [ { "name": "Status", "fields": [ { "name": "port", "type": "qulonglong" } ] } ]
+// spelled with the same Qt type names methods use, so a field can name another
+// record ("Status"), a list of them ("QList<Status>") or a map of them
+// ("QMap<QString, Status>"). The struct is nested in the wrapper class —
+// `InfoModule::Status` — because one module consuming two deps that each
+// declare `Status` includes both wrappers into the same translation unit.
+//
+// An empty record set leaves every emission path byte-for-byte as it was.
+
+struct RecordField { QString name; QString type; };
+struct RecordDef   { QString name; QVector<RecordField> fields; };
+using RecordSet = QVector<RecordDef>;
+
+// Forward declarations: the Lp (Qt-free) conversion helpers live further down
+// with the rest of the Lp backend, but the record helpers below dispatch to
+// them for non-record field types.
+static QString lpPushExpr(const QString& qtType, const QString& argName);
+static QString lpFromJsonExpr(const QString& qtType, const QString& jv);
+
+static RecordSet parseRecords(const QJsonArray& records)
+{
+    RecordSet out;
+    for (const QJsonValue& rv : records) {
+        const QJsonObject ro = rv.toObject();
+        RecordDef def;
+        def.name = ro.value("name").toString();
+        if (def.name.isEmpty()) continue;
+        for (const QJsonValue& fv : ro.value("fields").toArray()) {
+            const QJsonObject fo = fv.toObject();
+            RecordField f;
+            f.name = fo.value("name").toString();
+            f.type = fo.value("type").toString();
+            if (f.name.isEmpty()) continue;
+            def.fields.append(f);
+        }
+        out.append(def);
+    }
+    return out;
+}
+
+static bool isRecordName(const RecordSet& rs, const QString& name)
+{
+    for (const RecordDef& d : rs) if (d.name == name) return true;
+    return false;
+}
+
+// How a type name mentions a record, if at all.
+enum class RecordShape { None, Scalar, List, Map };
+
+static RecordShape recordShape(const RecordSet& rs, const QString& t, QString* elem)
+{
+    if (rs.isEmpty()) return RecordShape::None;
+    if (isRecordName(rs, t)) { if (elem) *elem = t; return RecordShape::Scalar; }
+    if (t.startsWith("QList<") && t.endsWith(">")) {
+        const QString e = t.mid(6, t.size() - 7).trimmed();
+        if (isRecordName(rs, e)) { if (elem) *elem = e; return RecordShape::List; }
+    }
+    if (t.startsWith("QMap<QString,") && t.endsWith(">")) {
+        const QString e = t.mid(13, t.size() - 14).trimmed();
+        if (isRecordName(rs, e)) { if (elem) *elem = e; return RecordShape::Map; }
+    }
+    return RecordShape::None;
+}
+
+// The C++ spelling of a record-bearing type, or empty when `t` names none.
+// `qual` qualifies the nested struct ("InfoModule::") where class scope does
+// not already apply — i.e. a return type written before the `Class::` in a
+// definition.
+static QString recordCppType(const RecordSet& rs, const QString& t, ApiStyle style, const QString& qual)
+{
+    QString elem;
+    const RecordShape shape = recordShape(rs, t, &elem);
+    const QString q = qual + elem;
+    switch (shape) {
+    case RecordShape::None:   return QString();
+    case RecordShape::Scalar: return q;
+    case RecordShape::List:
+        return style == ApiStyle::Qt ? "QList<" + q + ">" : "std::vector<" + q + ">";
+    case RecordShape::Map:
+        return style == ApiStyle::Qt ? "QMap<QString, " + q + ">"
+                                     : "std::map<std::string, " + q + ">";
+    }
+    return QString();
+}
+
+// File-local conversion helpers emitted into the generated .cpp — never into
+// the header, so a std/lp consumer's own translation units stay free of the
+// wire type (QVariant / nlohmann::json) the conversion is written in.
+static QString recToWireFn(const QString& record)   { return "recToWire_" + record; }
+static QString recFromWireFn(const QString& record) { return "recFromWire_" + record; }
+
+// Record value -> wire value, and back. Empty when `t` names no record.
+static QString recordToWireExpr(const RecordSet& rs, const QString& t, ApiStyle style, const QString& expr)
+{
+    QString elem;
+    const RecordShape shape = recordShape(rs, t, &elem);
+    if (shape == RecordShape::None) return QString();
+    const QString conv = recToWireFn(elem);
+    if (shape == RecordShape::Scalar) return conv + "(" + expr + ")";
+    // Locals are named apart from the record encoder/decoder's own `__m` / `__j`
+    // / `__out`: these lambdas are emitted INSIDE those functions when a record
+    // has a container-of-record field, and a shadowing local silently reads
+    // itself (caught by -Wuninitialized, not by any assertion on the text).
+    if (style == ApiStyle::Lp) {
+        if (shape == RecordShape::List)
+            return "[&]{ nlohmann::json __acc = nlohmann::json::array(); for (const auto& __e : "
+                 + expr + ") __acc.push_back(" + conv + "(__e)); return __acc; }()";
+        return "[&]{ nlohmann::json __acc = nlohmann::json::object(); for (const auto& __kv : "
+             + expr + ") __acc[__kv.first] = " + conv + "(__kv.second); return __acc; }()";
+    }
+    if (shape == RecordShape::List)
+        return "[&]{ QVariantList __acc; for (const auto& __e : " + expr
+             + ") __acc.append(" + conv + "(__e)); return __acc; }()";
+    // Qt keys are QString, std keys std::string.
+    if (style == ApiStyle::Qt)
+        return "[&]{ QVariantMap __acc; for (auto __i = " + expr + ".cbegin(); __i != " + expr
+             + ".cend(); ++__i) __acc.insert(__i.key(), " + conv + "(__i.value())); return __acc; }()";
+    return "[&]{ QVariantMap __acc; for (const auto& __kv : " + expr
+         + ") __acc.insert(QString::fromStdString(__kv.first), " + conv + "(__kv.second)); return __acc; }()";
+}
+
+static QString recordFromWireExpr(const RecordSet& rs, const QString& t, ApiStyle style,
+                                  const QString& wire, const QString& qual)
+{
+    QString elem;
+    const RecordShape shape = recordShape(rs, t, &elem);
+    if (shape == RecordShape::None) return QString();
+    const QString conv = recFromWireFn(elem);
+    const QString cpp = recordCppType(rs, t, style, qual);
+    if (shape == RecordShape::Scalar) return conv + "(" + wire + ")";
+    if (style == ApiStyle::Lp) {
+        if (shape == RecordShape::List)
+            return "[&]{ " + cpp + " __acc; const nlohmann::json& __src = " + wire
+                 + "; if (__src.is_array()) for (const auto& __e : __src) __acc.push_back(" + conv
+                 + "(__e)); return __acc; }()";
+        return "[&]{ " + cpp + " __acc; const nlohmann::json& __src = " + wire
+             + "; if (__src.is_object()) for (auto __i = __src.begin(); __i != __src.end(); ++__i) "
+               "__acc[__i.key()] = " + conv + "(__i.value()); return __acc; }()";
+    }
+    if (shape == RecordShape::List)
+        return "[&]{ " + cpp + " __acc; for (const QVariant& __e : (" + wire
+             + ").toList()) __acc.push_back(" + conv + "(__e)); return __acc; }()";
+    if (style == ApiStyle::Qt)
+        return "[&]{ " + cpp + " __acc; const QVariantMap __src = (" + wire
+             + ").toMap(); for (auto __i = __src.cbegin(); __i != __src.cend(); ++__i) "
+               "__acc.insert(__i.key(), " + conv + "(__i.value())); return __acc; }()";
+    return "[&]{ " + cpp + " __acc; const QVariantMap __src = (" + wire
+         + ").toMap(); for (auto __i = __src.cbegin(); __i != __src.cend(); ++__i) "
+           "__acc[__i.key().toStdString()] = " + conv + "(__i.value()); return __acc; }()";
+}
+
 // Param-type predicate: passed by const-ref?
 static bool isStdRefType(const QString& t)
 {
     return t == "std::string" || t.startsWith("std::vector")
+        || t == "std::map" || t.startsWith("std::map")
         || t == "LogosMap" || t == "LogosList";
 }
 
@@ -203,10 +375,144 @@ static bool isQtRefType(const QString& t)
         || t == "QJsonArray" || t == "QVariantList" || t == "QVariantMap";
 }
 
-QString makeHeader(const QString& moduleName, const QString& className, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode)
+// ─── Record-aware type / conversion dispatch ─────────────────────────────
+//
+// The one entry point every emission site goes through. A record-bearing type
+// takes the record path; everything else falls through to the pre-existing
+// mapping tables unchanged, so an empty record set is a no-op.
+
+static QString paramTypeFor(const QString& qtType, ApiStyle style, const RecordSet& rs,
+                            const QString& qual = QString())
+{
+    const QString rec = recordCppType(rs, qtType, style, qual);
+    if (!rec.isEmpty()) return rec;
+    return (style == ApiStyle::Qt) ? mapParamType(qtType) : mapParamTypeStd(qtType);
+}
+
+static QString returnTypeFor(const QString& qtType, ApiStyle style, const RecordSet& rs,
+                             const QString& qual = QString())
+{
+    const QString rec = recordCppType(rs, qtType, style, qual);
+    if (!rec.isEmpty()) return rec;
+    return (style == ApiStyle::Qt) ? mapReturnType(qtType) : mapReturnTypeStd(qtType);
+}
+
+// Records are structs — always by const-ref, never copied into a call.
+static bool byRefFor(const QString& qtType, const QString& cppType, ApiStyle style, const RecordSet& rs)
+{
+    if (recordShape(rs, qtType, nullptr) != RecordShape::None) return true;
+    return (style == ApiStyle::Qt) ? isQtRefType(cppType) : isStdRefType(cppType);
+}
+
+// Typed value -> wire value (QVariant for Qt/Std, nlohmann::json for Lp).
+static QString toWireFor(const QString& qtType, ApiStyle style, const RecordSet& rs, const QString& expr)
+{
+    const QString rec = recordToWireExpr(rs, qtType, style, expr);
+    if (!rec.isEmpty()) return rec;
+    if (style == ApiStyle::Lp)  return lpPushExpr(qtType, expr);
+    if (style == ApiStyle::Std) return stdParamToQVariant(qtType, expr);
+    return expr;  // Qt: the wrapper's own surface already IS the wire type
+}
+
+// Wire value -> typed value.
+static QString fromWireFor(const QString& qtType, ApiStyle style, const RecordSet& rs,
+                           const QString& wire, const QString& qual = QString())
+{
+    const QString rec = recordFromWireExpr(rs, qtType, style, wire, qual);
+    if (!rec.isEmpty()) return rec;
+    if (style == ApiStyle::Lp)  return lpFromJsonExpr(qtType, wire);
+    if (style == ApiStyle::Std) return qVariantToStdReturn(qtType, wire);
+    return toQVariantConversion(mapParamType(qtType), wire);
+}
+
+// The struct declarations, emitted inside the wrapper class.
+static void emitRecordStructs(QTextStream& s, const RecordSet& rs, ApiStyle style)
+{
+    if (rs.isEmpty()) return;
+    s << "    // Record types declared by the contract.\n";
+    for (const RecordDef& d : rs) {
+        s << "    struct " << d.name << " {\n";
+        for (const RecordField& f : d.fields)
+            s << "        " << paramTypeFor(f.type, style, rs) << " " << f.name << "{};\n";
+        s << "    };\n";
+    }
+    s << "\n";
+}
+
+// The struct <-> wire conversions, emitted as file-local statics in the
+// generated .cpp. Declared up front so records can reference each other (and
+// themselves, through a list field) regardless of declaration order.
+static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle style,
+                                  const QString& className)
+{
+    if (rs.isEmpty()) return;
+    const QString wire = (style == ApiStyle::Lp) ? "nlohmann::json" : "QVariant";
+    const QString qual = className + "::";
+
+    for (const RecordDef& d : rs) {
+        s << "static " << wire << " " << recToWireFn(d.name)
+          << "(const " << qual << d.name << "& v);\n";
+        s << "static " << qual << d.name << " " << recFromWireFn(d.name)
+          << "(const " << wire << "& w);\n";
+    }
+    s << "\n";
+
+    for (const RecordDef& d : rs) {
+        // Encode.
+        s << "static " << wire << " " << recToWireFn(d.name)
+          << "(const " << qual << d.name << "& v) {\n";
+        if (style == ApiStyle::Lp) {
+            s << "    nlohmann::json __j = nlohmann::json::object();\n";
+            for (const RecordField& f : d.fields)
+                s << "    __j[\"" << f.name << "\"] = "
+                  << toWireFor(f.type, style, rs, "v." + f.name) << ";\n";
+            s << "    return __j;\n";
+        } else {
+            s << "    QVariantMap __m;\n";
+            for (const RecordField& f : d.fields) {
+                // Qt's surface type IS the wire type for non-record fields, so
+                // fromValue is what puts it in the map; records/containers
+                // already produce a QVariant-compatible value.
+                const QString v = toWireFor(f.type, style, rs, "v." + f.name);
+                const bool isRec = recordShape(rs, f.type, nullptr) != RecordShape::None;
+                s << "    __m.insert(QStringLiteral(\"" << f.name << "\"), "
+                  << (isRec || style == ApiStyle::Std ? v : "QVariant::fromValue(" + v + ")")
+                  << ");\n";
+            }
+            s << "    return __m;\n";
+        }
+        s << "}\n\n";
+
+        // Decode. A missing / mistyped field keeps its default rather than
+        // failing the whole call — same leniency the scalar paths use.
+        s << "static " << qual << d.name << " " << recFromWireFn(d.name)
+          << "(const " << wire << "& w) {\n";
+        s << "    " << qual << d.name << " __out;\n";
+        if (style == ApiStyle::Lp) {
+            s << "    if (!w.is_object()) return __out;\n";
+            for (const RecordField& f : d.fields) {
+                const QString acc = "w.at(\"" + f.name + "\")";
+                s << "    if (w.contains(\"" << f.name << "\")) __out." << f.name << " = "
+                  << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
+            }
+        } else {
+            s << "    const QVariantMap __m = w.toMap();\n";
+            for (const RecordField& f : d.fields) {
+                const QString acc = "__m.value(QStringLiteral(\"" + f.name + "\"))";
+                s << "    __out." << f.name << " = "
+                  << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
+            }
+        }
+        s << "    return __out;\n";
+        s << "}\n\n";
+    }
+}
+
+QString makeHeader(const QString& moduleName, const QString& className, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
     if (apiStyle == ApiStyle::Lp)
-        return makeHeaderLp(moduleName, className, methods, events, bindMode);
+        return makeHeaderLp(moduleName, className, methods, events, bindMode, records);
+    const RecordSet rs = parseRecords(records);
     QString h;
     QTextStream s(&h);
     s << "#pragma once\n";
@@ -229,6 +535,8 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         // any events. Cheap to include unconditionally — keeps the
         // header symmetric with the Qt-style branch.
         if (!events.isEmpty()) s << "#include \"logos_object.h\"\n";
+        // Record maps are std::map on the std surface.
+        if (!rs.isEmpty()) s << "#include <map>\n";
         s << "\n";
     } else {
         s << "#include <QString>\n";
@@ -247,6 +555,7 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     }
     s << "class " << className << " {\n";
     s << "public:\n";
+    emitRecordStructs(s, rs, apiStyle);
     if (bindMode == BindMode::Bound) {
         // Interface wrapper: the module to talk to is chosen at runtime.
         s << "    explicit " << className << "(LogosAPI* api, const QString& moduleName);\n\n";
@@ -297,9 +606,8 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         for (int i = 0; i < evParams.size(); ++i) {
             const QJsonObject p = evParams.at(i).toObject();
             QString qtPt = p.value("type").toString();
-            QString pt = (apiStyle == ApiStyle::Std)
-                ? mapParamTypeStd(qtPt) : mapParamType(qtPt);
-            bool byRef = (apiStyle == ApiStyle::Std) ? isStdRefType(pt) : isQtRefType(pt);
+            QString pt = paramTypeFor(qtPt, apiStyle, rs);
+            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
             if (byRef) cbParams += "const " + pt + "& ";
             else       cbParams += pt + " ";
             cbParams += p.value("name").toString();
@@ -316,17 +624,15 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         if (!invokable) continue;
         const QString name = o.value("name").toString();
         const QString qtRet = o.value("returnType").toString();
-        const QString ret = (apiStyle == ApiStyle::Std)
-            ? mapReturnTypeStd(qtRet) : mapReturnType(qtRet);
+        const QString ret = returnTypeFor(qtRet, apiStyle, rs);
         s << "    " << ret << " " << name << "(";
         QJsonArray params = o.value("parameters").toArray();
         for (int i = 0; i < params.size(); ++i) {
             QJsonObject p = params.at(i).toObject();
             QString qtPt = p.value("type").toString();
-            QString pt = (apiStyle == ApiStyle::Std)
-                ? mapParamTypeStd(qtPt) : mapParamType(qtPt);
+            QString pt = paramTypeFor(qtPt, apiStyle, rs);
             QString pn = p.value("name").toString();
-            bool byRef = (apiStyle == ApiStyle::Std) ? isStdRefType(pt) : isQtRefType(pt);
+            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
             if (byRef) s << "const " << pt << "& " << pn;
             else       s << pt << " " << pn;
             if (i + 1 < params.size()) s << ", ";
@@ -344,10 +650,9 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         for (int i = 0; i < params.size(); ++i) {
             QJsonObject p = params.at(i).toObject();
             QString qtPt = p.value("type").toString();
-            QString pt = (apiStyle == ApiStyle::Std)
-                ? mapParamTypeStd(qtPt) : mapParamType(qtPt);
+            QString pt = paramTypeFor(qtPt, apiStyle, rs);
             QString pn = p.value("name").toString();
-            bool byRef = (apiStyle == ApiStyle::Std) ? isStdRefType(pt) : isQtRefType(pt);
+            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
             if (byRef) s << "const " << pt << "& " << pn;
             else       s << pt << " " << pn;
             if (i + 1 < params.size()) s << ", ";
@@ -388,10 +693,11 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     return h;
 }
 
-QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode)
+QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
     if (apiStyle == ApiStyle::Lp)
-        return makeSourceLp(moduleName, className, headerBaseName, methods, events, bindMode);
+        return makeSourceLp(moduleName, className, headerBaseName, methods, events, bindMode, records);
+    const RecordSet rs = parseRecords(records);
     QString c;
     QTextStream s(&c);
     s << "#include \"" << headerBaseName << "\"\n\n";
@@ -412,7 +718,12 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         // std mode when events are present.
         if (!events.isEmpty()) s << "#include \"logos_object.h\"\n";
     }
+    if (apiStyle == ApiStyle::Qt && !rs.isEmpty()) {
+        // Record conversions build QVariantMaps regardless of api style.
+        s << "#include <QVariantMap>\n";
+    }
     s << "\n";
+    emitRecordConversions(s, rs, apiStyle, className);
     // The expression every remote call uses to name its target module.
     // Static: the baked string literal "<moduleName>" (unchanged
     // behaviour). Bound: the m_moduleName member set from the runtime ctor
@@ -524,9 +835,8 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         for (int i = 0; i < evParams.size(); ++i) {
             const QJsonObject p = evParams.at(i).toObject();
             QString qtPt = p.value("type").toString();
-            QString pt = (apiStyle == ApiStyle::Std)
-                ? mapParamTypeStd(qtPt) : mapParamType(qtPt);
-            bool byRef = (apiStyle == ApiStyle::Std) ? isStdRefType(pt) : isQtRefType(pt);
+            QString pt = paramTypeFor(qtPt, apiStyle, rs);
+            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
             if (byRef) cbParams += "const " + pt + "& ";
             else       cbParams += pt + " ";
             cbParams += p.value("name").toString();
@@ -550,13 +860,7 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             QString qtPt = p.value("type").toString();
             // Build the QVariant → typed-arg conversion expression.
             const QString argExpr = QString("_args.at(%1)").arg(i);
-            QString conv;
-            if (apiStyle == ApiStyle::Std) {
-                conv = qVariantToStdReturn(qtPt, argExpr);
-            } else {
-                conv = toQVariantConversion(mapParamType(qtPt), argExpr);
-            }
-            s << conv;
+            s << fromWireFor(qtPt, apiStyle, rs, argExpr);
             if (i + 1 < evParams.size()) s << ", ";
         }
         s << ");\n";
@@ -571,8 +875,11 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         if (!invokable) continue;
         const QString name = o.value("name").toString();
         const QString qtRet = o.value("returnType").toString();
-        const QString ret = (apiStyle == ApiStyle::Std)
-            ? mapReturnTypeStd(qtRet) : mapReturnType(qtRet);
+        // Inside the class's own scope (parameter lists, bodies) a nested
+        // record needs no qualification; a return type written before the
+        // `Class::` in a definition does.
+        const QString ret = returnTypeFor(qtRet, apiStyle, rs);
+        const QString retQual = returnTypeFor(qtRet, apiStyle, rs, className + "::");
         QJsonArray params = o.value("parameters").toArray();
 
         // Helper closures kept inline so the two branches don't get
@@ -580,21 +887,20 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         // the only thing that varies between Qt and Std modes.
         auto emitParam = [&](const QJsonObject& p, bool& byRefOut) {
             QString qtPt = p.value("type").toString();
-            QString pt = (apiStyle == ApiStyle::Std)
-                ? mapParamTypeStd(qtPt) : mapParamType(qtPt);
+            QString pt = paramTypeFor(qtPt, apiStyle, rs);
             QString pn = p.value("name").toString();
-            byRefOut = (apiStyle == ApiStyle::Std) ? isStdRefType(pt) : isQtRefType(pt);
+            byRefOut = byRefFor(qtPt, pt, apiStyle, rs);
             if (byRefOut) s << "const " << pt << "& " << pn;
             else          s << pt << " " << pn;
         };
         auto wireArg = [&](const QJsonObject& p) -> QString {
             QString qtPt = p.value("type").toString();
             QString pn = p.value("name").toString();
-            return (apiStyle == ApiStyle::Std) ? stdParamToQVariant(qtPt, pn) : pn;
+            return toWireFor(qtPt, apiStyle, rs, pn);
         };
 
         // Signature
-        s << ret << " " << className << "::" << name << "(";
+        s << retQual << " " << className << "::" << name << "(";
         for (int i = 0; i < params.size(); ++i) {
             bool byRef;
             emitParam(params.at(i).toObject(), byRef);
@@ -630,12 +936,19 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
 
         // Return conversion
+        const bool retIsRecord = recordShape(rs, qtRet, nullptr) != RecordShape::None;
         if (ret == "void") {
             // nothing
+        } else if (retIsRecord) {
+            s << "    return " << fromWireFor(qtRet, apiStyle, rs, "_result") << ";\n";
         } else if (apiStyle == ApiStyle::Std) {
             s << "    return " << qVariantToStdReturn(qtRet, "_result") << ";\n";
         } else if (ret == "bool") {
             s << "    return _result.toBool();\n";
+        } else if (ret == "qlonglong") {
+            s << "    return _result.toLongLong();\n";
+        } else if (ret == "qulonglong") {
+            s << "    return _result.toULongLong();\n";
         } else if (ret == "int") {
             s << "    return _result.toInt();\n";
         } else if (ret == "double") {
@@ -690,6 +1003,10 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         s << ", [callback](QVariant v) {\n";
         if (ret == "void") {
             s << "        (void)v; callback();\n";
+        } else if (retIsRecord) {
+            // A record decodes field by field; an invalid QVariant yields a
+            // default-constructed struct, matching the scalar paths.
+            s << "        callback(" << fromWireFor(qtRet, apiStyle, rs, "v", className + "::") << ");\n";
         } else if (apiStyle == ApiStyle::Std) {
             // Default-construct on dispatch failure, matching the
             // existing Qt code path which falls back to a zero / empty
@@ -709,7 +1026,8 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         } else {
             QString defaultVal;
             if (ret == "bool") defaultVal = "false";
-            else if (ret == "int" || ret == "double" || ret == "float") defaultVal = "0";
+            else if (ret == "int" || ret == "qlonglong" || ret == "qulonglong"
+                     || ret == "double" || ret == "float") defaultVal = "0";
             else if (ret == "QString") defaultVal = "QString()";
             else if (ret == "QStringList") defaultVal = "QStringList()";
             else if (ret == "QJsonArray") defaultVal = "QJsonArray()";
@@ -871,6 +1189,7 @@ static QString lpFromJsonExpr(const QString& qtType, const QString& jv)
     if (t == "void")                     return QString();
     if (t == "std::string")              return "(" + jv + ".is_string() ? " + jv + ".get<std::string>() : std::string())";
     if (t == "int64_t")                  return "(" + jv + ".is_number_integer() ? " + jv + ".get<int64_t>() : (" + jv + ".is_number() ? static_cast<int64_t>(" + jv + ".get<double>()) : (int64_t)0))";
+    if (t == "uint64_t")                 return "(" + jv + ".is_number_integer() ? " + jv + ".get<uint64_t>() : (" + jv + ".is_number() ? static_cast<uint64_t>(" + jv + ".get<double>()) : (uint64_t)0))";
     if (t == "double")                   return "(" + jv + ".is_number() ? " + jv + ".get<double>() : 0.0)";
     if (t == "bool")                     return "(" + jv + ".is_boolean() ? " + jv + ".get<bool>() : false)";
     if (t == "std::vector<std::string>") return "logos::jsonToStringVec(" + jv + ")";
@@ -889,14 +1208,15 @@ static QString lpFromJsonExpr(const QString& qtType, const QString& jv)
 
 // Build the callback parameter list (std types, by-ref where appropriate) for
 // a typed event accessor `on<Event>`.
-static QString lpEventCbParams(const QJsonArray& evParams)
+static QString lpEventCbParams(const QJsonArray& evParams, const RecordSet& rs)
 {
     QString cbParams;
     for (int i = 0; i < evParams.size(); ++i) {
         const QJsonObject p = evParams.at(i).toObject();
-        const QString pt = mapParamTypeStd(p.value("type").toString());
-        if (isStdRefType(pt)) cbParams += "const " + pt + "& ";
-        else                  cbParams += pt + " ";
+        const QString qtPt = p.value("type").toString();
+        const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+        if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) cbParams += "const " + pt + "& ";
+        else                                      cbParams += pt + " ";
         cbParams += p.value("name").toString();
         if (i + 1 < evParams.size()) cbParams += ", ";
     }
@@ -910,9 +1230,10 @@ static QString lpEventAccessorName(const QString& evName)
     return QString("on") + cap;
 }
 
-QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events, BindMode bindMode)
+QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
     (void)moduleName;
+    const RecordSet rs = parseRecords(records);
     QString h;
     QTextStream s(&h);
     s << "#pragma once\n";
@@ -924,10 +1245,14 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     s << "#include \"logos_json.h\"\n";
     s << "#include \"logos_result.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
-    s << "#include \"logos_lp_client.h\"\n\n";
+    s << "#include \"logos_lp_client.h\"\n";
+    // Record maps are std::map on the Qt-free surface.
+    if (!rs.isEmpty()) s << "#include <map>\n";
+    s << "\n";
 
     s << "class " << className << " {\n";
     s << "public:\n";
+    emitRecordStructs(s, rs, ApiStyle::Lp);
     if (bindMode == BindMode::Bound) {
         // Bound (interface) wrappers are THIN, copyable handles over
         // umbrella-owned persistent State, so a transient
@@ -953,7 +1278,7 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         const QString evName = eo.value("name").toString();
         if (evName.isEmpty()) continue;
         s << "    bool " << lpEventAccessorName(evName)
-          << "(std::function<void(" << lpEventCbParams(eo.value("params").toArray()) << ")> callback);\n";
+          << "(std::function<void(" << lpEventCbParams(eo.value("params").toArray(), rs) << ")> callback);\n";
     }
     if (!events.isEmpty()) s << "\n";
 
@@ -962,15 +1287,16 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         const QJsonObject o = v.toObject();
         if (!o.value("isInvokable").toBool()) continue;
         const QString name = o.value("name").toString();
-        const QString ret = mapReturnTypeStd(o.value("returnType").toString());
+        const QString ret = returnTypeFor(o.value("returnType").toString(), ApiStyle::Lp, rs);
         const QJsonArray params = o.value("parameters").toArray();
 
         s << "    " << ret << " " << name << "(";
         for (int i = 0; i < params.size(); ++i) {
             const QJsonObject p = params.at(i).toObject();
-            const QString pt = mapParamTypeStd(p.value("type").toString());
-            if (isStdRefType(pt)) s << "const " << pt << "& " << p.value("name").toString();
-            else                  s << pt << " " << p.value("name").toString();
+            const QString qtPt = p.value("type").toString();
+            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
+            else                                     s << pt << " " << p.value("name").toString();
             if (i + 1 < params.size()) s << ", ";
         }
         if (!params.isEmpty()) s << ", ";
@@ -982,9 +1308,10 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         s << "    void " << name << "Async(";
         for (int i = 0; i < params.size(); ++i) {
             const QJsonObject p = params.at(i).toObject();
-            const QString pt = mapParamTypeStd(p.value("type").toString());
-            if (isStdRefType(pt)) s << "const " << pt << "& " << p.value("name").toString();
-            else                  s << pt << " " << p.value("name").toString();
+            const QString qtPt = p.value("type").toString();
+            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
+            else                                     s << pt << " " << p.value("name").toString();
             if (i + 1 < params.size()) s << ", ";
         }
         if (!params.isEmpty()) s << ", ";
@@ -1002,12 +1329,14 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     return h;
 }
 
-QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events, BindMode bindMode)
+QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
+    const RecordSet rs = parseRecords(records);
     QString c;
     QTextStream s(&c);
     s << "#include \"" << headerBaseName << "\"\n";
     s << "#include <nlohmann/json.hpp>\n\n";
+    emitRecordConversions(s, rs, ApiStyle::Lp, className);
 
     // How the wrapper reaches its persistent LpClient + subscription store.
     // Static (concrete dep): owns them by value — the wrapper itself is a
@@ -1031,14 +1360,15 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         if (evName.isEmpty()) continue;
         const QJsonArray evParams = eo.value("params").toArray();
         s << "bool " << className << "::" << lpEventAccessorName(evName)
-          << "(std::function<void(" << lpEventCbParams(evParams) << ")> callback) {\n";
+          << "(std::function<void(" << lpEventCbParams(evParams, rs) << ")> callback) {\n";
         s << "    if (!callback) return false;\n";
         s << "    auto _sub = " << clientExpr << ".subscribe(\"" << evName << "\", [callback](nlohmann::json _a) {\n";
         s << "        if (!_a.is_array() || _a.size() < " << evParams.size() << ") return;\n";
         s << "        callback(";
         for (int i = 0; i < evParams.size(); ++i) {
             const QJsonObject p = evParams.at(i).toObject();
-            s << lpFromJsonExpr(p.value("type").toString(), QString("_a.at(%1)").arg(i));
+            s << fromWireFor(p.value("type").toString(), ApiStyle::Lp, rs,
+                             QString("_a.at(%1)").arg(i), className + "::");
             if (i + 1 < evParams.size()) s << ", ";
         }
         s << ");\n";
@@ -1055,15 +1385,17 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         if (!o.value("isInvokable").toBool()) continue;
         const QString name = o.value("name").toString();
         const QString qtRet = o.value("returnType").toString();
-        const QString ret = mapReturnTypeStd(qtRet);
+        const QString ret = returnTypeFor(qtRet, ApiStyle::Lp, rs);
+        const QString retQual = returnTypeFor(qtRet, ApiStyle::Lp, rs, className + "::");
         const QJsonArray params = o.value("parameters").toArray();
 
         auto emitParams = [&]() {
             for (int i = 0; i < params.size(); ++i) {
                 const QJsonObject p = params.at(i).toObject();
-                const QString pt = mapParamTypeStd(p.value("type").toString());
-                if (isStdRefType(pt)) s << "const " << pt << "& " << p.value("name").toString();
-                else                  s << pt << " " << p.value("name").toString();
+                const QString qtPt = p.value("type").toString();
+                const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+                if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
+                else                                     s << pt << " " << p.value("name").toString();
                 if (i + 1 < params.size()) s << ", ";
             }
         };
@@ -1071,12 +1403,12 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
             s << "    nlohmann::json _args = nlohmann::json::array();\n";
             for (const QJsonValue& pv : params) {
                 const QJsonObject p = pv.toObject();
-                s << "    _args.push_back(" << lpPushExpr(p.value("type").toString(), p.value("name").toString()) << ");\n";
+                s << "    _args.push_back(" << toWireFor(p.value("type").toString(), ApiStyle::Lp, rs, p.value("name").toString()) << ");\n";
             }
         };
 
         // Sync
-        s << ret << " " << className << "::" << name << "(";
+        s << retQual << " " << className << "::" << name << "(";
         emitParams();
         if (!params.isEmpty()) s << ", ";
         s << "logos::CallError* err) {\n";
@@ -1085,7 +1417,7 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
             s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
         } else {
             s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
-            s << "    return " << lpFromJsonExpr(qtRet, "_r") << ";\n";
+            s << "    return " << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ";\n";
         }
         s << "}\n\n";
 
@@ -1103,7 +1435,7 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         if (ret == "void") {
             s << "        (void)_r; callback();\n";
         } else {
-            s << "        callback(" << lpFromJsonExpr(qtRet, "_r") << ");\n";
+            s << "        callback(" << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ");\n";
         }
         s << "    });\n";
         s << "}\n\n";

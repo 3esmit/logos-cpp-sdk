@@ -29,6 +29,11 @@
 // cdylib-supported subset.
 bool lidlCdylibSupported(const ModuleDecl& module, QString* error);
 
+// The record structs a contract declares, plus their codec — a Qt-free header
+// the author's impl class includes so it can name the structs directly.
+// Empty of types (but still valid) when the contract declares no records.
+QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module);
+
 QString lidlMakeModuleImplExports(const ModuleDecl& module,
                                   const QString& implClass,
                                   const QString& implHeader);

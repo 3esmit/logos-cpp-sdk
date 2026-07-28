@@ -1,0 +1,10 @@
+{
+    "name": "sample_module",
+    "version": "1.2.3",
+    "description": "A sample module for testing",
+    "author": "Test",
+    "type": "core",
+    "category": "testing",
+    "main": "sample_module_plugin",
+    "dependencies": ["dep_a", "dep_b"]
+}

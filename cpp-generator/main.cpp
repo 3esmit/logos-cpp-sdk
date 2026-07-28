@@ -172,6 +172,10 @@ int main(int argc, char* argv[])
                 }
                 struct Out { QString file; QString content; };
                 QList<Out> outs;
+                // Always emitted, records or not: the exports TU and the events
+                // sidecar both reference the generated codec, and a module with
+                // no `type` decls still has containers to encode.
+                outs.append({qs(mod.name) + "_types.h", lidlMakeTypesHeaderCdylib(mod)});
                 outs.append({qs(mod.name) + "_module_impl.cpp",
                              lidlMakeModuleImplExports(mod, implClass, implHeader)});
                 if (!mod.events.empty())
@@ -274,6 +278,7 @@ int main(int argc, char* argv[])
                         implHeader = args.at(implHeaderIdx + 1);
                     else
                         implHeader = qs(mod.name) + "_impl.h";
+                    outs.append({qs(mod.name) + "_types.h", lidlMakeTypesHeaderCdylib(mod)});
                     outs.append({qs(mod.name) + "_module_impl.cpp",
                                  lidlMakeModuleImplExports(mod, implClass, implHeader)});
                     if (!mod.events.empty())

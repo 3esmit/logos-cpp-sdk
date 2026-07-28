@@ -66,7 +66,7 @@ TEST(LidlGenClient, HeaderHasSyncMethods)
     auto m = makeTestModule();
     QString h = lidlMakeHeader(m);
     EXPECT_TRUE(h.contains("QString createAccount("));
-    EXPECT_TRUE(h.contains("int getBalance("));
+    EXPECT_TRUE(h.contains("qulonglong getBalance("));
     EXPECT_TRUE(h.contains("QStringList listAccounts("));
 }
 
@@ -149,8 +149,9 @@ TEST(LidlGenClient, SourceHasReturnConversion)
     QString s = lidlMakeSource(m);
     // createAccount returns tstr → QString, should use .toString()
     EXPECT_TRUE(s.contains("_result.toString()"));
-    // getBalance returns uint → int, should use .toInt()
-    EXPECT_TRUE(s.contains("_result.toInt()"));
+    // getBalance returns uint → qulonglong, so the accessor must be the 64-bit
+    // unsigned one; toInt() truncated and re-signed it.
+    EXPECT_TRUE(s.contains("_result.toULongLong()"));
     // listAccounts returns [tstr] → QStringList, should use .toStringList()
     EXPECT_TRUE(s.contains("_result.toStringList()"));
 }
@@ -249,3 +250,117 @@ TEST(LidlGenClient, VoidReturnMethod)
     // The source should just call the method without capturing return
     EXPECT_FALSE(s.contains("QVariant _result = m_client->invokeRemoteMethod(\"test\", \"doStuff\""));
 }
+
+// Records: a `type` decl becomes a real C++ struct in the generated header, so a
+// Qt consumer says `Status s = client.makeStatus();` rather than digging fields
+// out of a QVariantMap. Additive — nothing generated records before this.
+static ModuleDecl makeRecordModule()
+{
+    ModuleDecl m;
+    m.name = "info_module";
+    m.version = "1.0.0";
+
+    TypeDecl rec;
+    rec.name = "Status";
+    FieldDecl a; a.name = "port"; a.type = { TypeExpr::Primitive, "uint", {} };
+    FieldDecl b; b.name = "blob"; b.type = { TypeExpr::Primitive, "bstr", {} };
+    rec.fields = {a, b};
+    m.types.push_back(rec);
+
+    {
+        MethodDecl md;
+        md.name = "describeStatus";
+        md.returnType = { TypeExpr::Primitive, "tstr", {} };
+        ParamDecl p; p.name = "s"; p.type = { TypeExpr::Named, "Status", {} };
+        md.params.push_back(p);
+        m.methods.push_back(md);
+    }
+    {
+        MethodDecl md;
+        md.name = "makeStatuses";
+        TypeExpr elem = { TypeExpr::Named, "Status", {} };
+        md.returnType = { TypeExpr::Array, "", { elem } };
+        m.methods.push_back(md);
+    }
+    return m;
+}
+
+// `isTaggedBytes()` is checked BEFORE `is_object()` in both the codec and the
+// QVariant bridge, so a record whose only field is a tstr named `_bytes` is
+// wire-identical to a tagged byte string and decodes as bytes — the struct
+// silently disappears. The ambiguity is inherent to the tagged form; refusing
+// to emit the one shape guaranteed to misdecode is what a generator can do
+// about it.
+TEST(LidlGenClient, RecordThatCollidesWithTheBytesTagIsRefused)
+{
+    ModuleDecl m;
+    m.name = "c_module";
+    TypeDecl bad;
+    bad.name = "Sneaky";
+    FieldDecl f; f.name = "_bytes"; f.type = { TypeExpr::Primitive, "tstr", {} };
+    bad.fields = {f};
+    m.types.push_back(bad);
+
+    QString err;
+    EXPECT_FALSE(lidlCheckRecords(m, &err));
+    EXPECT_TRUE(err.contains("Sneaky")) << err.toStdString();
+    EXPECT_TRUE(err.contains("_bytes")) << err.toStdString();
+
+    // A SECOND field disambiguates it — isTaggedBytes requires exactly one key,
+    // so this shape round-trips and must still be allowed.
+    FieldDecl g; g.name = "other"; g.type = { TypeExpr::Primitive, "int", {} };
+    m.types[0].fields.push_back(g);
+    EXPECT_TRUE(lidlCheckRecords(m, nullptr));
+
+    // A `_bytes` field that is not the only one, and a differently-named sole
+    // field, are both fine.
+    ModuleDecl ok;
+    ok.name = "ok_module";
+    TypeDecl t; t.name = "Fine";
+    FieldDecl h; h.name = "payload"; h.type = { TypeExpr::Primitive, "tstr", {} };
+    t.fields = {h};
+    ok.types.push_back(t);
+    EXPECT_TRUE(lidlCheckRecords(ok, nullptr));
+}
+
+// The ASYNC overload must decode a record the same way the sync one does.
+//
+// `qvariant_cast<Status>(v)` does not fail on the wire's QVariantMap: no
+// Q_DECLARE_METATYPE is emitted for the struct, so the cast silently yields a
+// DEFAULT-CONSTRUCTED Status and the caller sees empty fields with no
+// diagnostic. The sync path was already correct, which makes it worse — the
+// same call would be right or wrong depending only on which overload the
+// caller reached for.
+TEST(LidlGenClient, AsyncRecordReturnsDecodeFieldByField)
+{
+    const QString c = lidlMakeSource(makeRecordModule(), BindMode::Bound);
+
+    // A [Record] return, in the async callback.
+    EXPECT_TRUE(c.contains("StatusFromVariant")) << c.toStdString();
+    EXPECT_FALSE(c.contains("qvariant_cast<QList<Status>>")) << c.toStdString();
+    EXPECT_FALSE(c.contains("qvariant_cast<Status>")) << c.toStdString();
+}
+
+TEST(LidlGenClient, RecordsBecomeStructsWithConversions)
+{
+    const QString h = lidlMakeHeader(makeRecordModule(), BindMode::Bound);
+
+    // The struct, at the 1-1 Qt spellings: 64-bit unsigned, QByteArray for bytes.
+    EXPECT_TRUE(h.contains("struct Status {")) << h.toStdString();
+    EXPECT_TRUE(h.contains("qulonglong port{};")) << h.toStdString();
+    EXPECT_TRUE(h.contains("QByteArray blob{};")) << h.toStdString();
+
+    // Conversions both ways.
+    EXPECT_TRUE(h.contains("inline QVariant StatusToVariant(const Status& v)")) << h.toStdString();
+    EXPECT_TRUE(h.contains("inline Status StatusFromVariant(const QVariant& value)")) << h.toStdString();
+    // A bstr field is a QByteArray: logos-protocol's QVariant<->JSON conversion
+    // already materialises the tagged {"_bytes":…} form as QByteArray, so binary
+    // survives without record-specific bytes handling.
+    EXPECT_TRUE(h.contains("__out.blob = __m.value(\"blob\").toByteArray();")) << h.toStdString();
+
+    // Methods speak the record: by const& in, typed list out. A QVariantList
+    // could not hold a Status without Q_DECLARE_METATYPE.
+    EXPECT_TRUE(h.contains("describeStatus(const Status& s")) << h.toStdString();
+    EXPECT_TRUE(h.contains("QList<Status> makeStatuses(")) << h.toStdString();
+}
+

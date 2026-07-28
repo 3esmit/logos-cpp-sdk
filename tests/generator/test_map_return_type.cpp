@@ -31,3 +31,16 @@ TEST(MapReturnTypeTest, UnknownType)
 {
     EXPECT_EQ(mapReturnType("MyCustomType"), "QVariant");
 }
+
+// LIDL int/uint are 64-bit, and since the Qt spelling became qlonglong/qulonglong
+// they have to be in the known set — otherwise every int/uint method silently
+// degrades to an opaque QVariant in the generated lp/std consumer wrappers.
+TEST(MapReturnType, SixtyFourBitIntegersAreKnown)
+{
+    EXPECT_EQ(mapReturnType("qlonglong"), "qlonglong");
+    EXPECT_EQ(mapReturnType("qulonglong"), "qulonglong");
+    EXPECT_EQ(mapReturnType("const qlonglong&"), "qlonglong");
+    // An unknown spelling still falls back.
+    EXPECT_EQ(mapReturnType("SomeRecord"), "QVariant");
+}
+

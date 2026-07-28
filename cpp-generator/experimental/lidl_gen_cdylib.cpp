@@ -3,6 +3,9 @@
 
 #include <QTextStream>
 
+#include <set>
+#include <string>
+
 QString lidlToPascalCase(const QString& name);
 QString lidlTypeToQt(const TypeExpr& te);
 bool lidlIsStdConvertible(const TypeExpr& te);
@@ -12,7 +15,23 @@ namespace {
 // The cdylib-supported subset: std-convertible LIDL types only — the same
 // Qt-free set the std apiStyle handled, so any universal module that built
 // under std also builds as a header-first cdylib.
-bool typeSupported(const TypeExpr& te, bool isReturn)
+// The records a contract DECLARES. A `Named` type is a record only if it is in
+// here: `void` is not a LIDL builtin, so `-> void` arrives as Named("void") and
+// treating every Named as a record is how the Rust generator once emitted
+// `-> Void`. Same trap, same guard.
+std::set<std::string> recordNames(const ModuleDecl& module)
+{
+    std::set<std::string> out;
+    for (const TypeDecl& t : module.types) out.insert(t.name);
+    return out;
+}
+
+bool isRecord(const TypeExpr& te, const std::set<std::string>& recs)
+{
+    return te.kind == TypeExpr::Named && recs.count(te.name) > 0;
+}
+
+bool typeSupported(const TypeExpr& te, bool isReturn, const std::set<std::string>& recs)
 {
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "tstr" || te.name == "bstr" || te.name == "int"
@@ -27,60 +46,44 @@ bool typeSupported(const TypeExpr& te, bool isReturn)
             return true;
         return false;
     }
-    if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
-        const TypeExpr& e = te.elements[0];
-        // `bstr` elements are the one array kind that cannot ride nlohmann's
-        // blanket get<>(): each element is the tagged {"_bytes": base64url}
-        // OBJECT, not a number array, so it needs the emitted per-element
-        // codec (lidlBytesListFromJson / lidlBytesListToJson) below.
-        return e.kind == TypeExpr::Primitive
-            && (e.name == "tstr" || e.name == "int" || e.name == "uint"
-                || e.name == "float64" || e.name == "bool" || e.name == "any"
-                || e.name == "bstr");
-    }
-    // Maps ({k: v}, i.e. LogosMap) round-trip through nlohmann too.
-    if (te.kind == TypeExpr::Map)
+    // A declared record is a generated struct with a generated codec.
+    if (isRecord(te, recs))
         return true;
-    return false;
-}
-
-// `[bstr]` — an array of byte strings (std::vector<std::vector<uint8_t>>).
-// Every place scalar `bstr` needs the tagged-bytes codec, this needs the list
-// form of it, so the check lives in one place.
-bool isBytesArray(const TypeExpr& te)
-{
-    return te.kind == TypeExpr::Array && te.elements.size() == 1
-        && te.elements[0].kind == TypeExpr::Primitive
-        && te.elements[0].name == "bstr";
-}
-
-// True when the module mentions `[bstr]` anywhere the emitted TU has to encode
-// or decode it — method params, method returns, or event payloads. Gates the
-// list codec so modules that never use it don't carry an unused static function
-// (the same reason hasBytesEventParam() gates the scalar encoder).
-bool usesBytesArray(const ModuleDecl& module)
-{
-    for (const MethodDecl& md : module.methods) {
-        if (isBytesArray(md.returnType))
-            return true;
-        for (const ParamDecl& pd : md.params)
-            if (isBytesArray(pd.type))
-                return true;
+    // Recurse rather than whitelisting element names: that admits [bstr],
+    // [[int]], [Record] and [{tstr: T}] in one rule, and keeps the gate and
+    // the spelling function agreeing about what is expressible.
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1)
+        return typeSupported(te.elements[0], false, recs);
+    // Only tstr keys: the generated codec spells a map as
+    // std::map<std::string, T>, so a non-tstr key has no C++ spelling. This
+    // used to `return true` for ANY map, which admitted `{int: tstr}` and then
+    // silently produced a LogosMap that lost the key type.
+    if (te.kind == TypeExpr::Map) {
+        if (te.elements.size() != 2) return false;
+        const TypeExpr& k = te.elements[0];
+        if (!(k.kind == TypeExpr::Primitive && k.name == "tstr")) return false;
+        return typeSupported(te.elements[1], false, recs);
     }
-    for (const EventDecl& ed : module.events)
-        for (const ParamDecl& pd : ed.params)
-            if (isBytesArray(pd.type))
-                return true;
     return false;
 }
 
 // Qt-free spelling of a LIDL type (defined below). Forward-declared so the
 // method-param decoder can spell composite `any` containers as their nlohmann
 // aliases instead of Qt containers in this Qt-free TU.
-QString lidlTypeToStdCdylib(const TypeExpr& te);
+QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& recs);
 
 // json arg expression -> std-typed C++ expression
-QString jsonArgToStd(const TypeExpr& te, const QString& expr)
+// A method argument, decoded into the author's C++ type.
+//
+// Everything that is not a plain scalar goes through the generated codec, which
+// recurses — so a bstr keeps its canonical tag at ANY depth and a record
+// decodes field by field with a path in the error. The scalars keep their
+// nlohmann accessor verbatim: `.get<int64_t>()` TRUNCATES a float rather than
+// throwing, and that leniency is pinned by the conformance matrix
+// (`hostile/int/fractional` expects 3 from 3.7 on this provider). Routing them
+// through the codec would silently change behaviour that something depends on.
+QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& path,
+                     const std::set<std::string>& recs)
 {
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "tstr")    return expr + ".get<std::string>()";
@@ -89,26 +92,17 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr)
         if (te.name == "uint")    return expr + ".get<uint64_t>()";
         if (te.name == "float64") return expr + ".get<double>()";
         if (te.name == "bool")    return expr + ".get<bool>()";
+        if (te.name == "any")     return expr;
     }
-    if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
-        // `[bstr]` cannot go through get<std::vector<std::vector<uint8_t>>>():
-        // its elements arrive as tagged {"_bytes": …} objects, which nlohmann
-        // would refuse (and a raw number-array element would silently bypass
-        // the base64 decode). Route it through the per-element codec instead.
-        if (isBytesArray(te))
-            return "lidlBytesListFromJson(" + expr + ")";
-        // Qt-free spelling: `[any]` must decode as LogosList, NOT QVariantList
-        // (lidlTypeToStd's Qt fallback), which is undeclared in this TU. Typed
-        // scalar arrays ([tstr]/[int]/…) are unaffected — Cdylib defers to the
-        // same std spelling for them.
-        const QString inner = lidlTypeToStdCdylib(te);
-        return expr + ".get<" + inner + ">()";
-    }
-    return expr;
+    const QString cpp = lidlTypeToStdCdylib(te, recs);
+    if (cpp == "LogosMap" || cpp == "LogosList")
+        return expr;  // untyped JSON passes through, as it always has
+    return "logos_gen::Codec<" + cpp + ">::from(" + expr + ", \"" + path + "\")";
 }
 
 // std-typed return variable -> json expression
-QString stdReturnToJson(const MethodDecl& md, const QString& var)
+QString stdReturnToJson(const MethodDecl& md, const QString& var,
+                        const std::set<std::string>& recs)
 {
     const TypeExpr& te = md.returnType;
     if (md.resultReturn) {
@@ -116,18 +110,24 @@ QString stdReturnToJson(const MethodDecl& md, const QString& var)
         // (same shape logos_json_convert emits for Qt LogosResult).
         return "lidlResultToJson(" + var + ")";
     }
-    if (md.jsonReturn) {
+    // `jsonReturn` is set by the front end for any map/list return, but that no
+    // longer implies the C++ type IS nlohmann::json: a TYPED map now spells
+    // std::map<std::string, T>. Checking the flag before the spelling emitted
+    // `result.dump()` on a std::map. The spelling decides.
+    const QString cppRet = lidlTypeToStdCdylib(te, recs);
+    if (md.jsonReturn && (cppRet == "LogosMap" || cppRet == "LogosList")) {
         return var;  // LogosMap / LogosList are nlohmann::json already
     }
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "bstr") return "lidlBytesToJson(" + var + ")";
+        if (te.name == "any")  return var;
         return "nlohmann::json(" + var + ")";
     }
-    // `[bstr]`: nlohmann::json(std::vector<std::vector<uint8_t>>) would emit
-    // nested number arrays, which no consumer decodes as bytes. Tag each element.
-    if (isBytesArray(te))
-        return "lidlBytesListToJson(" + var + ")";
-    return "nlohmann::json(" + var + ")";
+    if (cppRet == "LogosMap" || cppRet == "LogosList")
+        return var;
+    // `nlohmann::json(v)` would serialize a vector<uint8_t> as a plain number
+    // array and a record not at all; the codec keeps bytes tagged at depth.
+    return "logos_gen::Codec<" + cppRet + ">::to(" + var + ")";
 }
 
 // Qt-free spelling of a LIDL type. lidlTypeToStd() falls back to Qt containers
@@ -136,16 +136,35 @@ QString stdReturnToJson(const MethodDecl& md, const QString& var)
 // spell those as their nlohmann aliases (LogosMap / LogosList) instead. Without
 // this the events sidecar emits a bare `QVariant` parameter and does not
 // compile.
-QString lidlTypeToStdCdylib(const TypeExpr& te)
+QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& recs)
 {
     if (te.kind == TypeExpr::Primitive && te.name == "any")
         return "LogosMap";
-    if (te.kind == TypeExpr::Map)
+    // `{tstr: any}` and `[any]` keep their nlohmann aliases: every existing
+    // universal module spells them that way, and narrowing them would be a
+    // source break for no gain (they ARE untyped JSON).
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2
+        && te.elements[1].kind == TypeExpr::Primitive && te.elements[1].name == "any")
         return "LogosMap";
     if (te.kind == TypeExpr::Array && te.elements.size() == 1
         && te.elements[0].kind == TypeExpr::Primitive
         && te.elements[0].name == "any")
         return "LogosList";
+
+    // A declared record is its generated struct.
+    if (isRecord(te, recs))
+        return qs(te.name);
+    // Recurse, so [bstr] is std::vector<std::vector<uint8_t>> and {tstr: Blob}
+    // is std::map<std::string, Blob>. lidlTypeToStd() would answer QVariantList
+    // / QVariantMap here — a Qt name in a Qt-FREE translation unit, which only
+    // failed to appear because the gate used to reject these types. Widening
+    // the gate makes that fallback a live leak, so composites must never reach
+    // it.
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1)
+        return "std::vector<" + lidlTypeToStdCdylib(te.elements[0], recs) + ">";
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2)
+        return "std::map<std::string, " + lidlTypeToStdCdylib(te.elements[1], recs) + ">";
+
     return lidlTypeToStd(te);
 }
 
@@ -153,44 +172,181 @@ QString lidlTypeToStdCdylib(const TypeExpr& te)
 // reason the events sidecar needs the bytes encoder. Emitting it unconditionally
 // leaves an unused static function (a -Wunused-function warning) in every module
 // whose events carry no binary data.
+// ── The generated codec ─────────────────────────────────────────────────────
+//
+// Emitted into the module's types header so the author's impl class and the
+// generated dispatch share one definition of how a value crosses the wire.
+//
+// This is deliberately the same SHAPE as logos-protocol's logos_codec.h — and
+// it exists as generated code only because that header cannot currently be
+// included here: logos_json.h (which every universal module pulls in for
+// LogosMap) and logos_codec.h both define logos::b64UrlEncode /
+// b64UrlDecode / bytesToJson as inline, so including both in one translation
+// unit is a redefinition error. Unify when that is resolved; the emitted
+// specializations would then be the only generated part.
+//
+// The primary template is intentionally left UNDEFINED: an unsupported T is a
+// compile error naming the type, never a silent default-constructed value.
+void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
+                        const std::set<std::string>& recs)
+{
+    s << "namespace logos_gen {\n\n";
+    s << "// Codec<T>::to / ::from — the one place a value's wire form is decided.\n";
+    s << "// The primary template is undefined on purpose: an unsupported T is a\n";
+    s << "// compile error naming the type, not a silent default.\n";
+    s << "template <class T> struct Codec;\n\n";
+
+    s << "[[noreturn]] inline void lidlTypeError(const char* want, const std::string& path,\n";
+    s << "                                       const nlohmann::json& got)\n{\n";
+    s << "    throw std::runtime_error(std::string(\"expected \") + want + \" at \" + path\n";
+    s << "                             + \", got \" + std::string(got.type_name()));\n}\n\n";
+
+    // Scalars. Their leniency matches what the dispatch did before the codec
+    // existed, so behaviour for already-working modules is unchanged.
+    struct Scalar { const char* cpp; const char* want; const char* check; const char* get; };
+    const Scalar scalars[] = {
+        {"std::string",  "string",  "is_string()",         "get<std::string>()"},
+        {"int64_t",      "integer", "is_number()",         "get<int64_t>()"},
+        {"uint64_t",     "integer", "is_number()",         "get<uint64_t>()"},
+        {"double",       "number",  "is_number()",         "get<double>()"},
+        {"bool",         "boolean", "is_boolean()",        "get<bool>()"},
+    };
+    for (const Scalar& sc : scalars) {
+        s << "template <> struct Codec<" << sc.cpp << "> {\n";
+        s << "    static nlohmann::json to(const " << sc.cpp << "& v) { return nlohmann::json(v); }\n";
+        s << "    static " << sc.cpp << " from(const nlohmann::json& j, const std::string& path) {\n";
+        s << "        if (!j." << sc.check << ") lidlTypeError(\"" << sc.want << "\", path, j);\n";
+        s << "        return j." << sc.get << ";\n    }\n};\n\n";
+    }
+
+    // bstr. The FULL specialization wins over the generic vector rule below,
+    // which is what keeps bytes tagged at every depth instead of being
+    // serialized as a plain array of numbers.
+    s << "template <> struct Codec<std::vector<uint8_t>> {\n";
+    s << "    static nlohmann::json to(const std::vector<uint8_t>& v) { return logos::bytesToJson(v); }\n";
+    s << "    static std::vector<uint8_t> from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (j.is_object() && j.size() == 1 && j.contains(\"_bytes\")\n";
+    s << "            && j.at(\"_bytes\").is_string())\n";
+    s << "            return logos::jsonToBytes(j);\n";
+    s << "        lidlTypeError(\"bytes\", path, j);\n    }\n};\n\n";
+
+    // Untyped JSON passes through unchanged — `any`, and the LogosMap/LogosList
+    // aliases, are all nlohmann::json.
+    s << "template <> struct Codec<nlohmann::json> {\n";
+    s << "    static nlohmann::json to(const nlohmann::json& v) { return v; }\n";
+    s << "    static nlohmann::json from(const nlohmann::json& j, const std::string&) { return j; }\n";
+    s << "};\n\n";
+
+    s << "template <class T> struct Codec<std::vector<T>> {\n";
+    s << "    static nlohmann::json to(const std::vector<T>& v) {\n";
+    s << "        nlohmann::json out = nlohmann::json::array();\n";
+    s << "        for (const T& e : v) out.push_back(Codec<T>::to(e));\n";
+    s << "        return out;\n    }\n";
+    s << "    static std::vector<T> from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (!j.is_array()) lidlTypeError(\"array\", path, j);\n";
+    s << "        std::vector<T> out;\n        out.reserve(j.size());\n";
+    s << "        for (size_t i = 0; i < j.size(); ++i)\n";
+    s << "            out.push_back(Codec<T>::from(j.at(i), path + \"[\" + std::to_string(i) + \"]\"));\n";
+    s << "        return out;\n    }\n};\n\n";
+
+    s << "template <class T> struct Codec<std::map<std::string, T>> {\n";
+    s << "    static nlohmann::json to(const std::map<std::string, T>& v) {\n";
+    s << "        nlohmann::json out = nlohmann::json::object();\n";
+    s << "        for (const auto& kv : v) out[kv.first] = Codec<T>::to(kv.second);\n";
+    s << "        return out;\n    }\n";
+    s << "    static std::map<std::string, T> from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (!j.is_object()) lidlTypeError(\"object\", path, j);\n";
+    s << "        std::map<std::string, T> out;\n";
+    s << "        for (auto it = j.begin(); it != j.end(); ++it)\n";
+    s << "            out.emplace(it.key(), Codec<T>::from(it.value(), path + \".\" + it.key()));\n";
+    s << "        return out;\n    }\n};\n\n";
+
+    // One specialization per declared record. Field order follows the contract.
+    for (const TypeDecl& t : module.types) {
+        const QString name = qs(t.name);
+        s << "template <> struct Codec<" << name << "> {\n";
+        s << "    static nlohmann::json to(const " << name << "& v) {\n";
+        s << "        nlohmann::json out = nlohmann::json::object();\n";
+        for (const FieldDecl& f : t.fields) {
+            const QString ft = lidlTypeToStdCdylib(f.type, recs);
+            s << "        out[\"" << qs(f.name) << "\"] = Codec<" << ft << ">::to(v."
+              << qs(f.name) << ");\n";
+        }
+        s << "        return out;\n    }\n";
+        s << "    static " << name << " from(const nlohmann::json& j, const std::string& path) {\n";
+        s << "        if (!j.is_object()) lidlTypeError(\"object\", path, j);\n";
+        s << "        " << name << " out;\n";
+        for (const FieldDecl& f : t.fields) {
+            const QString ft = lidlTypeToStdCdylib(f.type, recs);
+            const QString fn = qs(f.name);
+            // A missing field is reported at its own path rather than
+            // default-constructed: a record that silently loses a field is the
+            // failure mode this whole layer exists to prevent.
+            s << "        out." << fn << " = Codec<" << ft << ">::from(\n";
+            s << "            j.contains(\"" << fn << "\") ? j.at(\"" << fn
+              << "\") : nlohmann::json(),\n";
+            s << "            path + \"." << fn << "\");\n";
+        }
+        s << "        return out;\n    }\n};\n\n";
+    }
+    s << "}  // namespace logos_gen\n\n";
+}
+
 bool hasBytesEventParam(const ModuleDecl& module)
 {
     for (const EventDecl& ed : module.events)
         for (const ParamDecl& pd : ed.params)
-            if ((pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
-                || isBytesArray(pd.type))
+            if (pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
                 return true;
     return false;
 }
 
-// True when an EVENT carries `[bstr]`, so the sidecar needs the list encoder on
-// top of the scalar one. Method params/returns are handled in the impl TU.
-bool hasBytesArrayEventParam(const ModuleDecl& module)
+// The Qt spelling of what actually crosses the Qt boundary.
+//
+// NOT lidlTypeToQt: that answers the CONSUMER's question ("what type does the
+// caller hold?") and since records became real structs it answers `Blob` /
+// `QList<Blob>`. Those names are correct in a generated consumer wrapper, where
+// the struct exists — but this JSON is the module's getMethods(), read by the
+// host to marshal a QVariant across the plugin boundary, and there is no
+// metatype called `Blob`. Emitting it made the host SIGSEGV on the first call
+// to any record method.
+//
+// A record IS a variant map at that boundary; the struct only exists inside the
+// cdylib.
+QString lidlTypeToQtWire(const TypeExpr& te, const std::set<std::string>& recs)
 {
-    for (const EventDecl& ed : module.events)
-        for (const ParamDecl& pd : ed.params)
-            if (isBytesArray(pd.type))
-                return true;
-    return false;
+    if (isRecord(te, recs))
+        return "QVariantMap";
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1
+        && isRecord(te.elements[0], recs))
+        return "QVariantList";
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2
+        && isRecord(te.elements[1], recs))
+        return "QVariantMap";
+    return lidlTypeToQt(te);
 }
 
 // True when any event parameter is spelled LogosMap / LogosList, so the sidecar
 // needs <logos_json.h> for those aliases.
 bool hasJsonEventParam(const ModuleDecl& module)
 {
+    const std::set<std::string> recs = recordNames(module);
     for (const EventDecl& ed : module.events)
         for (const ParamDecl& pd : ed.params) {
-            const QString t = lidlTypeToStdCdylib(pd.type);
+            const QString t = lidlTypeToStdCdylib(pd.type, recs);
             if (t == "LogosMap" || t == "LogosList")
                 return true;
         }
     return false;
 }
 
-// `withList` additionally emits lidlBytesListToJson for `[bstr]`. Off by
-// default so a module that never carries a byte-string array does not gain an
-// unused static function.
-void emitBytesEncodeHelpers(QTextStream& s, bool withList = false)
+// The SCALAR tagged-bytes helpers. A `[bstr]` (and bytes at any deeper
+// nesting) rides logos_gen::Codec instead: its full specialization for
+// std::vector<uint8_t> beats the generic vector rule, so one mechanism covers
+// [bstr], [[bstr]] and {tstr: [bstr]} alike. #111 emitted a dedicated depth-1
+// list codec here; the generic one subsumes it, and keeping both left an
+// unused static in every module that mentioned [bstr].
+void emitBytesEncodeHelpers(QTextStream& s)
 {
     s << "// Canonical tagged bytes form {\"_bytes\": base64url} (see logos_protocol.h)\n";
     s << "std::string lidlB64UrlEncode(const std::vector<uint8_t>& bytes)\n{\n";
@@ -212,17 +368,11 @@ void emitBytesEncodeHelpers(QTextStream& s, bool withList = false)
     s << "nlohmann::json lidlBytesToJson(const std::vector<uint8_t>& bytes)\n{\n";
     s << "    return nlohmann::json{{\"_bytes\", lidlB64UrlEncode(bytes)}};\n}\n\n";
 
-    if (withList) {
-        s << "nlohmann::json lidlBytesListToJson(const std::vector<std::vector<uint8_t>>& list)\n{\n";
-        s << "    nlohmann::json out = nlohmann::json::array();\n";
-        s << "    for (const std::vector<uint8_t>& bytes : list)\n";
-        s << "        out.push_back(lidlBytesToJson(bytes));\n";
-        s << "    return out;\n}\n\n";
-    }
 }
 
 void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
 {
+    const std::set<std::string> recs = recordNames(module);
     s << "static nlohmann::json lidlInterfaceJson()\n{\n";
     s << "    nlohmann::json methods = nlohmann::json::array();\n";
     for (const MethodDecl& md : module.methods) {
@@ -235,17 +385,17 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         }
         QString sig = qs(md.name) + "(";
         for (int i = 0; i < md.params.size(); ++i) {
-            sig += lidlTypeToQt(md.params[i].type);
+            sig += lidlTypeToQtWire(md.params[i].type, recs);
             if (i + 1 < md.params.size()) sig += ",";
         }
         sig += ")";
         s << "        obj[\"signature\"] = \"" << sig << "\";\n";
-        s << "        obj[\"returnType\"] = \"" << lidlTypeToQt(md.returnType) << "\";\n";
+        s << "        obj[\"returnType\"] = \"" << lidlTypeToQtWire(md.returnType, recs) << "\";\n";
         s << "        obj[\"isInvokable\"] = true;\n";
         if (!md.params.empty()) {
             s << "        nlohmann::json params = nlohmann::json::array();\n";
             for (const ParamDecl& pd : md.params) {
-                s << "        params.push_back({{\"type\", \"" << lidlTypeToQt(pd.type)
+                s << "        params.push_back({{\"type\", \"" << lidlTypeToQtWire(pd.type, recs)
                   << "\"}, {\"name\", \"" << pd.name << "\"}});\n";
             }
             s << "        obj[\"parameters\"] = params;\n";
@@ -263,7 +413,7 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         }
         QString sig = qs(ed.name) + "(";
         for (int i = 0; i < ed.params.size(); ++i) {
-            sig += lidlTypeToQt(ed.params[i].type);
+            sig += lidlTypeToQtWire(ed.params[i].type, recs);
             if (i + 1 < ed.params.size()) sig += ",";
         }
         sig += ")";
@@ -271,7 +421,7 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         if (!ed.params.empty()) {
             s << "        nlohmann::json params = nlohmann::json::array();\n";
             for (const ParamDecl& pd : ed.params) {
-                s << "        params.push_back({{\"type\", \"" << lidlTypeToQt(pd.type)
+                s << "        params.push_back({{\"type\", \"" << lidlTypeToQtWire(pd.type, recs)
                   << "\"}, {\"name\", \"" << pd.name << "\"}});\n";
             }
             s << "        obj[\"parameters\"] = params;\n";
@@ -285,9 +435,10 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
 
 bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
 {
+    const std::set<std::string> recs = recordNames(module);
     for (const MethodDecl& md : module.methods) {
         for (const ParamDecl& pd : md.params) {
-            if (!typeSupported(pd.type, /*isReturn=*/false)) {
+            if (!typeSupported(pd.type, /*isReturn=*/false, recs)) {
                 if (error)
                     *error = QString("method '%1': parameter '%2' has a type outside the "
                                      "cdylib-supported (Qt-free) subset")
@@ -302,7 +453,7 @@ bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
             md.returnType.name == "void"
             || (md.returnType.kind == TypeExpr::Primitive && md.returnType.name.empty());
         if (!voidReturn && !md.jsonReturn && !md.resultReturn
-            && !typeSupported(md.returnType, /*isReturn=*/true)) {
+            && !typeSupported(md.returnType, /*isReturn=*/true, recs)) {
             if (error)
                 *error = QString("method '%1': return type outside the cdylib-supported "
                                  "(Qt-free) subset").arg(qs(md.name));
@@ -311,7 +462,7 @@ bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
     }
     for (const EventDecl& ed : module.events) {
         for (const ParamDecl& pd : ed.params) {
-            if (!typeSupported(pd.type, /*isReturn=*/false)) {
+            if (!typeSupported(pd.type, /*isReturn=*/false, recs)) {
                 if (error)
                     *error = QString("event '%1': parameter '%2' has a type outside the "
                                      "cdylib-supported (Qt-free) subset")
@@ -323,10 +474,47 @@ bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
     return true;
 }
 
+QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
+{
+    const std::set<std::string> recs = recordNames(module);
+    QString c;
+    QTextStream s(&c);
+    s << "// AUTO-GENERATED by logos-cpp-generator --backend cdylib -- do not edit\n";
+    s << "//\n";
+    s << "// The record types `" << module.name << "` declares, plus the codec that moves\n";
+    s << "// them across the wire. Qt-FREE. The author's impl header includes this and\n";
+    s << "// writes the structs directly:\n";
+    s << "//\n";
+    s << "//     Blob echoBlob(const Blob& v);\n";
+    s << "//\n";
+    s << "// rather than picking fields out of a LogosMap.\n";
+    s << "#pragma once\n";
+    s << "#include <logos_json.h>\n";
+    s << "#include <cstdint>\n";
+    s << "#include <map>\n";
+    s << "#include <stdexcept>\n";
+    s << "#include <string>\n";
+    s << "#include <vector>\n\n";
+
+    // The structs themselves are the AUTHOR's: this file is included after the
+    // impl header, and the contract was derived from those very declarations,
+    // so emitting them again is a redefinition error. Only forward
+    // declarations, so the codec below can name them in any order.
+    if (!module.types.empty()) {
+        for (const TypeDecl& t : module.types)
+            s << "struct " << qs(t.name) << ";\n";
+        s << "\n";
+    }
+
+    emitGeneratedCodec(s, module, recs);
+    return c;
+}
+
 QString lidlMakeModuleImplExports(const ModuleDecl& module,
                                   const QString& implClass,
                                   const QString& implHeader)
 {
+    const std::set<std::string> recs = recordNames(module);
     QString c;
     QTextStream s(&c);
 
@@ -337,6 +525,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "// module's cdylib; the uniform Qt-plugin glue (or a future no-Qt host)\n";
     s << "// drives it exclusively through these symbols.\n";
     s << "#include \"" << implHeader << "\"\n";
+    s << "#include \"" << module.name << "_types.h\"\n";
     s << "#include \"logos_module_impl.h\"\n";
     s << "#include \"logos_protocol.h\"\n";
     s << "#include \"logos_module_context.h\"\n";
@@ -373,8 +562,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    if (out) std::memcpy(out, str.data(), str.size() + 1);\n";
     s << "    return out;\n}\n\n";
 
-    const bool bytesList = usesBytesArray(module);
-    emitBytesEncodeHelpers(s, bytesList);
+    emitBytesEncodeHelpers(s);
 
     s << "int lidlB64Idx(char ch)\n{\n";
     s << "    if (ch >= 'A' && ch <= 'Z') return ch - 'A';\n";
@@ -431,20 +619,6 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "            out.push_back((n >> 8) & 0xff);\n";
     s << "        }\n    }\n    return out;\n}\n\n";
 
-    if (bytesList) {
-        s << "std::vector<std::vector<uint8_t>> lidlBytesListFromJson(const nlohmann::json& j)\n{\n";
-        s << "    std::vector<std::vector<uint8_t>> out;\n";
-        s << "    // Each element runs through the lenient scalar decode above, so a\n";
-        s << "    // caller may send tagged {\"_bytes\": base64url} objects, plain\n";
-        s << "    // strings or number arrays — element by element. A non-array arg\n";
-        s << "    // yields an empty list rather than throwing, matching the scalar\n";
-        s << "    // decoder's behaviour on an unexpected shape.\n";
-        s << "    if (!j.is_array()) return out;\n";
-        s << "    out.reserve(j.size());\n";
-        s << "    for (const auto& e : j)\n";
-        s << "        out.push_back(lidlBytesFromJson(e));\n";
-        s << "    return out;\n}\n\n";
-    }
 
     s << "nlohmann::json lidlResultToJson(const StdLogosResult& r)\n{\n";
     s << "    nlohmann::json obj;\n";
@@ -534,7 +708,8 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
         QString call = "lidlImpl()." + qs(md.name) + "(";
         for (int i = 0; i < md.params.size(); ++i) {
             call += jsonArgToStd(md.params[i].type,
-                                 QString("args.at(%1)").arg(i));
+                                 QString("args.at(%1)").arg(i),
+                                 QString("arg%1").arg(i), recs);
             if (i + 1 < md.params.size()) call += ", ";
         }
         call += ")";
@@ -549,7 +724,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
             s << "            return lidlStrdup(\"true\");\n";
         } else {
             s << "            auto result = " << call << ";\n";
-            s << "            return lidlStrdup(" << stdReturnToJson(md, "result") << ".dump());\n";
+            s << "            return lidlStrdup(" << stdReturnToJson(md, "result", recs) << ".dump());\n";
         }
         s << "        }\n";
     }
@@ -617,9 +792,12 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
     s << "// Typed `logos_events:` bodies, cdylib flavor: marshal into\n";
     s << "// nlohmann::json and route through LogosModuleContext::emitEventImpl_\n";
     s << "// (the export wrapper forwards to the host's emit callback).\n";
+    const std::set<std::string> recsEv = recordNames(module);
     s << "#include \"" << implHeader << "\"\n";
+    s << "#include \"" << module.name << "_types.h\"\n";
     s << "#include <nlohmann/json.hpp>\n\n";
     s << "#include <cstdint>\n";
+    s << "#include <map>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n";
     // LogosMap / LogosList (nlohmann aliases) appear in the emitted signatures
@@ -632,17 +810,24 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
     // encoder; emitting it everywhere would leave it unused (and warned about).
     if (hasBytesEventParam(module)) {
         s << "namespace {\n\n";
-        emitBytesEncodeHelpers(s, hasBytesArrayEventParam(module));
+        emitBytesEncodeHelpers(s);
         s << "} // namespace\n\n";
     }
 
     for (const EventDecl& ed : module.events) {
         s << "void " << implClass << "::" << ed.name << "(";
         for (int i = 0; i < ed.params.size(); ++i) {
-            const QString stdType = lidlTypeToStdCdylib(ed.params[i].type);
+            const QString stdType = lidlTypeToStdCdylib(ed.params[i].type, recsEv);
             // Must match the author's declaration in the `logos_events:` block:
             // the non-scalar types are conventionally taken by const-ref there.
+            // Records and std::map belong in that set too — they are structs and
+            // containers, and emitting them BY VALUE makes the generated
+            // definition not match the author's declaration, which is a compile
+            // error naming a parameter type mismatch rather than anything
+            // helpful.
             if (stdType == "std::string" || stdType.startsWith("std::vector")
+                || stdType.startsWith("std::map")
+                || isRecord(ed.params[i].type, recsEv)
                 || stdType == "LogosMap" || stdType == "LogosList")
                 s << "const " << stdType << "& " << ed.params[i].name;
             else
@@ -652,10 +837,19 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
         s << ")\n{\n";
         s << "    nlohmann::json args = nlohmann::json::array();\n";
         for (const ParamDecl& pd : ed.params) {
+            const QString evStd = lidlTypeToStdCdylib(pd.type, recsEv);
+            // A record or a composite carrying bytes rides the generated codec,
+            // exactly like a method return — otherwise an event payload would be
+            // the one place a bstr silently loses its tag.
+            if (evStd != "LogosMap" && evStd != "LogosList"
+                && (isRecord(pd.type, recsEv)
+                    || pd.type.kind == TypeExpr::Array || pd.type.kind == TypeExpr::Map)) {
+                s << "    args.push_back(logos_gen::Codec<" << evStd << ">::to("
+                  << pd.name << "));\n";
+                continue;
+            }
             if (pd.type.kind == TypeExpr::Primitive && pd.type.name == "bstr")
                 s << "    args.push_back(lidlBytesToJson(" << pd.name << "));\n";
-            else if (isBytesArray(pd.type))
-                s << "    args.push_back(lidlBytesListToJson(" << pd.name << "));\n";
             else
                 s << "    args.push_back(" << pd.name << ");\n";
         }

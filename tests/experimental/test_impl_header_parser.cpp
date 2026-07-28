@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <QTemporaryDir>
+#include <algorithm>
 #include "impl_header_parser.h"
 #include <QCoreApplication>
 #include <QDir>
@@ -205,6 +206,64 @@ TEST_F(ImplHeaderParserTest, ComplexAccessSpecifiers)
 // ---------------------------------------------------------------------------
 // Error cases
 // ---------------------------------------------------------------------------
+
+// A struct in an impl header becomes a contract `type` — but ONLY if the API
+// mentions it. A header routinely declares private helpers, and publishing
+// those would change the module's interface as a side effect of an internal
+// refactor. Verified against two real modules: openmetrics' `ModuleSource` and
+// the package manager's in-class `PendingAction` were both being published.
+TEST_F(ImplHeaderParserTest, OnlyApiReferencedStructsBecomeRecords)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/records_impl.h",
+        "RecordsImpl",
+        fixturesDir() + "/records_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    std::vector<std::string> names;
+    for (const auto& t : r.module.types) names.push_back(t.name);
+    std::sort(names.begin(), names.end());
+
+    // Blob is named directly; Wrapper too. Internal and Helper are not.
+    ASSERT_EQ(names.size(), 2u) << "published: " << [&]{
+        std::string j; for (const auto& n : names) j += n + " "; return j; }();
+    EXPECT_EQ(names[0], "Blob");
+    EXPECT_EQ(names[1], "Wrapper");
+
+    // A field with a trailing comment must NOT be silently dropped: a record
+    // published with a partial field list looks like a contract and is not one.
+    for (const auto& t : r.module.types) {
+        if (t.name != "Blob") continue;
+        ASSERT_EQ(t.fields.size(), 3u);
+        EXPECT_EQ(t.fields[2].name, "payload");
+        EXPECT_EQ(t.fields[2].type.name, "bstr");
+    }
+}
+
+// The closure is transitive: a record reaches the contract because something
+// the API names refers to it, however indirectly.
+TEST_F(ImplHeaderParserTest, RecordsReachableOnlyThroughAnotherRecordAreKept)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/records_impl.h",
+        "RecordsImpl",
+        fixturesDir() + "/records_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    // Wrapper's own fields name Blob; both survive even though a signature
+    // could have named only one of them.
+    bool sawWrapper = false;
+    for (const auto& t : r.module.types) {
+        if (t.name != "Wrapper") continue;
+        sawWrapper = true;
+        ASSERT_EQ(t.fields.size(), 2u);
+        EXPECT_EQ(t.fields[0].type.name, "Blob");
+        EXPECT_EQ(t.fields[1].type.elements.at(0).name, "Blob");
+    }
+    EXPECT_TRUE(sawWrapper);
+}
 
 TEST_F(ImplHeaderParserTest, MissingHeaderFile)
 {

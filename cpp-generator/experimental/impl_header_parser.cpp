@@ -6,6 +6,10 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QRegularExpression>
+#include <QSet>
+
+#include <functional>
+#include <set>
 #include <QStringList>
 
 // ---------------------------------------------------------------------------
@@ -33,6 +37,12 @@ static QString stripDeclarationSpecifiers(QString string)
 // ---------------------------------------------------------------------------
 // C++ type string → LIDL TypeExpr
 // ---------------------------------------------------------------------------
+
+// The records the header declares, discovered by scanForRecords() before any
+// method is parsed. A bare `Blob` in a signature is only a record if the header
+// actually declared `struct Blob { ... };` — otherwise it stays the opaque
+// `any` it always was.
+static QSet<QString> g_recordNames;
 
 static TypeExpr cppTypeToLidl(const QString& raw)
 {
@@ -91,6 +101,12 @@ static TypeExpr cppTypeToLidl(const QString& raw)
             TypeExpr elem = { TypeExpr::Primitive, "bool", {} };
             return { TypeExpr::Array, "", { elem } };
         }
+        // Anything else: recurse. That is what makes `std::vector<Blob>` a
+        // [Blob] and `std::vector<std::map<std::string, int64_t>>` a
+        // [{tstr: int}]. Without it the element list above was exhaustive and
+        // every other vector fell all the way through to the opaque `any`,
+        // which then encoded a record as a LogosMap.
+        return { TypeExpr::Array, "", { cppTypeToLidl(inner) } };
     }
 
     // Qt collection types — pass through directly (non-std-convertible)
@@ -113,8 +129,128 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     if (t == "StdLogosResult")
         return { TypeExpr::Primitive, "result", {} };
 
+    // std::map<std::string, T> -> {tstr: T}. Absent before, so a typed map was
+    // unspellable header-first and fell through to `any`.
+    static QRegularExpression mapRe("^std::map\\s*<\\s*std::string\\s*,\\s*(.+)\\s*>$");
+    QRegularExpressionMatch mm = mapRe.match(t);
+    if (mm.hasMatch()) {
+        TypeExpr val = cppTypeToLidl(mm.captured(1).trimmed());
+        return { TypeExpr::Map, "", { {TypeExpr::Primitive, "tstr", {}}, val } };
+    }
+
+    // A record the header declared. Checked LAST so it can never shadow a
+    // builtin spelling, and gated on the declared set so an unknown type keeps
+    // the historical `any` fallback rather than naming a struct nobody emits.
+    if (g_recordNames.contains(t))
+        return { TypeExpr::Named, t.toStdString(), {} };
+
     // Fallback: treat as opaque
     return { TypeExpr::Primitive, "any", {} };
+}
+
+// Find `struct Name { Type field; ... };` blocks and turn them into `type`
+// declarations.
+//
+// The parser used to SKIP any line starting with `struct`, which meant a record
+// could not be declared header-first at all — the only way to get one was a
+// hand-written .lidl. Worse, a method mentioning the struct still parsed: its
+// type fell through to the opaque `any`, so the contract silently disagreed
+// with the header.
+static std::vector<TypeDecl> scanForRecords(const QStringList& lines)
+{
+    static QRegularExpression openRe("^struct\\s+(\\w+)\\s*\\{\\s*$");
+    static QRegularExpression fieldRe("^([\\w:<>,\\s\\*]+?)\\s+(\\w+)\\s*(=[^;]*)?;$");
+
+    // TWO passes. A record field may name another record (`Blob inner;` inside
+    // Wrapper), and cppTypeToLidl only answers Named() for a name already in
+    // g_recordNames — so every struct name has to be registered before any
+    // field is typed. One pass silently typed such a field as `any`, and the
+    // generated codec then tried to encode a Blob as a LogosMap.
+    for (int i = 0; i < lines.size(); ++i) {
+        QRegularExpressionMatch om = openRe.match(lines.at(i).trimmed());
+        if (om.hasMatch())
+            g_recordNames.insert(om.captured(1));
+    }
+
+    std::vector<TypeDecl> out;
+    for (int i = 0; i < lines.size(); ++i) {
+        const QString line = lines.at(i).trimmed();
+        QRegularExpressionMatch om = openRe.match(line);
+        if (!om.hasMatch()) continue;
+
+        TypeDecl td;
+        td.name = om.captured(1).toStdString();
+        for (int j = i + 1; j < lines.size(); ++j) {
+            const QString body = lines.at(j).trimmed();
+            if (body.startsWith("};")) break;
+            if (body.isEmpty() || body.startsWith("//")) continue;
+            // Strip a trailing line comment before matching: a field written
+            // `std::string name;   // what it is` does not end in ';' and was
+            // silently DROPPED, publishing a record with a partial field list —
+            // the worst kind of wrong, because it looks like a contract.
+            QString field = body;
+            const int comment = field.indexOf("//");
+            if (comment >= 0) field = field.left(comment).trimmed();
+            if (field.isEmpty()) continue;
+            QRegularExpressionMatch fm = fieldRe.match(field);
+            if (!fm.hasMatch()) continue;
+            FieldDecl fd;
+            fd.name = fm.captured(2).toStdString();
+            fd.type = cppTypeToLidl(fm.captured(1).trimmed());
+            td.fields.push_back(fd);
+        }
+        if (!td.fields.empty()) out.push_back(td);
+    }
+    return out;
+}
+
+// Keep only the records the module's API actually mentions.
+//
+// An impl header routinely declares helper structs that are none of a
+// consumer's business — `struct PendingAction` inside the class, a
+// `struct ModuleSource` next to it. Publishing every struct as a contract
+// `type` changes the module's PUBLISHED interface as a side effect of an
+// internal refactor, which is not something deriving a contract from a header
+// is allowed to do. A struct earns its place in the contract by appearing in a
+// method or event signature — transitively, since a published record's own
+// fields may name others.
+static void keepOnlyReferencedRecords(ModuleDecl& module)
+{
+    auto mention = [](const TypeExpr& te, std::set<std::string>& out) {
+        std::function<void(const TypeExpr&)> walk = [&](const TypeExpr& t) {
+            if (t.kind == TypeExpr::Named) out.insert(t.name);
+            for (const TypeExpr& e : t.elements) walk(e);
+        };
+        walk(te);
+    };
+
+    std::set<std::string> referenced;
+    for (const MethodDecl& md : module.methods) {
+        mention(md.returnType, referenced);
+        for (const ParamDecl& pd : md.params) mention(pd.type, referenced);
+    }
+    for (const EventDecl& ed : module.events)
+        for (const ParamDecl& pd : ed.params) mention(pd.type, referenced);
+
+    // Transitive closure: a referenced record's fields may name more records.
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (const TypeDecl& td : module.types) {
+            if (!referenced.count(td.name)) continue;
+            for (const FieldDecl& fd : td.fields) {
+                std::set<std::string> here;
+                mention(fd.type, here);
+                for (const std::string& n : here)
+                    if (referenced.insert(n).second) grew = true;
+            }
+        }
+    }
+
+    std::vector<TypeDecl> kept;
+    for (const TypeDecl& td : module.types)
+        if (referenced.count(td.name)) kept.push_back(td);
+    module.types = std::move(kept);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +425,8 @@ ImplParseResult parseImplHeader(const QString& headerPath,
     QString source = QString::fromUtf8(hf.readAll());
     hf.close();
 
+    // Records first: cppTypeToLidl consults the declared set, so the structs
+    // have to be known before a single signature is looked at.
     // Split into physical lines, then merge any whose parentheses are still
     // open into one logical line. The scanner below is line-based — it only
     // accepts a method when a single trimmed line ends in ';' and
@@ -339,6 +477,13 @@ ImplParseResult parseImplHeader(const QString& headerPath,
         if (!acc.isEmpty())
             lines.append(acc);
     }
+
+    // Records, before any signature is examined: cppTypeToLidl() consults the
+    // declared set, so a `Blob` parameter only becomes Named("Blob") once the
+    // struct has been seen. Reset per parse — the set is file-static and a
+    // single process generates for more than one module.
+    g_recordNames.clear();
+    result.module.types = scanForRecords(lines);
 
     // State machine: find "class <className>", then collect declarations.
     // `InLogosEvents` is entered by the literal `logos_events:` token
@@ -551,6 +696,11 @@ ImplParseResult parseImplHeader(const QString& headerPath,
     }
 
 done:
+    // Now that every signature is known, drop the structs the API never
+    // mentions — a header's internal helpers must not become published
+    // contract types.
+    keepOnlyReferencedRecords(result.module);
+
     if (result.module.methods.empty()) {
         err << "Warning: no public methods found in class " << className
             << " in " << headerPath << "\n";

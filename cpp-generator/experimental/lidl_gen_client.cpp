@@ -17,8 +17,14 @@
 
 static bool isRefType(const QString& qt)
 {
-    return qt == "QString" || qt == "QStringList" || qt == "QJsonArray"
-        || qt == "QVariantList" || qt == "QVariantMap" || qt == "QByteArray";
+    if (qt == "QString" || qt == "QStringList" || qt == "QJsonArray"
+        || qt == "QVariantList" || qt == "QVariantMap" || qt == "QByteArray")
+        return true;
+    // A record is a struct: pass it by const& too. Anything that is not a known
+    // Qt scalar/handle spelling is a generated record type.
+    return !(qt == "bool" || qt == "int" || qt == "double" || qt == "float"
+             || qt == "void" || qt == "qlonglong" || qt == "qulonglong"
+             || qt == "QVariant" || qt == "LogosResult");
 }
 
 static void emitParam(QTextStream& s, const QString& qtType, const std::string& name)
@@ -29,10 +35,18 @@ static void emitParam(QTextStream& s, const QString& qtType, const std::string& 
         s << qtType << " " << name;
 }
 
+static bool lidlIsRecord(const TypeExpr& te);
+static QString qtToVariantExpr(const TypeExpr& te, const QString& expr);
+static QString qtFromVariantExpr(const TypeExpr& te, const QString& expr);
+static QString returnConversionFor(const TypeExpr& te, const QString& qt);
+
 static QString returnConversion(const QString& qt)
 {
     if (qt == "bool")        return "return _result.toBool();";
-    if (qt == "int")         return "return _result.toInt();";
+    // 64-bit, matching lidlTypeToQt: toInt() truncated a LIDL int/uint, and for
+    // uint it also read the value as signed.
+    if (qt == "qlonglong")   return "return _result.toLongLong();";
+    if (qt == "qulonglong")  return "return _result.toULongLong();";
     if (qt == "double")      return "return _result.toDouble();";
     if (qt == "float")       return "return _result.toFloat();";
     if (qt == "QString")     return "return _result.toString();";
@@ -42,6 +56,39 @@ static QString returnConversion(const QString& qt)
     if (qt == "QVariantMap") return "return _result.toMap();";
     if (qt == "LogosResult") return "return _result.value<LogosResult>();";
     return "return _result;";
+}
+
+// Records (and containers holding them) decode through the generated
+// conversions; everything else keeps the historical QVariant accessor.
+static QString returnConversionFor(const TypeExpr& te, const QString& qt)
+{
+    const bool holdsRecord =
+        lidlIsRecord(te)
+        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
+        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
+    if (holdsRecord)
+        return "return " + qtFromVariantExpr(te, "_result") + ";";
+    return returnConversion(qt);
+}
+
+// The async twin of returnConversionFor: `v` is the wire QVariant.
+//
+// A record-bearing return MUST decode field by field here too. The wire carries
+// a QVariantMap and no Q_DECLARE_METATYPE is emitted for the struct, so
+// `qvariant_cast<Status>(v)` does not fail — it silently returns a
+// DEFAULT-CONSTRUCTED Status, and the caller sees empty fields with no
+// diagnostic. That is the worst failure mode available: the sync path is
+// correct, so the same call is right or wrong depending only on which overload
+// the caller reached for.
+static QString asyncReturnConversionFor(const TypeExpr& te, const QString& qt)
+{
+    const bool holdsRecord =
+        lidlIsRecord(te)
+        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
+        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
+    if (holdsRecord)
+        return qtFromVariantExpr(te, "v");
+    return "qvariant_cast<" + qt + ">(v)";
 }
 
 static QString asyncDefaultVal(const QString& qt)
@@ -54,6 +101,114 @@ static QString asyncDefaultVal(const QString& qt)
     if (qt == "QVariantList") return "QVariantList()";
     if (qt == "QVariantMap") return "QVariantMap()";
     return qt + "{}";
+}
+
+
+// ---------------------------------------------------------------------------
+// Records
+//
+// A `type Foo { … }` in the contract becomes a real C++ struct plus two inline
+// conversions, so a Qt consumer says `Status s = client.makeStatus();` instead
+// of digging fields out of a QVariantMap. One LIDL type, one type per language.
+//
+// bstr fields are QByteArray on purpose: logos-protocol's QVariant<->JSON
+// conversion already materialises the canonical {"_bytes": base64url} form as a
+// QByteArray and back (logos_json_convert.cpp), so the record conversions stay
+// pure field mapping and binary survives at any depth for free.
+// ---------------------------------------------------------------------------
+
+static bool lidlIsRecord(const TypeExpr& te)
+{
+    return te.kind == TypeExpr::Named && !te.name.empty();
+}
+
+// value expression of the Qt type -> QVariant
+static QString qtToVariantExpr(const TypeExpr& te, const QString& expr)
+{
+    if (lidlIsRecord(te))
+        return qs(te.name) + "ToVariant(" + expr + ")";
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1
+        && (lidlIsRecord(te.elements[0]) || te.elements[0].kind != TypeExpr::Primitive)) {
+        return "[&]{ QVariantList __l; for (const auto& __e : " + expr + ") __l.append("
+             + qtToVariantExpr(te.elements[0], "__e") + "); return QVariant(__l); }()";
+    }
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2
+        && (lidlIsRecord(te.elements[1]) || te.elements[1].kind != TypeExpr::Primitive)) {
+        return "[&]{ QVariantMap __m; for (auto __it = " + expr + ".begin(); __it != " + expr
+             + ".end(); ++__it) __m.insert(__it.key(), "
+             + qtToVariantExpr(te.elements[1], "__it.value()") + "); return QVariant(__m); }()";
+    }
+    return "QVariant::fromValue(" + expr + ")";
+}
+
+// QVariant expression -> value of the Qt type
+static QString qtFromVariantExpr(const TypeExpr& te, const QString& expr)
+{
+    if (lidlIsRecord(te))
+        return qs(te.name) + "FromVariant(" + expr + ")";
+    if (te.kind == TypeExpr::Primitive) {
+        const QString n = qs(te.name);
+        if (n == "tstr")    return expr + ".toString()";
+        if (n == "bstr")    return expr + ".toByteArray()";
+        if (n == "int")     return expr + ".toLongLong()";
+        if (n == "uint")    return expr + ".toULongLong()";
+        if (n == "float64") return expr + ".toDouble()";
+        if (n == "bool")    return expr + ".toBool()";
+    }
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
+        const TypeExpr& e = te.elements[0];
+        return "[&]{ " + lidlTypeToQt(te) + " __acc; for (const QVariant& __e : " + expr
+             + ".toList()) __acc.append(" + qtFromVariantExpr(e, "__e") + "); return __acc; }()";
+    }
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2) {
+        const TypeExpr& v = te.elements[1];
+        return "[&]{ " + lidlTypeToQt(te) + " __acc; const QVariantMap __mm = " + expr
+             + ".toMap(); for (auto __it = __mm.begin(); __it != __mm.end(); ++__it) __acc.insert("
+             + "__it.key(), " + qtFromVariantExpr(v, "__it.value()") + "); return __acc; }()";
+    }
+    return expr;
+}
+
+// A method argument as passed to packVariantList: records convert, everything
+// else goes through unchanged (packVariantList wraps with QVariant::fromValue).
+static QString qtArgExpr(const TypeExpr& te, const QString& name)
+{
+    const bool holdsRecord =
+        lidlIsRecord(te)
+        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
+        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
+    return holdsRecord ? qtToVariantExpr(te, name) : name;
+}
+
+static void emitRecords(QTextStream& s, const ModuleDecl& module)
+{
+    if (module.types.empty()) return;
+    for (const TypeDecl& t : module.types) {
+        const QString n = qs(t.name);
+        s << "/// `" << n << "` — a record declared by the `" << qs(module.name) << "` contract.\n";
+        s << "struct " << n << " {\n";
+        for (const FieldDecl& f : t.fields)
+            s << "    " << lidlTypeToQt(f.type) << " " << qs(f.name) << "{};\n";
+        s << "};\n\n";
+    }
+    // Conversions come after ALL structs so records may reference each other.
+    for (const TypeDecl& t : module.types) {
+        const QString n = qs(t.name);
+        s << "inline QVariant " << n << "ToVariant(const " << n << "& v)\n{\n";
+        s << "    QVariantMap __m;\n";
+        for (const FieldDecl& f : t.fields)
+            s << "    __m.insert(\"" << qs(f.name) << "\", "
+              << qtToVariantExpr(f.type, "v." + qs(f.name)) << ");\n";
+        s << "    return QVariant(__m);\n}\n\n";
+
+        s << "inline " << n << " " << n << "FromVariant(const QVariant& value)\n{\n";
+        s << "    const QVariantMap __m = value.toMap();\n";
+        s << "    " << n << " __out;\n";
+        for (const FieldDecl& f : t.fields)
+            s << "    __out." << qs(f.name) << " = "
+              << qtFromVariantExpr(f.type, "__m.value(\"" + qs(f.name) + "\")") << ";\n";
+        s << "    return __out;\n}\n\n";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +235,8 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "#include \"logos_api_client.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
     s << "#include \"logos_object.h\"\n\n";
+
+    emitRecords(s, module);
 
     s << "class " << className << " {\n";
     s << "public:\n";
@@ -240,7 +397,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         // one — the historical "typed arrays empty over the Qt path" bug.
         s << "m_client->invokeRemoteMethod(" << targetExpr << ", \"" << md.name << "\", packVariantList(";
         for (int i = 0; i < nParams; ++i) {
-            s << md.params[i].name;
+            s << qtArgExpr(md.params[i].type, qs(md.params[i].name));
             if (i + 1 < nParams) s << ", ";
         }
         s << "), Timeout(), &_err);\n";
@@ -249,7 +406,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
 
         if (ret != "void")
-            s << "    " << returnConversion(ret) << "\n";
+            s << "    " << returnConversionFor(md.returnType, ret) << "\n";
         s << "}\n\n";
 
         s << "void " << className << "::" << md.name << "Async(";
@@ -264,7 +421,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         // QVariantList-typed arg must not be spread across the args list.
         s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << md.name << "\", packVariantList(";
         for (int i = 0; i < nParams; ++i) {
-            s << md.params[i].name;
+            s << qtArgExpr(md.params[i].type, qs(md.params[i].name));
             if (i + 1 < nParams) s << ", ";
         }
         s << ")";
@@ -274,7 +431,8 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         } else if (ret == "QVariant") {
             s << "        callback(v);\n";
         } else {
-            s << "        callback(v.isValid() ? qvariant_cast<" << ret << ">(v) : " << asyncDefaultVal(ret) << ");\n";
+            s << "        callback(v.isValid() ? " << asyncReturnConversionFor(md.returnType, ret)
+              << " : " << asyncDefaultVal(ret) << ");\n";
         }
         s << "    }, timeout);\n";
         s << "}\n\n";
@@ -323,6 +481,10 @@ int lidlGenerateClientStubs(const QString& lidlPath, const QString& outputDir,
 
     LidlValidationResult vr = lidlValidate(pr.module);
     if (vr.hasErrors()) { for (const std::string& e : vr.errors) err << lidlPath << ": " << e << "\n"; return 5; }
+    {
+        QString recErr;
+        if (!lidlCheckRecords(pr.module, &recErr)) { err << lidlPath << ": " << recErr << "\n"; return 5; }
+    }
 
     const ModuleDecl& mod = pr.module;
     QString genDirPath = outputDir.isEmpty() ? QDir::current().filePath("logos-cpp-sdk/cpp/generated") : outputDir;
