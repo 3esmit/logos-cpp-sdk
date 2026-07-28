@@ -340,6 +340,12 @@ bool hasJsonEventParam(const ModuleDecl& module)
     return false;
 }
 
+// The SCALAR tagged-bytes helpers. A `[bstr]` (and bytes at any deeper
+// nesting) rides logos_gen::Codec instead: its full specialization for
+// std::vector<uint8_t> beats the generic vector rule, so one mechanism covers
+// [bstr], [[bstr]] and {tstr: [bstr]} alike. #111 emitted a dedicated depth-1
+// list codec here; the generic one subsumes it, and keeping both left an
+// unused static in every module that mentioned [bstr].
 void emitBytesEncodeHelpers(QTextStream& s)
 {
     s << "// Canonical tagged bytes form {\"_bytes\": base64url} (see logos_protocol.h)\n";
@@ -361,6 +367,7 @@ void emitBytesEncodeHelpers(QTextStream& s)
 
     s << "nlohmann::json lidlBytesToJson(const std::vector<uint8_t>& bytes)\n{\n";
     s << "    return nlohmann::json{{\"_bytes\", lidlB64UrlEncode(bytes)}};\n}\n\n";
+
 }
 
 void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
@@ -611,6 +618,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "            n |= uint32_t(c2) << 6;\n";
     s << "            out.push_back((n >> 8) & 0xff);\n";
     s << "        }\n    }\n    return out;\n}\n\n";
+
 
     s << "nlohmann::json lidlResultToJson(const StdLogosResult& r)\n{\n";
     s << "    nlohmann::json obj;\n";

@@ -44,6 +44,29 @@ QString eventsSourceFor(const ModuleDecl& m)
     return lidlMakeEventsSourceCdylib(m, "DeliveryModuleImpl", "delivery_module_plugin.h");
 }
 
+MethodDecl method(const char* name, const TypeExpr& returnType,
+                  const std::vector<ParamDecl>& params)
+{
+    MethodDecl md;
+    md.name = name;
+    md.returnType = returnType;
+    md.params = params;
+    return md;
+}
+
+ModuleDecl moduleWithMethod(const MethodDecl& md)
+{
+    ModuleDecl m;
+    m.name = "delivery_module";
+    m.methods.push_back(md);
+    return m;
+}
+
+QString implSourceFor(const ModuleDecl& m)
+{
+    return lidlMakeModuleImplExports(m, "DeliveryModuleImpl", "delivery_module_plugin.h");
+}
+
 } // namespace
 
 // logos-cpp-sdk#99: `payload` was replaced by an empty tagged value, so a module
@@ -118,13 +141,15 @@ TEST(LidlGenCdylib, JsonEventPayloadIsQtFree)
     EXPECT_FALSE(source.contains("QVariant"));
 }
 
-// `[bstr]` used to be rejected by name: the gate whitelisted element types and
-// the emitter had no way to keep a nested byte string tagged. Both are fixed —
-// the gate recurses and the generated codec's full specialization for
-// std::vector<uint8_t> wins over its generic vector rule at every depth — so
-// the type is now SUPPORTED. Inverted deliberately rather than deleted: the
-// cell it used to pin still matters, only its answer changed.
-TEST(LidlGenCdylib, ArrayOfBytesEventParamIsSupported)
+// `[bstr]` is in the supported subset: each element carries the canonical
+// tagged form, so a module can take or return a list of blobs (e.g. a program
+// plus its dependency ELFs) instead of hand-encoding them as hex strings.
+//
+// #111 reached this with a dedicated depth-1 list codec; the gate now RECURSES
+// and the generated Codec's full specialization for std::vector<uint8_t> beats
+// its generic vector rule, so the same mechanism covers [bstr], [[bstr]] and
+// {tstr: [bstr]}. The assertions moved to that mechanism; what they pin did not.
+TEST(LidlGenCdylib, ArrayOfBytesEventParamIsEligibleAndTagsEachElement)
 {
     const ModuleDecl m = moduleWithEvent("batchReceived", {
         param("payloads", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
@@ -139,6 +164,81 @@ TEST(LidlGenCdylib, ArrayOfBytesEventParamIsSupported)
     EXPECT_TRUE(source.contains("std::vector<std::vector<uint8_t>>")) << source.toStdString();
     EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to(payloads)"))
         << source.toStdString();
+    // From #111, still exactly right: Qt-free, and taken by const-ref like the
+    // other composite payloads.
+    EXPECT_TRUE(source.contains("const std::vector<std::vector<uint8_t>>& payloads"))
+        << source.toStdString();
+    EXPECT_FALSE(source.contains("QVariant")) << source.toStdString();
+}
+
+// Ported from #111. Its assertions named that PR's depth-1 helpers
+// (lidlBytesListFromJson / lidlBytesListToJson); the generated Codec subsumes
+// them, so the assertions moved to the codec while what they pin — per-element
+// tagging, and never nlohmann's blanket container conversion — did not.
+TEST(LidlGenCdylib, ArrayOfBytesMethodParamDecodesPerElement)
+{
+    const ModuleDecl m = moduleWithMethod(method("send", prim("tstr"), {
+        param("program_elf",          prim("bstr")),
+        param("program_dependencies", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
+    }));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = implSourceFor(m);
+
+    EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::from("))
+        << source.toStdString();
+    // The scalar param still uses the scalar decoder — deliberately NOT routed
+    // through the codec, so its documented leniency is unchanged.
+    EXPECT_TRUE(source.contains("lidlBytesFromJson(")) << source.toStdString();
+    // nlohmann's blanket container decode must not be used for this type: it
+    // refuses a tagged object and would silently accept a raw number array,
+    // skipping the base64 decode entirely.
+    EXPECT_FALSE(source.contains(".get<std::vector<std::vector<uint8_t>>>()"))
+        << source.toStdString();
+}
+
+// Ported from #111: a `[bstr]` RETURN tags each element.
+// nlohmann::json(std::vector<std::vector<uint8_t>>) would emit nested number
+// arrays, which no consumer decodes as bytes.
+TEST(LidlGenCdylib, ArrayOfBytesReturnTagsEachElement)
+{
+    const ModuleDecl m = moduleWithMethod(
+        method("fetchAll", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}, {}));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString source = implSourceFor(m);
+    EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to("))
+        << source.toStdString();
+    EXPECT_FALSE(source.contains("nlohmann::json(result)")) << source.toStdString();
+}
+
+// #111 gated its list encoder so a module that never carries `[bstr]` did not
+// gain an unused static function. The generic codec is a TEMPLATE — it only
+// instantiates where used — so that hazard is gone and there is no dedicated
+// list encoder to omit. What still needs gating is the SCALAR encoder, and it
+// still is; this pins both halves so neither regresses.
+TEST(LidlGenCdylib, NoDedicatedListEncoderAndTheScalarOneStaysGated)
+{
+    const ModuleDecl noBytes = moduleWithEvent("fault", {
+        param("code",    prim("int")),
+        param("message", prim("tstr")),
+    });
+    const QString plain = eventsSourceFor(noBytes);
+    EXPECT_FALSE(plain.contains("lidlBytesToJson")) << plain.toStdString();
+    EXPECT_FALSE(plain.contains("lidlBytesListToJson")) << plain.toStdString();
+
+    const ModuleDecl withList = moduleWithEvent("batchReceived", {
+        param("payloads", TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
+    });
+    const QString listed = eventsSourceFor(withList);
+    // The list rides the codec; no bespoke list encoder is emitted at all.
+    EXPECT_FALSE(listed.contains("lidlBytesListToJson")) << listed.toStdString();
+    EXPECT_TRUE(listed.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to("))
+        << listed.toStdString();
 }
 
 // The gate recurses, so what it refuses is now a property of the leaf. A map
@@ -210,6 +310,7 @@ TEST(LidlGenCdylib, OnlyDeclaredRecordsAreRecords)
     m.methods.push_back(bad);
     EXPECT_FALSE(lidlCdylibSupported(m, &error));
     EXPECT_TRUE(error.contains("takeGhost")) << error.toStdString();
+
 }
 
 // The supported scalar / bytes payloads stay eligible.
