@@ -7,6 +7,9 @@
 #include <QJsonArray>
 #include <QRegularExpression>
 #include <QSet>
+
+#include <functional>
+#include <set>
 #include <QStringList>
 
 // ---------------------------------------------------------------------------
@@ -180,7 +183,15 @@ static std::vector<TypeDecl> scanForRecords(const QStringList& lines)
             const QString body = lines.at(j).trimmed();
             if (body.startsWith("};")) break;
             if (body.isEmpty() || body.startsWith("//")) continue;
-            QRegularExpressionMatch fm = fieldRe.match(body);
+            // Strip a trailing line comment before matching: a field written
+            // `std::string name;   // what it is` does not end in ';' and was
+            // silently DROPPED, publishing a record with a partial field list —
+            // the worst kind of wrong, because it looks like a contract.
+            QString field = body;
+            const int comment = field.indexOf("//");
+            if (comment >= 0) field = field.left(comment).trimmed();
+            if (field.isEmpty()) continue;
+            QRegularExpressionMatch fm = fieldRe.match(field);
             if (!fm.hasMatch()) continue;
             FieldDecl fd;
             fd.name = fm.captured(2).toStdString();
@@ -190,6 +201,55 @@ static std::vector<TypeDecl> scanForRecords(const QStringList& lines)
         if (!td.fields.empty()) out.push_back(td);
     }
     return out;
+}
+
+// Keep only the records the module's API actually mentions.
+//
+// An impl header routinely declares helper structs that are none of a
+// consumer's business — `struct PendingAction` inside the class, a
+// `struct ModuleSource` next to it. Publishing every struct as a contract
+// `type` changes the module's PUBLISHED interface as a side effect of an
+// internal refactor, which is not something deriving a contract from a header
+// is allowed to do. A struct earns its place in the contract by appearing in a
+// method or event signature — transitively, since a published record's own
+// fields may name others.
+static void keepOnlyReferencedRecords(ModuleDecl& module)
+{
+    auto mention = [](const TypeExpr& te, std::set<std::string>& out) {
+        std::function<void(const TypeExpr&)> walk = [&](const TypeExpr& t) {
+            if (t.kind == TypeExpr::Named) out.insert(t.name);
+            for (const TypeExpr& e : t.elements) walk(e);
+        };
+        walk(te);
+    };
+
+    std::set<std::string> referenced;
+    for (const MethodDecl& md : module.methods) {
+        mention(md.returnType, referenced);
+        for (const ParamDecl& pd : md.params) mention(pd.type, referenced);
+    }
+    for (const EventDecl& ed : module.events)
+        for (const ParamDecl& pd : ed.params) mention(pd.type, referenced);
+
+    // Transitive closure: a referenced record's fields may name more records.
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (const TypeDecl& td : module.types) {
+            if (!referenced.count(td.name)) continue;
+            for (const FieldDecl& fd : td.fields) {
+                std::set<std::string> here;
+                mention(fd.type, here);
+                for (const std::string& n : here)
+                    if (referenced.insert(n).second) grew = true;
+            }
+        }
+    }
+
+    std::vector<TypeDecl> kept;
+    for (const TypeDecl& td : module.types)
+        if (referenced.count(td.name)) kept.push_back(td);
+    module.types = std::move(kept);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +695,11 @@ ImplParseResult parseImplHeader(const QString& headerPath,
     }
 
 done:
+    // Now that every signature is known, drop the structs the API never
+    // mentions — a header's internal helpers must not become published
+    // contract types.
+    keepOnlyReferencedRecords(result.module);
+
     if (result.module.methods.empty()) {
         err << "Warning: no public methods found in class " << className
             << " in " << headerPath << "\n";
