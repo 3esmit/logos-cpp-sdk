@@ -54,4 +54,37 @@ inline lidl::ValidationResult lidlValidate(const ModuleDecl& module)
     return lidl::validate(module);
 }
 
+// A record whose ONLY field is a `tstr` named `_bytes` is indistinguishable on
+// the wire from a canonical tagged byte string: `isTaggedBytes()` is checked
+// BEFORE `is_object()` in both logos_codec.h and logos_json_convert.cpp, so
+// such a record silently decodes as a byte string and the struct is gone. The
+// ambiguity is inherent to the tagged form — the codec's own comment says not
+// to name a map key `_bytes` — but a generator can at least refuse to emit the
+// one shape that is guaranteed to misdecode, instead of leaving it to be
+// discovered at runtime.
+inline bool lidlRecordCollidesWithBytesTag(const TypeDecl& t)
+{
+    return t.fields.size() == 1
+        && t.fields[0].name == "_bytes"
+        && t.fields[0].type.kind == TypeExpr::Primitive
+        && t.fields[0].type.name == "tstr";
+}
+
+// Returns false and fills `error` when any declared record cannot round-trip.
+inline bool lidlCheckRecords(const ModuleDecl& m, QString* error)
+{
+    for (const TypeDecl& t : m.types) {
+        if (lidlRecordCollidesWithBytesTag(t)) {
+            if (error)
+                *error = QString("type '%1': a record whose only field is a tstr named "
+                                 "'_bytes' is wire-identical to a tagged byte string and "
+                                 "would decode as bytes, not as the record. Rename the "
+                                 "field or give the record another field.")
+                             .arg(qs(t.name));
+            return false;
+        }
+    }
+    return true;
+}
+
 #endif // LIDL_COMPAT_H

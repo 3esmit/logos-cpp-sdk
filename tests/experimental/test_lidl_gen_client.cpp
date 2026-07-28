@@ -285,6 +285,62 @@ static ModuleDecl makeRecordModule()
     return m;
 }
 
+// `isTaggedBytes()` is checked BEFORE `is_object()` in both the codec and the
+// QVariant bridge, so a record whose only field is a tstr named `_bytes` is
+// wire-identical to a tagged byte string and decodes as bytes — the struct
+// silently disappears. The ambiguity is inherent to the tagged form; refusing
+// to emit the one shape guaranteed to misdecode is what a generator can do
+// about it.
+TEST(LidlGenClient, RecordThatCollidesWithTheBytesTagIsRefused)
+{
+    ModuleDecl m;
+    m.name = "c_module";
+    TypeDecl bad;
+    bad.name = "Sneaky";
+    FieldDecl f; f.name = "_bytes"; f.type = { TypeExpr::Primitive, "tstr", {} };
+    bad.fields = {f};
+    m.types.push_back(bad);
+
+    QString err;
+    EXPECT_FALSE(lidlCheckRecords(m, &err));
+    EXPECT_TRUE(err.contains("Sneaky")) << err.toStdString();
+    EXPECT_TRUE(err.contains("_bytes")) << err.toStdString();
+
+    // A SECOND field disambiguates it — isTaggedBytes requires exactly one key,
+    // so this shape round-trips and must still be allowed.
+    FieldDecl g; g.name = "other"; g.type = { TypeExpr::Primitive, "int", {} };
+    m.types[0].fields.push_back(g);
+    EXPECT_TRUE(lidlCheckRecords(m, nullptr));
+
+    // A `_bytes` field that is not the only one, and a differently-named sole
+    // field, are both fine.
+    ModuleDecl ok;
+    ok.name = "ok_module";
+    TypeDecl t; t.name = "Fine";
+    FieldDecl h; h.name = "payload"; h.type = { TypeExpr::Primitive, "tstr", {} };
+    t.fields = {h};
+    ok.types.push_back(t);
+    EXPECT_TRUE(lidlCheckRecords(ok, nullptr));
+}
+
+// The ASYNC overload must decode a record the same way the sync one does.
+//
+// `qvariant_cast<Status>(v)` does not fail on the wire's QVariantMap: no
+// Q_DECLARE_METATYPE is emitted for the struct, so the cast silently yields a
+// DEFAULT-CONSTRUCTED Status and the caller sees empty fields with no
+// diagnostic. The sync path was already correct, which makes it worse — the
+// same call would be right or wrong depending only on which overload the
+// caller reached for.
+TEST(LidlGenClient, AsyncRecordReturnsDecodeFieldByField)
+{
+    const QString c = lidlMakeSource(makeRecordModule(), BindMode::Bound);
+
+    // A [Record] return, in the async callback.
+    EXPECT_TRUE(c.contains("StatusFromVariant")) << c.toStdString();
+    EXPECT_FALSE(c.contains("qvariant_cast<QList<Status>>")) << c.toStdString();
+    EXPECT_FALSE(c.contains("qvariant_cast<Status>")) << c.toStdString();
+}
+
 TEST(LidlGenClient, RecordsBecomeStructsWithConversions)
 {
     const QString h = lidlMakeHeader(makeRecordModule(), BindMode::Bound);

@@ -313,6 +313,14 @@ static bool generateInterfaceWrappers(const QVector<InterfaceSpec>& ifaces,
         ModuleDecl mod;
         if (!parseInterfaceFile(spec, genDirPath, mod, err)) return false;
 
+        {
+            QString recErr;
+            if (!lidlCheckRecords(mod, &recErr)) {
+                err << spec.path << ": " << recErr << "\n";
+                return false;
+            }
+        }
+
         const QString className = toPascalCase(spec.name);
         const QJsonArray methods = moduleMethodsToJson(mod);
         const QJsonArray events  = moduleEventsToJson(mod);

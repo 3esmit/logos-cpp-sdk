@@ -71,6 +71,26 @@ static QString returnConversionFor(const TypeExpr& te, const QString& qt)
     return returnConversion(qt);
 }
 
+// The async twin of returnConversionFor: `v` is the wire QVariant.
+//
+// A record-bearing return MUST decode field by field here too. The wire carries
+// a QVariantMap and no Q_DECLARE_METATYPE is emitted for the struct, so
+// `qvariant_cast<Status>(v)` does not fail — it silently returns a
+// DEFAULT-CONSTRUCTED Status, and the caller sees empty fields with no
+// diagnostic. That is the worst failure mode available: the sync path is
+// correct, so the same call is right or wrong depending only on which overload
+// the caller reached for.
+static QString asyncReturnConversionFor(const TypeExpr& te, const QString& qt)
+{
+    const bool holdsRecord =
+        lidlIsRecord(te)
+        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
+        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
+    if (holdsRecord)
+        return qtFromVariantExpr(te, "v");
+    return "qvariant_cast<" + qt + ">(v)";
+}
+
 static QString asyncDefaultVal(const QString& qt)
 {
     if (qt == "bool")        return "false";
@@ -411,7 +431,8 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         } else if (ret == "QVariant") {
             s << "        callback(v);\n";
         } else {
-            s << "        callback(v.isValid() ? qvariant_cast<" << ret << ">(v) : " << asyncDefaultVal(ret) << ");\n";
+            s << "        callback(v.isValid() ? " << asyncReturnConversionFor(md.returnType, ret)
+              << " : " << asyncDefaultVal(ret) << ");\n";
         }
         s << "    }, timeout);\n";
         s << "}\n\n";
@@ -460,6 +481,10 @@ int lidlGenerateClientStubs(const QString& lidlPath, const QString& outputDir,
 
     LidlValidationResult vr = lidlValidate(pr.module);
     if (vr.hasErrors()) { for (const std::string& e : vr.errors) err << lidlPath << ": " << e << "\n"; return 5; }
+    {
+        QString recErr;
+        if (!lidlCheckRecords(pr.module, &recErr)) { err << lidlPath << ": " << recErr << "\n"; return 5; }
+    }
 
     const ModuleDecl& mod = pr.module;
     QString genDirPath = outputDir.isEmpty() ? QDir::current().filePath("logos-cpp-sdk/cpp/generated") : outputDir;
