@@ -163,6 +163,11 @@ logos_events:
     /// Fires when a channel faults.
     /// Carries an error code, a message, and whether the fault is fatal.
     void fault(int64_t code, const std::string& message, bool fatal);
+
+    /// Fires with a raw capture buffer — an event carrying a byte
+    /// string, which the generator must encode rather than pass
+    /// through as text.
+    void capture(uint64_t id, const std::vector<uint8_t>& frame);
 };
 ```
 
@@ -230,6 +235,22 @@ host's emit callback.
 grep -E 'extern \"C\"|logos_module_|SensorModuleImpl' provider/sensor_module_module_impl.cpp
 ```
 
+### 4.3 How each event marshals its payload
+
+The events file defines the body of every `logos_events:` declaration:
+each argument is pushed into a JSON array and handed to the host's emit
+callback. Scalars and strings go in as they are — but a byte string
+cannot, because JSON has no binary type and a NUL would truncate it.
+`frame` is therefore encoded into the canonical tagged form
+`{"_bytes": "<base64url>"}`, the same representation the transport and
+the consumer both understand. A generator that pushed the raw value —
+or dropped it — would leave every subscriber with an empty payload
+([#99](https://github.com/logos-co/logos-cpp-sdk/issues/99)).
+
+```bash
+cat provider/sensor_module_events_cdylib.cpp
+```
+
 ---
 
 ## Step 5: Flow 3 — LIDL → consumer header
@@ -238,9 +259,14 @@ The consumer side. From the same contract, `--module-only` emits the typed
 wrapper a *consumer* compiles against to call `sensor_module`. Each LIDL
 `method` becomes a synchronous caller plus an `…Async` variant, and each
 `event` an `on(...)` subscription. The type mapping is the Qt caller style:
-`float64`→`double`, `tstr`→`QString`, `int`/`uint`→`int`, `bstr`→
-`QByteArray`, `[tstr]`→`QStringList`, other arrays→`QVariantList`, and
-`result`→`LogosResult`.
+`float64`→`double`, `tstr`→`QString`, `int`→`qlonglong`, `uint`→
+`qulonglong`, `bstr`→`QByteArray`, `[tstr]`→`QStringList`, other
+arrays→`QVariantList`, and `result`→`LogosResult`.
+
+The integer spellings are 64-bit, and unsigned stays unsigned: LIDL
+`int`/`uint` are `int64_t`/`uint64_t` in every other binding, so spelling
+them `int` here truncated above 2^31 and read a `uint` back as *signed*.
+`record` below shows it — its `id` is a `uint64_t` in the impl header.
 
 ### 5.1 Generate the consumer header
 
@@ -261,12 +287,16 @@ grep -E 'class|temperature|record|firmware|labels|reset|on\(' consumer/sensor_mo
 
 Beyond the round-trippable core above, LIDL also has **composite** types:
 named record types (`type`), maps (`{K: V}`), and optionals (`?T`), plus the
-untyped escape hatch `any`. These cross the wire as untyped JSON, so the
-generated wrappers carry them as `QVariant` / `QVariantMap` / `QVariantList`
-(record/map/optional shapes live in the authored contract; a
-`--header-to-lidl` extraction recovers the std-friendly subset shown
-earlier). Here is a contract that uses all of them, taken straight to a
-consumer header.
+untyped escape hatch `any`.
+
+A **record becomes a real C++ struct**: a `type Point { … }` in the contract
+generates `struct Point` plus the conversions, so a caller writes
+`Point p = client.translate(q, 1, 2)` instead of digging fields out of a
+`QVariantMap`. `[Point]` is a `QList<Point>` and `{tstr: Point}` a
+`QMap<QString, Point>`. Maps of `any`, optionals (`?T`) and `any` itself
+still cross as untyped JSON and stay `QVariantMap` / `QVariant` — a record
+has a declared shape, those do not. Here is a contract that uses all of
+them, taken straight to a consumer header.
 
 ### 6.1 geometry_module.lidl
 
@@ -299,9 +329,11 @@ logos-cpp-generator --lidl geometry_module.lidl \
 
 ### 6.3 Inspect the composite signatures
 
-Records and optionals surface as `QVariant`, an array-of-records as
-`QVariantList`, and a map as `QVariantMap` — the untyped carriers for the
-JSON that crosses the process boundary.
+`Point` is generated as a struct, so a record parameter is taken by
+const-ref and a record return comes back typed. An array-of-records is a
+`QList<Point>`. A map of `any`, an optional and a bare `any` stay
+`QVariantMap` / `QVariant` — the untyped carriers for JSON whose shape
+the contract does not declare.
 
 ```bash
 grep -E 'class|translate|bounds|attributes|nearest' geometry/geometry_module_api.h

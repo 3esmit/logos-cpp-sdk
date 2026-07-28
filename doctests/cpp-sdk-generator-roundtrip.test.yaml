@@ -271,9 +271,14 @@ sections:
       wrapper a *consumer* compiles against to call `sensor_module`. Each LIDL
       `method` becomes a synchronous caller plus an `…Async` variant, and each
       `event` an `on(...)` subscription. The type mapping is the Qt caller style:
-      `float64`→`double`, `tstr`→`QString`, `int`/`uint`→`int`, `bstr`→
-      `QByteArray`, `[tstr]`→`QStringList`, other arrays→`QVariantList`, and
-      `result`→`LogosResult`.
+      `float64`→`double`, `tstr`→`QString`, `int`→`qlonglong`, `uint`→
+      `qulonglong`, `bstr`→`QByteArray`, `[tstr]`→`QStringList`, other
+      arrays→`QVariantList`, and `result`→`LogosResult`.
+
+      The integer spellings are 64-bit, and unsigned stays unsigned: LIDL
+      `int`/`uint` are `int64_t`/`uint64_t` in every other binding, so spelling
+      them `int` here truncated above 2^31 and read a `uint` back as *signed*.
+      `record` below shows it — its `id` is a `uint64_t` in the impl header.
     steps:
       - title: "Generate the consumer header"
         run: "./result/bin/logos-cpp-generator --lidl extracted/sensor_module.lidl --output-dir consumer --module-only"
@@ -285,13 +290,13 @@ sections:
           - "sensor_module_api.h"
         check_file: "consumer/sensor_module_api.h"
       - title: "Inspect the consumer API"
-        run: "grep -E 'class SensorModule|double temperature|int record|QByteArray firmware|QStringList labels|LogosResult reset|bool on\\(' consumer/sensor_module_api.h"
+        run: "grep -E 'class SensorModule|double temperature|qlonglong record|QByteArray firmware|QStringList labels|LogosResult reset|bool on\\(' consumer/sensor_module_api.h"
         code_block: |
           grep -E 'class|temperature|record|firmware|labels|reset|on\(' consumer/sensor_module_api.h
         expect_contains:
           - "class SensorModule"
           - "double temperature("
-          - "int record(int id, double value, const QString& note, bool valid"
+          - "qlonglong record(qulonglong id, double value, const QString& note, bool valid"
           - "QByteArray firmware(const QByteArray& image"
           - "QStringList labels(const QVariantList& ids"
           - "LogosResult reset(const QString& id"
@@ -301,12 +306,16 @@ sections:
     text: |
       Beyond the round-trippable core above, LIDL also has **composite** types:
       named record types (`type`), maps (`{K: V}`), and optionals (`?T`), plus the
-      untyped escape hatch `any`. These cross the wire as untyped JSON, so the
-      generated wrappers carry them as `QVariant` / `QVariantMap` / `QVariantList`
-      (record/map/optional shapes live in the authored contract; a
-      `--header-to-lidl` extraction recovers the std-friendly subset shown
-      earlier). Here is a contract that uses all of them, taken straight to a
-      consumer header.
+      untyped escape hatch `any`.
+
+      A **record becomes a real C++ struct**: a `type Point { … }` in the contract
+      generates `struct Point` plus the conversions, so a caller writes
+      `Point p = client.translate(q, 1, 2)` instead of digging fields out of a
+      `QVariantMap`. `[Point]` is a `QList<Point>` and `{tstr: Point}` a
+      `QMap<QString, Point>`. Maps of `any`, optionals (`?T`) and `any` itself
+      still cross as untyped JSON and stay `QVariantMap` / `QVariant` — a record
+      has a declared shape, those do not. Here is a contract that uses all of
+      them, taken straight to a consumer header.
     steps:
       - title: "geometry_module.lidl"
         file:
@@ -341,14 +350,18 @@ sections:
         check_file: "geometry/geometry_module_api.h"
       - title: "Inspect the composite signatures"
         text: |
-          Records and optionals surface as `QVariant`, an array-of-records as
-          `QVariantList`, and a map as `QVariantMap` — the untyped carriers for the
-          JSON that crosses the process boundary.
-        run: "grep -E 'class GeometryModule|QVariant translate|QVariantList|QVariantMap attributes|QVariant nearest' geometry/geometry_module_api.h"
+          `Point` is generated as a struct, so a record parameter is taken by
+          const-ref and a record return comes back typed. An array-of-records is a
+          `QList<Point>`. A map of `any`, an optional and a bare `any` stay
+          `QVariantMap` / `QVariant` — the untyped carriers for JSON whose shape
+          the contract does not declare.
+        run: "grep -E 'class GeometryModule|struct Point|Point translate|QList<Point>|QVariantMap attributes|QVariant nearest' geometry/geometry_module_api.h"
         code_block: |
           grep -E 'class|translate|bounds|attributes|nearest' geometry/geometry_module_api.h
         expect_contains:
           - "class GeometryModule"
-          - "QVariant translate(QVariant p, double dx, double dy"
+          - "struct Point"
+          - "Point translate(const Point& p, double dx, double dy"
+          - "Point bounds(const QList<Point>& points"
           - "QVariantMap attributes(const QVariantMap& tags"
-          - "QVariant nearest(QVariant p, QVariant limit"
+          - "QVariant nearest(const Point& p, QVariant limit"
