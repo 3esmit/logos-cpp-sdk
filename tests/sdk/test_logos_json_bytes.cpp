@@ -1,4 +1,4 @@
-// Value-level tests for the canonical tagged-bytes codec (logos_json.h).
+// Value-level tests for the canonical tagged-bytes codec.
 //
 // Binary payloads cross every module boundary as {"_bytes": "<base64url>"}.
 // The generated cdylib event sidecar encodes into that form and the generated
@@ -9,7 +9,11 @@
 
 #include <gtest/gtest.h>
 
-#include <logos_json.h>
+// logos_codec.h owns the canonical encode; logos_lp_client.h owns the lenient
+// `lp`-path decode. They used to be second copies in logos_json.h, which is now
+// aliases-only — see the note at the top of that header.
+#include <logos_codec.h>
+#include <logos_lp_client.h>
 
 #include <cstdint>
 #include <string>

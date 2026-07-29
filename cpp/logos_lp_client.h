@@ -26,7 +26,8 @@
 
 #include "logos_protocol.h"     // lp_* C ABI
 #include "logos_call_error.h"   // logos::CallError
-#include "logos_json.h"         // logos::bytesToJson / logos::jsonToBytes
+#include "logos_json.h"         // LogosMap / LogosList aliases
+#include "logos_codec.h"        // logos::bytesToJson, b64UrlDecode, isTaggedBytes
 #include "logos_result.h"       // StdLogosResult
 
 namespace logos {
@@ -43,8 +44,17 @@ inline std::vector<std::string> jsonToStringVec(const nlohmann::json& j) {
 }
 
 // Binary payloads travel in the canonical tagged form
-// {"_bytes": "<base64url, unpadded>"}; logos::bytesToJson / logos::jsonToBytes
-// live in logos_json.h and are used by the generated wrappers on both sides.
+// {"_bytes": "<base64url, unpadded>"}. Encoding is logos::bytesToJson from
+// logos_codec.h — the one canonical definition. Decoding on this path is NOT
+// the codec's: bytesFromJson throws and bytesFromJsonLenient also accepts a
+// plain string, a number and an int array, whereas every `lp` decoder here is
+// documented to yield the default-constructed value on a mismatch. So the lp
+// decode keeps its own deliberately-narrow spelling, next to jsonToStringVec
+// which has exactly the same contract.
+inline std::vector<uint8_t> jsonToBytes(const nlohmann::json& j) {
+    if (!isTaggedBytes(j)) return {};
+    return b64UrlDecode(j["_bytes"].get<std::string>());
+}
 
 inline StdLogosResult jsonToStdResult(const nlohmann::json& j) {
     StdLogosResult r;

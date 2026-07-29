@@ -162,7 +162,7 @@ TEST(LidlGenCdylib, ArrayOfBytesEventParamIsEligibleAndTagsEachElement)
     // Spelled Qt-free and encoded through the codec, so each element keeps its
     // canonical tag instead of becoming a plain array of numbers.
     EXPECT_TRUE(source.contains("std::vector<std::vector<uint8_t>>")) << source.toStdString();
-    EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to(payloads)"))
+    EXPECT_TRUE(source.contains("logos::toJson<std::vector<std::vector<uint8_t>>>(payloads)"))
         << source.toStdString();
     // From #111, still exactly right: Qt-free, and taken by const-ref like the
     // other composite payloads.
@@ -187,11 +187,13 @@ TEST(LidlGenCdylib, ArrayOfBytesMethodParamDecodesPerElement)
 
     const QString source = implSourceFor(m);
 
-    EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::from("))
+    EXPECT_TRUE(source.contains("logos::fromJson<std::vector<std::vector<uint8_t>>>("))
         << source.toStdString();
-    // The scalar param still uses the scalar decoder — deliberately NOT routed
-    // through the codec, so its documented leniency is unchanged.
-    EXPECT_TRUE(source.contains("lidlBytesFromJson(")) << source.toStdString();
+    // The scalar param decodes leniently too — and now through the SAME
+    // function as the nested one. It used to be a separate emitted helper, so a
+    // scalar bstr accepted a plain string while a [bstr] element rejected it:
+    // echoBytes("hi") worked and echoBytesList(["hi"]) threw, inside one module.
+    EXPECT_TRUE(source.contains("logos::bytesFromJsonLenient(")) << source.toStdString();
     // nlohmann's blanket container decode must not be used for this type: it
     // refuses a tagged object and would silently accept a raw number array,
     // skipping the base64 decode entirely.
@@ -211,7 +213,7 @@ TEST(LidlGenCdylib, ArrayOfBytesReturnTagsEachElement)
     ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
 
     const QString source = implSourceFor(m);
-    EXPECT_TRUE(source.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to("))
+    EXPECT_TRUE(source.contains("logos::toJson<std::vector<std::vector<uint8_t>>>("))
         << source.toStdString();
     EXPECT_FALSE(source.contains("nlohmann::json(result)")) << source.toStdString();
 }
@@ -237,7 +239,7 @@ TEST(LidlGenCdylib, NoDedicatedListEncoderAndTheScalarOneStaysGated)
     const QString listed = eventsSourceFor(withList);
     // The list rides the codec; no bespoke list encoder is emitted at all.
     EXPECT_FALSE(listed.contains("lidlBytesListToJson")) << listed.toStdString();
-    EXPECT_TRUE(listed.contains("logos_gen::Codec<std::vector<std::vector<uint8_t>>>::to("))
+    EXPECT_TRUE(listed.contains("logos::toJson<std::vector<std::vector<uint8_t>>>("))
         << listed.toStdString();
 }
 
@@ -297,9 +299,17 @@ TEST(LidlGenCdylib, OnlyDeclaredRecordsAreRecords)
     // redefinition.
     EXPECT_TRUE(types.contains("struct Blob;")) << types.toStdString();
     EXPECT_FALSE(types.contains("struct Blob {")) << types.toStdString();
-    EXPECT_TRUE(types.contains("template <> struct Codec<Blob>")) << types.toStdString();
+    // Specialized into logos::detail, beside the primary template it specializes,
+    // and spelled ::Blob because the author's struct is at global scope while
+    // this is namespace logos::detail.
+    EXPECT_TRUE(types.contains("template <> struct Codec<::Blob, void>")) << types.toStdString();
+    EXPECT_TRUE(types.contains("namespace logos { namespace detail {")) << types.toStdString();
     // The bstr field goes through the bytes codec, not nlohmann's array-of-numbers.
     EXPECT_TRUE(types.contains("Codec<std::vector<uint8_t>>::to(v.payload)")) << types.toStdString();
+    // The generic half is NOT emitted any more — it comes from logos_codec.h.
+    EXPECT_TRUE(types.contains("#include <logos_codec.h>")) << types.toStdString();
+    EXPECT_FALSE(types.contains("namespace logos_gen")) << types.toStdString();
+    EXPECT_FALSE(types.contains("struct Codec<int64_t>")) << types.toStdString();
 
     // An undeclared Named type is NOT a record and stays refused.
     MethodDecl bad;
