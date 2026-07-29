@@ -97,13 +97,14 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& pat
                      const std::set<std::string>& recs)
 {
     if (te.kind == TypeExpr::Primitive) {
-        if (te.name == "bstr") return "lidlBytesFromJson(" + expr + ")";
+        if (te.name == "bstr")
+            return "logos::bytesFromJsonLenient(" + expr + ", \"" + path + "\")";
         if (te.name == "any")  return expr;
     }
     const QString cpp = lidlTypeToStdCdylib(te, recs);
     if (cpp == "LogosMap" || cpp == "LogosList")
         return expr;  // untyped JSON passes through, as it always has
-    return "logos_gen::Codec<" + cpp + ">::from(" + expr + ", \"" + path + "\")";
+    return "logos::fromJson<" + cpp + ">(" + expr + ", \"" + path + "\")";
 }
 
 // std-typed return variable -> json expression
@@ -133,7 +134,7 @@ QString stdReturnToJson(const MethodDecl& md, const QString& var,
         return var;
     // `nlohmann::json(v)` would serialize a vector<uint8_t> as a plain number
     // array and a record not at all; the codec keeps bytes tagged at depth.
-    return "logos_gen::Codec<" + cppRet + ">::to(" + var + ")";
+    return "logos::toJson<" + cppRet + ">(" + var + ")";
 }
 
 // Qt-free spelling of a LIDL type. lidlTypeToStd() falls back to Qt containers
@@ -193,131 +194,36 @@ QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& rec
 //
 // The primary template is intentionally left UNDEFINED: an unsupported T is a
 // compile error naming the type, never a silent default-constructed value.
-void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
-                        const std::set<std::string>& recs)
+// Emits ONE specialization per record the module declares — and nothing else.
+//
+// The generic half (scalars, bstr, the vector/map composition, the error paths)
+// used to be emitted here too, ~186 lines of C++-emitting-C++ that mirrored
+// logos-protocol's logos_codec.h by hand. It no longer is: logos_json.h stopped
+// defining byte helpers that collided with that header, so a module TU can now
+// include the canonical codec directly.
+//
+// That duplication was not free. The two copies had drifted (the emitted integer
+// decode gated on is_number() where the canonical one checked
+// is_number_integer() || is_number_unsigned()), they disagreed on padded base64,
+// and every codec fix had to be written twice or it silently only half-applied.
+//
+// What remains is irreducible: a LIDL `type` is a per-contract struct whose field
+// names and member types exist only in this module's header, and C++17 has no
+// field reflection. Nesting composes for free — Codec<std::vector<Blob>> and
+// deeper come from the shared generic half once Codec<::Blob> exists.
+void emitRecordCodecs(QTextStream& s, const ModuleDecl& module,
+                      const std::set<std::string>& recs)
 {
-    s << "namespace logos_gen {\n\n";
-    s << "// Codec<T>::to / ::from — the one place a value's wire form is decided.\n";
-    s << "// The primary template is undefined on purpose: an unsupported T is a\n";
-    s << "// compile error naming the type, not a silent default.\n";
-    s << "template <class T> struct Codec;\n\n";
-
-    s << "[[noreturn]] inline void lidlTypeError(const char* want, const std::string& path,\n";
-    s << "                                       const nlohmann::json& got)\n{\n";
-    s << "    throw std::runtime_error(std::string(\"expected \") + want + \" at \" + path\n";
-    s << "                             + \", got \" + std::string(got.type_name()));\n}\n\n";
-
-    // Scalars that need no more than a category check.
-    struct Scalar { const char* cpp; const char* want; const char* check; const char* get; };
-    const Scalar scalars[] = {
-        {"std::string",  "string",  "is_string()",         "get<std::string>()"},
-        {"double",       "number",  "is_number()",         "get<double>()"},
-        {"bool",         "boolean", "is_boolean()",        "get<bool>()"},
-    };
-    for (const Scalar& sc : scalars) {
-        s << "template <> struct Codec<" << sc.cpp << "> {\n";
-        s << "    static nlohmann::json to(const " << sc.cpp << "& v) { return nlohmann::json(v); }\n";
-        s << "    static " << sc.cpp << " from(const nlohmann::json& j, const std::string& path) {\n";
-        s << "        if (!j." << sc.check << ") lidlTypeError(\"" << sc.want << "\", path, j);\n";
-        s << "        return j." << sc.get << ";\n    }\n};\n\n";
-    }
-
-    // The integers are spelled out rather than driven from the table above,
-    // because a category check is not enough for them and the shortcuts are
-    // silent rather than loud:
-    //
-    //   is_number() admits a FLOAT, and .get<int64_t>() TRUNCATES it — 3.7
-    //   arrived as 3 instead of being rejected.
-    //   is_number() admits a NEGATIVE, and .get<uint64_t>() WRAPS it — -1
-    //   arrived as 18446744073709551615, a sign flip on a nominal value.
-    //
-    // Both used to be pinned as conformance expectations, which made the C++
-    // provider disagree with the Rust one (which rejects) on a contract they
-    // share. Rejecting is the correct half of that disagreement: a value the
-    // declared type cannot represent must not reach the author wearing another.
-    s << "template <> struct Codec<int64_t> {\n";
-    s << "    static nlohmann::json to(const int64_t& v) { return nlohmann::json(v); }\n";
-    s << "    static int64_t from(const nlohmann::json& j, const std::string& path) {\n";
-    s << "        if (j.is_number_float()) {\n";
-    s << "            const double d = j.get<double>();\n";
-    s << "            double ip = 0.0;\n";
-    s << "            if (std::modf(d, &ip) != 0.0)\n";
-    s << "                lidlTypeError(\"integer\", path, j);\n";
-    s << "            if (d < -9223372036854775808.0 || d >= 9223372036854775808.0)\n";
-    s << "                lidlTypeError(\"signed integer in range\", path, j);\n";
-    s << "            return static_cast<int64_t>(d);\n";
-    s << "        }\n";
-    s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
-    s << "            lidlTypeError(\"integer\", path, j);\n";
-    s << "        if (j.is_number_unsigned()\n";
-    s << "            && j.get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max()))\n";
-    s << "            lidlTypeError(\"signed integer in range\", path, j);\n";
-    s << "        return j.get<int64_t>();\n    }\n};\n\n";
-
-    s << "template <> struct Codec<uint64_t> {\n";
-    s << "    static nlohmann::json to(const uint64_t& v) { return nlohmann::json(v); }\n";
-    s << "    static uint64_t from(const nlohmann::json& j, const std::string& path) {\n";
-    s << "        if (j.is_number_float()) {\n";
-    s << "            const double d = j.get<double>();\n";
-    s << "            double ip = 0.0;\n";
-    s << "            if (std::modf(d, &ip) != 0.0)\n";
-    s << "                lidlTypeError(\"integer\", path, j);\n";
-    s << "            if (d < 0.0 || d >= 18446744073709551616.0)\n";
-    s << "                lidlTypeError(\"unsigned integer in range\", path, j);\n";
-    s << "            return static_cast<uint64_t>(d);\n";
-    s << "        }\n";
-    s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
-    s << "            lidlTypeError(\"integer\", path, j);\n";
-    s << "        if (!j.is_number_unsigned() && j.get<int64_t>() < 0)\n";
-    s << "            lidlTypeError(\"unsigned integer\", path, j);\n";
-    s << "        return j.get<uint64_t>();\n    }\n};\n\n";
-
-    // bstr. The FULL specialization wins over the generic vector rule below,
-    // which is what keeps bytes tagged at every depth instead of being
-    // serialized as a plain array of numbers.
-    s << "template <> struct Codec<std::vector<uint8_t>> {\n";
-    s << "    static nlohmann::json to(const std::vector<uint8_t>& v) { return logos::bytesToJson(v); }\n";
-    s << "    static std::vector<uint8_t> from(const nlohmann::json& j, const std::string& path) {\n";
-    s << "        if (j.is_object() && j.size() == 1 && j.contains(\"_bytes\")\n";
-    s << "            && j.at(\"_bytes\").is_string())\n";
-    s << "            return logos::jsonToBytes(j);\n";
-    s << "        lidlTypeError(\"bytes\", path, j);\n    }\n};\n\n";
-
-    // Untyped JSON passes through unchanged — `any`, and the LogosMap/LogosList
-    // aliases, are all nlohmann::json.
-    s << "template <> struct Codec<nlohmann::json> {\n";
-    s << "    static nlohmann::json to(const nlohmann::json& v) { return v; }\n";
-    s << "    static nlohmann::json from(const nlohmann::json& j, const std::string&) { return j; }\n";
-    s << "};\n\n";
-
-    s << "template <class T> struct Codec<std::vector<T>> {\n";
-    s << "    static nlohmann::json to(const std::vector<T>& v) {\n";
-    s << "        nlohmann::json out = nlohmann::json::array();\n";
-    s << "        for (const T& e : v) out.push_back(Codec<T>::to(e));\n";
-    s << "        return out;\n    }\n";
-    s << "    static std::vector<T> from(const nlohmann::json& j, const std::string& path) {\n";
-    s << "        if (!j.is_array()) lidlTypeError(\"array\", path, j);\n";
-    s << "        std::vector<T> out;\n        out.reserve(j.size());\n";
-    s << "        for (size_t i = 0; i < j.size(); ++i)\n";
-    s << "            out.push_back(Codec<T>::from(j.at(i), path + \"[\" + std::to_string(i) + \"]\"));\n";
-    s << "        return out;\n    }\n};\n\n";
-
-    s << "template <class T> struct Codec<std::map<std::string, T>> {\n";
-    s << "    static nlohmann::json to(const std::map<std::string, T>& v) {\n";
-    s << "        nlohmann::json out = nlohmann::json::object();\n";
-    s << "        for (const auto& kv : v) out[kv.first] = Codec<T>::to(kv.second);\n";
-    s << "        return out;\n    }\n";
-    s << "    static std::map<std::string, T> from(const nlohmann::json& j, const std::string& path) {\n";
-    s << "        if (!j.is_object()) lidlTypeError(\"object\", path, j);\n";
-    s << "        std::map<std::string, T> out;\n";
-    s << "        for (auto it = j.begin(); it != j.end(); ++it)\n";
-    s << "            out.emplace(it.key(), Codec<T>::from(it.value(), path + \".\" + it.key()));\n";
-    s << "        return out;\n    }\n};\n\n";
-
+    if (module.types.empty()) return;
+    // Reopened so the specializations land beside the primary template they
+    // specialize. `::Name` because the author's record types are at global
+    // scope, while this is namespace logos::detail — without the qualifier the
+    // name would resolve inside logos::.
+    s << "namespace logos { namespace detail {\n\n";
     // One specialization per declared record. Field order follows the contract.
     for (const TypeDecl& t : module.types) {
         const QString name = qs(t.name);
-        s << "template <> struct Codec<" << name << "> {\n";
+        s << "template <> struct Codec<::" << name << ", void> {\n";
         s << "    static nlohmann::json to(const " << name << "& v) {\n";
         s << "        nlohmann::json out = nlohmann::json::object();\n";
         for (const FieldDecl& f : t.fields) {
@@ -327,7 +233,7 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
         }
         s << "        return out;\n    }\n";
         s << "    static " << name << " from(const nlohmann::json& j, const std::string& path) {\n";
-        s << "        if (!j.is_object()) lidlTypeError(\"object\", path, j);\n";
+        s << "        if (!j.is_object()) detail::typeError(path, \"object\", j);\n";
         s << "        " << name << " out;\n";
         for (const FieldDecl& f : t.fields) {
             const QString ft = lidlTypeToStdCdylib(f.type, recs);
@@ -342,7 +248,7 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
         }
         s << "        return out;\n    }\n};\n\n";
     }
-    s << "}  // namespace logos_gen\n\n";
+    s << "}}  // namespace logos::detail\n\n";
 }
 
 bool hasBytesEventParam(const ModuleDecl& module)
@@ -394,7 +300,7 @@ bool hasJsonEventParam(const ModuleDecl& module)
 }
 
 // The SCALAR tagged-bytes helpers. A `[bstr]` (and bytes at any deeper
-// nesting) rides logos_gen::Codec instead: its full specialization for
+// nesting) rides logos::Codec instead: its full specialization for
 // std::vector<uint8_t> beats the generic vector rule, so one mechanism covers
 // [bstr], [[bstr]] and {tstr: [bstr]} alike. #111 emitted a dedicated depth-1
 // list codec here; the generic one subsumes it, and keeping both left an
@@ -542,12 +448,10 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
     s << "//\n";
     s << "// rather than picking fields out of a LogosMap.\n";
     s << "#pragma once\n";
-    s << "#include <logos_json.h>\n";
+    s << "#include <logos_json.h>\n";   // LogosMap / LogosList aliases
+    s << "#include <logos_codec.h>\n";  // logos::Codec — the ONE definition
     s << "#include <cstdint>\n";
-    s << "#include <cmath>\n";    // the integer codecs accept whole-valued floats
-    s << "#include <limits>\n";   // ...and range-check
     s << "#include <map>\n";
-    s << "#include <stdexcept>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n\n";
 
@@ -561,7 +465,7 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
         s << "\n";
     }
 
-    emitGeneratedCodec(s, module, recs);
+    emitRecordCodecs(s, module, recs);
     return c;
 }
 
@@ -899,7 +803,7 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
             if (evStd != "LogosMap" && evStd != "LogosList"
                 && (isRecord(pd.type, recsEv)
                     || pd.type.kind == TypeExpr::Array || pd.type.kind == TypeExpr::Map)) {
-                s << "    args.push_back(logos_gen::Codec<" << evStd << ">::to("
+                s << "    args.push_back(logos::toJson<" << evStd << ">("
                   << pd.name << "));\n";
                 continue;
             }

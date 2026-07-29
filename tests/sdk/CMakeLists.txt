@@ -15,4 +15,13 @@ target_link_libraries(sdk_tests PRIVATE
     GTest::gtest_main
 )
 
+# logos_lp_client.h (and through it logos_codec.h / logos_protocol.h) lives in
+# logos-protocol. nix/tests.nix already passes LOGOS_PROTOCOL_ROOT; this is what
+# plumbs it into the target.
+target_include_directories(sdk_tests PRIVATE
+    ${LOGOS_PROTOCOL_ROOT}/cpp
+    ${LOGOS_PROTOCOL_ROOT}/include
+    ${LOGOS_PROTOCOL_ROOT}/include/cpp
+)
+
 gtest_discover_tests(sdk_tests)

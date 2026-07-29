@@ -1,91 +1,30 @@
 #pragma once
 #include <nlohmann/json.hpp>
 
-#include <cstddef>
-#include <cstdint>
-#include <string>
-#include <vector>
-
 // Semantic aliases for nlohmann::json used in universal module impl classes.
 // The code generator recognizes these names and emits QVariantMap / QVariantList
 // conversions in the Qt glue layer, so impl classes remain Qt-free.
+//
+// ALIASES ONLY, on purpose. This header also used to define b64UrlEncode,
+// b64UrlDecode, bytesToJson and jsonToBytes — second copies of functions
+// logos-protocol's logos_codec.h already owned. That was not merely duplication:
+// the two sets had the same mangled names with weak linkage and DIFFERENT bodies,
+// and both reached one program, because module TUs compiled these while
+// liblogos_protocol.a carries TUs that included logos_codec.h. Which body won was
+// down to link order.
+//
+// It also made logos_codec.h unincludable from any TU that wanted LogosMap — a
+// redefinition error, since `inline` allows one definition per translation unit,
+// not two. That is why the cdylib generator had to emit its own copy of the
+// entire codec, and why every codec fix had to be written twice.
+//
+// The byte helpers now live where they belong: the canonical ones in
+// logos-protocol's logos_codec.h, and the lenient `lp`-path jsonToBytes beside
+// its sibling jsonToStringVec in logos_lp_client.h.
+//
+// Keeping this header dependency-free (nlohmann only) is deliberate. Some thirty
+// alias-only include sites across the module repos would otherwise inherit an
+// include path they have no use for, and logos-cpp-sdkConfig.cmake's "its only
+// dependency is nlohmann_json" would stop being true.
 using LogosMap  = nlohmann::json;
 using LogosList = nlohmann::json;
-
-namespace logos {
-
-// The canonical tagged form for binary payloads on the wire:
-//
-//     {"_bytes": "<base64url, unpadded>"}
-//
-// It is what logos-protocol emits and expects (logos_json_convert.cpp,
-// implementations/plain/json_mapping.cpp), and it is lossless for arbitrary
-// bytes — including embedded NULs, which a plain JSON string would not survive.
-// The Qt side reaches this form through QByteArray::toBase64/fromBase64 with
-// Base64UrlEncoding | OmitTrailingEquals; these are the Qt-free equivalents,
-// used by the generated `lp` wrappers and by universal (Qt-free) module code.
-
-inline std::string b64UrlEncode(const std::vector<uint8_t>& bytes)
-{
-    static const char* alpha =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    size_t i = 0;
-    while (i + 3 <= bytes.size()) {
-        uint32_t n = (uint32_t(bytes[i]) << 16) | (uint32_t(bytes[i + 1]) << 8)
-                   | uint32_t(bytes[i + 2]);
-        out += alpha[(n >> 18) & 0x3f]; out += alpha[(n >> 12) & 0x3f];
-        out += alpha[(n >> 6) & 0x3f];  out += alpha[n & 0x3f];
-        i += 3;
-    }
-    if (i < bytes.size()) {
-        uint32_t n = uint32_t(bytes[i]) << 16;
-        if (i + 1 < bytes.size()) n |= uint32_t(bytes[i + 1]) << 8;
-        out += alpha[(n >> 18) & 0x3f]; out += alpha[(n >> 12) & 0x3f];
-        if (i + 1 < bytes.size()) out += alpha[(n >> 6) & 0x3f];
-    }
-    return out;
-}
-
-inline std::vector<uint8_t> b64UrlDecode(const std::string& in)
-{
-    auto idx = [](char ch) -> int {
-        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
-        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
-        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
-        if (ch == '-') return 62;
-        if (ch == '_') return 63;
-        return -1;  // skips '=' padding and any stray character
-    };
-    std::vector<uint8_t> out;
-    uint32_t buf = 0;
-    int bits = 0;
-    for (char ch : in) {
-        const int v = idx(ch);
-        if (v < 0) continue;
-        buf = (buf << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xff));
-        }
-    }
-    return out;
-}
-
-// Bytes -> the tagged JSON object.
-inline nlohmann::json bytesToJson(const std::vector<uint8_t>& bytes)
-{
-    return nlohmann::json{{"_bytes", b64UrlEncode(bytes)}};
-}
-
-// The tagged JSON object -> bytes. Lenient, like the rest of the `lp` decode
-// path: anything that is not a well-formed tagged-bytes object yields empty.
-inline std::vector<uint8_t> jsonToBytes(const nlohmann::json& j)
-{
-    if (!j.is_object() || !j.contains("_bytes") || !j["_bytes"].is_string())
-        return {};
-    return b64UrlDecode(j["_bytes"].get<std::string>());
-}
-
-} // namespace logos
