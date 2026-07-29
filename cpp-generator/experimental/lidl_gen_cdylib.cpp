@@ -238,6 +238,15 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
     s << "template <> struct Codec<int64_t> {\n";
     s << "    static nlohmann::json to(const int64_t& v) { return nlohmann::json(v); }\n";
     s << "    static int64_t from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (j.is_number_float()) {\n";
+    s << "            const double d = j.get<double>();\n";
+    s << "            double ip = 0.0;\n";
+    s << "            if (std::modf(d, &ip) != 0.0)\n";
+    s << "                lidlTypeError(\"integer\", path, j);\n";
+    s << "            if (d < -9223372036854775808.0 || d >= 9223372036854775808.0)\n";
+    s << "                lidlTypeError(\"signed integer in range\", path, j);\n";
+    s << "            return static_cast<int64_t>(d);\n";
+    s << "        }\n";
     s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
     s << "            lidlTypeError(\"integer\", path, j);\n";
     s << "        if (j.is_number_unsigned()\n";
@@ -248,6 +257,15 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
     s << "template <> struct Codec<uint64_t> {\n";
     s << "    static nlohmann::json to(const uint64_t& v) { return nlohmann::json(v); }\n";
     s << "    static uint64_t from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (j.is_number_float()) {\n";
+    s << "            const double d = j.get<double>();\n";
+    s << "            double ip = 0.0;\n";
+    s << "            if (std::modf(d, &ip) != 0.0)\n";
+    s << "                lidlTypeError(\"integer\", path, j);\n";
+    s << "            if (d < 0.0 || d >= 18446744073709551616.0)\n";
+    s << "                lidlTypeError(\"unsigned integer in range\", path, j);\n";
+    s << "            return static_cast<uint64_t>(d);\n";
+    s << "        }\n";
     s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
     s << "            lidlTypeError(\"integer\", path, j);\n";
     s << "        if (!j.is_number_unsigned() && j.get<int64_t>() < 0)\n";
@@ -526,7 +544,8 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
     s << "#pragma once\n";
     s << "#include <logos_json.h>\n";
     s << "#include <cstdint>\n";
-    s << "#include <limits>\n";   // the integer codecs range-check
+    s << "#include <cmath>\n";    // the integer codecs accept whole-valued floats
+    s << "#include <limits>\n";   // ...and range-check
     s << "#include <map>\n";
     s << "#include <stdexcept>\n";
     s << "#include <string>\n";
