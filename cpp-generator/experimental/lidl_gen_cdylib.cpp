@@ -75,24 +75,30 @@ QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& rec
 // json arg expression -> std-typed C++ expression
 // A method argument, decoded into the author's C++ type.
 //
-// Everything that is not a plain scalar goes through the generated codec, which
-// recurses — so a bstr keeps its canonical tag at ANY depth and a record
-// decodes field by field with a path in the error. The scalars keep their
-// nlohmann accessor verbatim: `.get<int64_t>()` TRUNCATES a float rather than
-// throwing, and that leniency is pinned by the conformance matrix
-// (`hostile/int/fractional` expects 3 from 3.7 on this provider). Routing them
-// through the codec would silently change behaviour that something depends on.
+// EVERY typed value goes through the generated codec, which recurses — so a bstr
+// keeps its canonical tag at ANY depth, a record decodes field by field with a
+// path in the error, and a scalar is checked against its declared type.
+//
+// The scalars used to keep their nlohmann accessor verbatim, and that was the
+// last hole in the type contract on this backend: `.get<uint64_t>()` on -1 wraps
+// to 18446744073709551615 with no exception, so `echoUint(-1)` answered
+// 18446744073709551615 here and `dispatch_failed` on the Rust provider — a
+// silent sign flip on a nominal type, in a contract both providers share.
+// `.get<int64_t>()` on 3.7 likewise truncated to 3 instead of rejecting.
+//
+// The comment that used to sit here justified the leniency by pointing at the
+// conformance matrix cells that pinned it. That was circular: those cells exist
+// to DOCUMENT the divergence, and their own `why` text says the strict behaviour
+// is the correct one. The expectations moved with this change.
+//
+// `any` still passes through untouched — it is the one LIDL type that declares
+// nothing, so there is nothing to check it against.
 QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& path,
                      const std::set<std::string>& recs)
 {
     if (te.kind == TypeExpr::Primitive) {
-        if (te.name == "tstr")    return expr + ".get<std::string>()";
-        if (te.name == "bstr")    return "lidlBytesFromJson(" + expr + ")";
-        if (te.name == "int")     return expr + ".get<int64_t>()";
-        if (te.name == "uint")    return expr + ".get<uint64_t>()";
-        if (te.name == "float64") return expr + ".get<double>()";
-        if (te.name == "bool")    return expr + ".get<bool>()";
-        if (te.name == "any")     return expr;
+        if (te.name == "bstr") return "lidlBytesFromJson(" + expr + ")";
+        if (te.name == "any")  return expr;
     }
     const QString cpp = lidlTypeToStdCdylib(te, recs);
     if (cpp == "LogosMap" || cpp == "LogosList")
@@ -201,13 +207,10 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
     s << "    throw std::runtime_error(std::string(\"expected \") + want + \" at \" + path\n";
     s << "                             + \", got \" + std::string(got.type_name()));\n}\n\n";
 
-    // Scalars. Their leniency matches what the dispatch did before the codec
-    // existed, so behaviour for already-working modules is unchanged.
+    // Scalars that need no more than a category check.
     struct Scalar { const char* cpp; const char* want; const char* check; const char* get; };
     const Scalar scalars[] = {
         {"std::string",  "string",  "is_string()",         "get<std::string>()"},
-        {"int64_t",      "integer", "is_number()",         "get<int64_t>()"},
-        {"uint64_t",     "integer", "is_number()",         "get<uint64_t>()"},
         {"double",       "number",  "is_number()",         "get<double>()"},
         {"bool",         "boolean", "is_boolean()",        "get<bool>()"},
     };
@@ -218,6 +221,38 @@ void emitGeneratedCodec(QTextStream& s, const ModuleDecl& module,
         s << "        if (!j." << sc.check << ") lidlTypeError(\"" << sc.want << "\", path, j);\n";
         s << "        return j." << sc.get << ";\n    }\n};\n\n";
     }
+
+    // The integers are spelled out rather than driven from the table above,
+    // because a category check is not enough for them and the shortcuts are
+    // silent rather than loud:
+    //
+    //   is_number() admits a FLOAT, and .get<int64_t>() TRUNCATES it — 3.7
+    //   arrived as 3 instead of being rejected.
+    //   is_number() admits a NEGATIVE, and .get<uint64_t>() WRAPS it — -1
+    //   arrived as 18446744073709551615, a sign flip on a nominal value.
+    //
+    // Both used to be pinned as conformance expectations, which made the C++
+    // provider disagree with the Rust one (which rejects) on a contract they
+    // share. Rejecting is the correct half of that disagreement: a value the
+    // declared type cannot represent must not reach the author wearing another.
+    s << "template <> struct Codec<int64_t> {\n";
+    s << "    static nlohmann::json to(const int64_t& v) { return nlohmann::json(v); }\n";
+    s << "    static int64_t from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
+    s << "            lidlTypeError(\"integer\", path, j);\n";
+    s << "        if (j.is_number_unsigned()\n";
+    s << "            && j.get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max()))\n";
+    s << "            lidlTypeError(\"signed integer in range\", path, j);\n";
+    s << "        return j.get<int64_t>();\n    }\n};\n\n";
+
+    s << "template <> struct Codec<uint64_t> {\n";
+    s << "    static nlohmann::json to(const uint64_t& v) { return nlohmann::json(v); }\n";
+    s << "    static uint64_t from(const nlohmann::json& j, const std::string& path) {\n";
+    s << "        if (!j.is_number_integer() && !j.is_number_unsigned())\n";
+    s << "            lidlTypeError(\"integer\", path, j);\n";
+    s << "        if (!j.is_number_unsigned() && j.get<int64_t>() < 0)\n";
+    s << "            lidlTypeError(\"unsigned integer\", path, j);\n";
+    s << "        return j.get<uint64_t>();\n    }\n};\n\n";
 
     // bstr. The FULL specialization wins over the generic vector rule below,
     // which is what keeps bytes tagged at every depth instead of being
@@ -491,6 +526,7 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
     s << "#pragma once\n";
     s << "#include <logos_json.h>\n";
     s << "#include <cstdint>\n";
+    s << "#include <limits>\n";   // the integer codecs range-check
     s << "#include <map>\n";
     s << "#include <stdexcept>\n";
     s << "#include <string>\n";
