@@ -18,6 +18,7 @@
 #include "generator_lib.h"
 #include "../experimental/lidl_compat.h"
 #include "../experimental/impl_header_parser.h"
+#include "../experimental/lidl_emit_common.h"   // lidlTypeToQt — the one Qt type mapper
 
 // Escape a string for safe embedding inside a generated C++ string literal.
 static QString cppStringEscape(const QString& s)
@@ -32,43 +33,20 @@ static QString cppStringEscape(const QString& s)
 // Convert a TypeExpr → Qt-typed string name (same surface the
 // metaobject-introspection path produces for methods, so generator_lib
 // can consume both via one code path).
+//
+// ONE Qt type mapper. This used to be a near-duplicate of `lidlTypeToQt`
+// (experimental/lidl_emit_common.cpp) and the two disagreed: this copy had no
+// `void` case, so a `-> void` method reaching it as Primitive("void") from the
+// impl-header parser fell through to QVariant and generated
+// `QVariant doVoid(...)`. (The .lidl parser spells the same thing
+// Named("void"), which survived only by accident — mapReturnType's
+// `base == "void"` early-out.) The lp/std tables are DERIVED from this name, so
+// the same bug produced `LogosMap doVoid(...)` on the Qt-free surface: not a
+// Qt-only defect, a front-end one. It is now a delegation, so there is one
+// table to disagree with.
 static QString lidlTypeExprToQtTypeName(const TypeExpr& te)
 {
-    if (te.kind == TypeExpr::Primitive) {
-        if (te.name == "tstr")    return "QString";
-        if (te.name == "bstr")    return "QByteArray";
-        // 64-bit, and unsigned stays unsigned. LIDL int/uint are int64_t /
-        // uint64_t in every other binding; spelling them `int` here handed a
-        // Qt-style consumer a signed 32-bit value (silent truncation above
-        // 2^31) and a std/lp consumer a SIGNED int64_t for a `uint`.
-        if (te.name == "int")     return "qlonglong";
-        if (te.name == "uint")    return "qulonglong";
-        if (te.name == "float64") return "double";
-        if (te.name == "bool")    return "bool";
-        if (te.name == "result")  return "LogosResult";
-        if (te.name == "any")     return "QVariant";
-        return "QVariant";
-    }
-    if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
-        const TypeExpr& elem = te.elements[0];
-        if (elem.kind == TypeExpr::Primitive && elem.name == "tstr")
-            return "QStringList";
-        // A list of records keeps its element type — the wrapper emits a
-        // typed container, not a bag of QVariants.
-        if (elem.kind == TypeExpr::Named)
-            return "QList<" + qs(elem.name) + ">";
-        return "QVariantList";
-    }
-    if (te.kind == TypeExpr::Map) {
-        if (te.elements.size() == 2 && te.elements[1].kind == TypeExpr::Named)
-            return "QMap<QString, " + qs(te.elements[1].name) + ">";
-        return "QVariantMap";
-    }
-    if (te.kind == TypeExpr::Optional) return "QVariant";
-    // A record declared by the contract: generator_lib emits the struct and
-    // types every mention of it with the struct.
-    if (te.kind == TypeExpr::Named)    return qs(te.name);
-    return "QVariant";
+    return lidlTypeToQt(te);
 }
 
 static QJsonArray moduleRecordsToJson(const ModuleDecl& mod);
