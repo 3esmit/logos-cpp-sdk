@@ -114,9 +114,16 @@ public:
 
     // Blocking call. `args` is a JSON array. Returns the result JSON value
     // (null on failure); fills `err` when non-null.
+    //
+    // `timeout_ms <= 0` selects the protocol default (the C ABI's rule), which
+    // is what every caller got before the parameter existed — so adding it
+    // changes nothing for them. It exists because the Qt-typed consumer surface
+    // takes a `Timeout` on every async overload and had nowhere to put it: a
+    // wrapper delegating here silently dropped the caller's timeout.
     nlohmann::json invoke(const std::string& method,
                           const nlohmann::json& args,
-                          CallError* err) {
+                          CallError* err,
+                          int timeout_ms = 0) {
         lp_client* c = ensure();
         if (!c) {
             if (err) { err->code = "object_unavailable";
@@ -127,7 +134,7 @@ public:
         const std::string argsStr = args.dump();
         char* outRes = nullptr;
         char* outErr = nullptr;
-        const int rc = lp_invoke(c, method.c_str(), argsStr.c_str(), 0, &outRes, &outErr);
+        const int rc = lp_invoke(c, method.c_str(), argsStr.c_str(), timeout_ms, &outRes, &outErr);
         nlohmann::json result;  // null
         if (rc == LP_OK) {
             if (err) err->clear();
@@ -147,12 +154,13 @@ public:
     // failure / parse error). Safe to call from any thread.
     void invokeAsync(const std::string& method,
                      const nlohmann::json& args,
-                     std::function<void(nlohmann::json)> cb) {
+                     std::function<void(nlohmann::json)> cb,
+                     int timeout_ms = 0) {
         lp_client* c = ensure();
         if (!c) { if (cb) cb(nullptr); return; }
         auto* box = new std::function<void(nlohmann::json)>(std::move(cb));
         const std::string argsStr = args.dump();
-        lp_invoke_async(c, method.c_str(), argsStr.c_str(), 0,
+        lp_invoke_async(c, method.c_str(), argsStr.c_str(), timeout_ms,
             &LpClient::resultTrampoline, box);
     }
 
