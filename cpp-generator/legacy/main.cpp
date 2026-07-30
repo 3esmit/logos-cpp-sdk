@@ -696,6 +696,8 @@ static int generateProviderDispatch(const QString& headerPath, const QString& ou
     s << "#include <QVariant>\n";
     s << "#include <QString>\n";
     s << "#include \"logos_types.h\"\n";
+    // The canonical argument decoder — the Qt face of logos::fromJson<T>.
+    s << "#include \"logos_qt_arg_decode.h\"\n";
     s << "#include <exception>\n\n";
 
     // callMethod() — group by name to support overloaded methods
@@ -724,7 +726,9 @@ static int generateProviderDispatch(const QString& headerPath, const QString& ou
             if (m->returnType == "void" || m->returnType.isEmpty()) {
                 s << "        " << m->name << "(";
                 for (int i = 0; i < m->params.size(); ++i) {
-                    s << toQVariantConversion(m->params[i].first, QString("args.at(%1)").arg(i));
+                    s << toProviderArgDecode(m->params[i].first,
+                                             QString("args.at(%1)").arg(i),
+                                             QString("arg%1").arg(i));
                     if (i + 1 < m->params.size()) s << ", ";
                 }
                 s << ");\n";
@@ -733,7 +737,9 @@ static int generateProviderDispatch(const QString& headerPath, const QString& ou
             } else {
                 s << "        return QVariant::fromValue(" << m->name << "(";
                 for (int i = 0; i < m->params.size(); ++i) {
-                    s << toQVariantConversion(m->params[i].first, QString("args.at(%1)").arg(i));
+                    s << toProviderArgDecode(m->params[i].first,
+                                             QString("args.at(%1)").arg(i),
+                                             QString("arg%1").arg(i));
                     if (i + 1 < m->params.size()) s << ", ";
                 }
                 s << "));\n";
@@ -744,6 +750,18 @@ static int generateProviderDispatch(const QString& headerPath, const QString& ou
         }
         s << "    }\n";
     }
+    // An argument the declared type cannot represent is a REJECTED call, not a
+    // failed one: it answers the canonical {"code":"dispatch_failed", ...}
+    // object — byte-identical to what the cdylib dispatch and the Rust provider
+    // return — so the caller can tell "you sent me the wrong thing" from "the
+    // method threw". Anything else the author lets escape stays an ordinary
+    // method failure (invalid QVariant) rather than unwinding through Qt event
+    // dispatch and killing the module process.
+    s << "    } catch (const logos::CodecError& e) {\n";
+    s << "        qWarning() << \"" << className
+      << "::callMethod:\" << methodName << \"rejected:\" << e.what();\n";
+    s << "        return logos::dispatchFailedVariant(providerName(), "
+         "QString::fromUtf8(e.what()));\n";
     s << "    } catch (const std::exception& e) {\n";
     s << "        qWarning() << \"" << className
       << "::callMethod:\" << methodName << \"failed:\" << e.what();\n";

@@ -52,6 +52,35 @@ QString mapReturnType(const QString& qtType)
     return QString("QVariant");
 }
 
+// How an INCOMING provider argument is turned into the type the author
+// declared. Not the same job as toQVariantConversion below, which converts a
+// value the module already owns.
+//
+// The Qt conversions coerce: `args.at(0).toULongLong()` turned echoUint(-1)
+// into 18446744073709551615 and `.toLongLong()` turned echoInt(3.7) into 4, so
+// the author's method body never saw the value the caller actually sent, while
+// every non-Qt provider answered {"code":"dispatch_failed"} for the same input.
+// logos::qtArgFromVariant<T> routes the value through the canonical codec
+// instead — one rule, shared with the QMetaObject dispatch in logos-qt-sdk, and
+// deliberately NOT re-derived here (the codec is what knows that a whole-valued
+// 3.0 is a legal integer and 3.7 is not).
+//
+// A type the codec has no rule for keeps the old conversion verbatim: those are
+// module-author types the generator already treated as `any`, and routing them
+// through the codec would be a compile error rather than a behaviour change.
+QString toProviderArgDecode(const QString& type, const QString& argExpr,
+                            const QString& path)
+{
+    static const QSet<QString> codecKnown = {
+        "bool","int","qlonglong","qulonglong","double","float",
+        "QString","QStringList","QByteArray","QJsonArray","QJsonObject",
+        "QVariantList","QVariantMap","QVariant","LogosResult"
+    };
+    if (!codecKnown.contains(type))
+        return toQVariantConversion(type, argExpr);
+    return "logos::qtArgFromVariant<" + type + ">(" + argExpr + ", \"" + path + "\")";
+}
+
 QString toQVariantConversion(const QString& type, const QString& argExpr)
 {
     if (type == "int") return argExpr + ".toInt()";

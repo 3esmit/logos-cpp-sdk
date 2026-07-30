@@ -49,6 +49,13 @@ QString mapParamType(const QString& qtType);
 QString mapReturnType(const QString& qtType);
 QString toQVariantConversion(const QString& type, const QString& argExpr);
 
+// Incoming provider argument -> the declared type, via the canonical codec
+// (logos::qtArgFromVariant). `path` names the slot in the diagnostic a
+// rejection carries, e.g. "arg0". See the definition for why this is separate
+// from toQVariantConversion.
+QString toProviderArgDecode(const QString& type, const QString& argExpr,
+                            const QString& path);
+
 // makeHeader / makeSource emit the single `<Class>` wrapper for a
 // module. When `apiStyle == Std`, parameter / return types come from
 // the std-typed mapping table (std::string / std::vector<std::string>
