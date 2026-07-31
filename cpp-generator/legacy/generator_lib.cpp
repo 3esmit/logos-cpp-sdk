@@ -1,5 +1,7 @@
 #include "generator_lib.h"
 
+#include "metadata_dependencies.h"
+
 #include <QFile>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -1261,4 +1263,129 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         s << "}\n\n";
     }
     return c;
+}
+
+// ── Umbrella (logos_sdk.h / logos_sdk.cpp) over a module's dependencies ──────
+
+QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle, const QString& originName)
+{
+    const QStringList depNames = dependencyNames(deps);
+
+    QString content;
+    QTextStream s(&content);
+
+    // Lp (Qt-free) umbrella: no LogosAPI. Each dep wrapper self-creates its
+    // lp_client on behalf of `originName` (this module), so the struct is
+    // default-constructible and the glue just does `new LogosModules()`.
+    if (apiStyle == ApiStyle::Lp) {
+        s << "#pragma once\n";
+        s << "#include <string>\n";
+        if (!interfaceNames.isEmpty()) {
+            s << "#include <map>\n";
+            s << "#include <memory>\n";
+        }
+        for (const QString& depName : depNames)
+            s << "#include \"" << depName << "_api.h\"\n";
+        for (const QString& ifaceName : interfaceNames)
+            s << "#include \"" << ifaceName << "_api.h\"\n";
+        s << "\n";
+        s << "struct LogosModules {\n";
+        s << "    LogosModules()";
+        bool first = true;
+        for (const QString& depName : depNames) {
+            s << (first ? " : " : ",\n        ");
+            first = false;
+            s << depName << "(\"" << originName << "\")";
+        }
+        s << " {}\n";
+        for (const QString& depName : depNames)
+            s << "    " << toPascalCase(depName) << " " << depName << ";\n";
+        // Interface dependencies: bound at runtime. The bound wrapper is a
+        // THIN handle over per-provider State the umbrella OWNS for the
+        // module's lifetime — so a transient `modules().bind_x(p)` temporary
+        // can register an async callback / event subscription that outlives
+        // it (the LpClient + RAII subscriptions persist in the map). Keyed by
+        // provider so repeated binds to the same provider share one client.
+        for (const QString& ifaceName : interfaceNames) {
+            const QString className = toPascalCase(ifaceName);
+            s << "    " << className << " bind_" << ifaceName << "(const std::string& moduleName) {\n";
+            s << "        auto& _st = m_" << ifaceName << "_bound[moduleName];\n";
+            s << "        if (!_st) _st = std::make_unique<" << className << "::State>(moduleName, \"" << originName << "\");\n";
+            s << "        return " << className << "(_st.get());\n";
+            s << "    }\n";
+        }
+        for (const QString& ifaceName : interfaceNames) {
+            const QString className = toPascalCase(ifaceName);
+            s << "    std::map<std::string, std::unique_ptr<" << className << "::State>> m_"
+              << ifaceName << "_bound;\n";
+        }
+        s << "};\n";
+        return content;
+    }
+
+    // The shape doesn't depend on apiStyle — each dep emits a single
+    // `<name>_api.h` whose class signature shape was already decided
+    // at codegen time. The umbrella just `#include`s and aggregates
+    // each wrapper into the flat `LogosModules` struct.
+    //
+    // Only the modules explicitly listed in `metadata.json#
+    // dependencies` are exposed. Apps that need to manage the core
+    // (basecamp, logoscore) use liblogos' C API directly rather than
+    // the typed `LogosModules` aggregate.
+    //
+    // Interface dependencies (`metadata.json#interface_dependencies`) are
+    // NOT fixed members — they bind to a runtime-chosen module — so each
+    // gets a `bind_<name>(moduleName)` factory instead, returning a bound
+    // wrapper by value.
+    s << "#pragma once\n";
+    // <string> is only needed for the std::string bind_<iface> overloads;
+    // omit it when there are no interfaces so the umbrella stays identical
+    // to its historical form for dependency-only modules.
+    if (!interfaceNames.isEmpty()) s << "#include <string>\n";
+    s << "#include \"logos_api.h\"\n";
+    s << "#include \"logos_api_client.h\"\n\n";
+    for (const QString& depName : depNames)
+        s << "#include \"" << depName << "_api.h\"\n";
+    for (const QString& ifaceName : interfaceNames)
+        s << "#include \"" << ifaceName << "_api.h\"\n";
+    s << "\n";
+
+    s << "struct LogosModules {\n";
+    s << "    explicit LogosModules(LogosAPI* api) : api(api)";
+    for (const QString& depName : depNames)
+        s << ", \n        " << depName << "(api)";
+    s << " {}\n";
+    s << "    LogosAPI* api;\n";
+    for (const QString& depName : depNames)
+        s << "    " << toPascalCase(depName) << " " << depName << ";\n";
+    // Bind factories — one per interface dependency. Two overloads so
+    // both Qt-typed (QString) and std-typed (std::string) call sites can
+    // pass the runtime module name without converting at the call site.
+    for (const QString& ifaceName : interfaceNames) {
+        const QString className = toPascalCase(ifaceName);
+        s << "    " << className << " bind_" << ifaceName << "(const QString& moduleName) {\n";
+        s << "        return " << className << "(api, moduleName);\n";
+        s << "    }\n";
+        s << "    " << className << " bind_" << ifaceName << "(const std::string& moduleName) {\n";
+        s << "        return " << className << "(api, QString::fromStdString(moduleName));\n";
+        s << "    }\n";
+    }
+    s << "};\n";
+    return content;
+}
+
+QString makeUmbrellaSourceFromDeps(const QJsonArray& deps, const QStringList& interfaceNames)
+{
+    // Each dep emits one wrapper `.cpp` (Qt or std — decided at codegen time,
+    // file name is the same either way), `#include`'d here. Interface wrappers
+    // (`<name>_api.cpp`) are #include'd the same way.
+    QString content;
+    QTextStream s(&content);
+    s << "#include \"logos_sdk.h\"\n\n";
+    for (const QString& depName : dependencyNames(deps))
+        s << "#include \"" << depName << "_api.cpp\"\n";
+    for (const QString& ifaceName : interfaceNames)
+        s << "#include \"" << ifaceName << "_api.cpp\"\n";
+    s << "\n";
+    return content;
 }

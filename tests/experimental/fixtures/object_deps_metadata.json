@@ -1,0 +1,15 @@
+{
+    "name": "sample_module",
+    "version": "1.2.3",
+    "description": "A sample module whose dependencies carry resolution constraints",
+    "author": "Test",
+    "type": "core",
+    "category": "testing",
+    "main": "sample_module_plugin",
+    "dependencies": [
+        "dep_a",
+        { "name": "dep_b", "version": "=1.2.3" },
+        { "name": "dep_c", "version": "^2.0", "signer": "did:jwk:abc" },
+        {}
+    ]
+}

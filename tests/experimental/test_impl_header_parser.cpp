@@ -64,6 +64,25 @@ TEST_F(ImplHeaderParserTest, ParsesSampleImpl)
     EXPECT_GE(r.module.methods.size(), 10);
 }
 
+// A dependency entry may carry the constraints an installer resolves it by,
+// and generation still needs the name. Read as a plain string, an object entry
+// came back empty and the module it names vanished from the generated
+// LogosModules aggregate, so every call through it failed to compile.
+TEST_F(ImplHeaderParserTest, ReadsDependenciesDeclaredInObjectForm)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/sample_impl.h",
+        "SampleModuleImpl",
+        fixturesDir() + "/object_deps_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    ASSERT_EQ(r.module.depends.size(), 3);
+    EXPECT_EQ(r.module.depends[0], "dep_a");
+    EXPECT_EQ(r.module.depends[1], "dep_b");
+    EXPECT_EQ(r.module.depends[2], "dep_c");
+}
+
 TEST_F(ImplHeaderParserTest, MethodTypes)
 {
     auto r = parseImplHeader(

@@ -102,4 +102,18 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
 QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 QVector<ParsedMethod> parseProviderHeader(const QString& headerPath, QTextStream& err);
 
+// The umbrella (`logos_sdk.h` / `logos_sdk.cpp`) over a module's declared
+// `metadata.json#dependencies` + interface dependencies: one `#include` and one
+// `LogosModules` member per dep, so a module reaches its deps as
+// `modules().<dep>`. `deps` is the raw metadata array — elements are read
+// through dependencyNames() (metadata_dependencies.h), never element by
+// element, so includes and members can never disagree about what it declares.
+//
+// ApiStyle::Lp emits the Qt-free umbrella: no LogosAPI member, each wrapper
+// self-creates its lp_client on behalf of `originName` (the module being
+// generated for), so the struct is default-constructible. Qt emits the
+// LogosAPI-threading form, where `originName` is unused.
+QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle = ApiStyle::Qt, const QString& originName = QString());
+QString makeUmbrellaSourceFromDeps(const QJsonArray& deps, const QStringList& interfaceNames);
+
 #endif // GENERATOR_LIB_H

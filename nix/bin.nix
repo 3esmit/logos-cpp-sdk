@@ -46,6 +46,7 @@ pkgs.stdenv.mkDerivation {
     cp cpp-generator/experimental/lidl_compat.h \
        cpp-generator/experimental/impl_header_parser.h cpp-generator/experimental/impl_header_parser.cpp \
        cpp-generator/experimental/lidl_emit_common.h cpp-generator/experimental/lidl_emit_common.cpp \
+       cpp-generator/metadata_dependencies.h \
        $out/share/lidl-frontend/
 
     runHook postInstall
