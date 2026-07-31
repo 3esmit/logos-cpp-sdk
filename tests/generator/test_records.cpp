@@ -2,7 +2,7 @@
 // C++ module actually gets for its dependencies (`--dep <name>=<lidl>`).
 //
 // A contract's `type Status { ... }` used to reach every C++ consumer as an
-// untyped bag: QVariant on the Qt surface, LogosMap on the std/lp one. The
+// untyped bag: QVariant on the Qt surface, LogosMap on the lp one. The
 // caller then had to know the field names AND, for a `bstr` field, that the
 // value arrives as the canonical `{"_bytes": "..."}` envelope it must unwrap
 // itself — while Rust and the client-stub backend hand back a real struct.
@@ -97,11 +97,11 @@ TEST(Records, QtWrapperExposesTheStruct)
     EXPECT_FALSE(h.contains("describeStatus(QVariant"));
 }
 
-// The std / lp surfaces spell the same records in std types — a universal
+// The lp surface spells the same records in std types — a universal
 // (Qt-free) module never sees a Qt name.
-TEST(Records, StdAndLpWrappersUseStdFieldTypes)
+TEST(Records, LpWrapperUsesStdFieldTypes)
 {
-    for (ApiStyle style : {ApiStyle::Std, ApiStyle::Lp}) {
+    for (ApiStyle style : {ApiStyle::Lp}) {
         const QString h = makeHeader("info_module", "InfoModule", statusMethods(),
                                      style, {}, BindMode::Static, statusRecords());
         EXPECT_TRUE(h.contains("        uint64_t port{};")) << h.toStdString();
@@ -113,7 +113,7 @@ TEST(Records, StdAndLpWrappersUseStdFieldTypes)
         EXPECT_FALSE(h.contains("LogosMap getStatus("));
     }
 
-    // std::map needs its header on the std/lp surfaces.
+    // std::map needs its header on the lp surface.
     const QString lp = makeHeader("info_module", "InfoModule", statusMethods(),
                                   ApiStyle::Lp, {}, BindMode::Static, statusRecords());
     EXPECT_TRUE(lp.contains("#include <map>"));
@@ -136,7 +136,7 @@ TEST(Records, BytesFieldsUseTheCanonicalEncoding)
     EXPECT_TRUE(qt.contains("__out.blob = __m.value(QStringLiteral(\"blob\")).toByteArray();"));
 }
 
-// The conversions are file-local statics in the .cpp: a std/lp consumer's own
+// The conversions are file-local statics in the .cpp: an lp consumer's own
 // translation units must not need the wire type to include the header.
 TEST(Records, ConversionsStayOutOfTheHeader)
 {
@@ -172,11 +172,11 @@ TEST(Records, ReturnTypesAreQualifiedInTheDefinition)
 // from its own uninitialized local — it compiled, with only a warning.
 TEST(Records, ContainerLambdasDoNotShadowTheDecoderLocals)
 {
-    for (ApiStyle style : {ApiStyle::Qt, ApiStyle::Std, ApiStyle::Lp}) {
+    for (ApiStyle style : {ApiStyle::Qt, ApiStyle::Lp}) {
         const QString c = makeSource("info_module", "InfoModule", "info_module_api.h",
                                      statusMethods(), style, {}, BindMode::Static,
                                      statusRecords());
-        // The decoder's own map is `__m` (Qt/Std); a nested lambda must not
+        // The decoder's own map is `__m` (Qt); a nested lambda must not
         // declare another one.
         EXPECT_FALSE(c.contains("const QVariantMap __m = (__m.value")) << c.toStdString();
         EXPECT_FALSE(c.contains("const nlohmann::json& __j = w.at")) << c.toStdString();
@@ -188,7 +188,7 @@ TEST(Records, ContainerLambdasDoNotShadowTheDecoderLocals)
 TEST(Records, EmptyRecordSetChangesNothing)
 {
     const QJsonArray methods{method("ping", "QString", QJsonArray{param("msg", "QString")})};
-    for (ApiStyle style : {ApiStyle::Qt, ApiStyle::Std, ApiStyle::Lp}) {
+    for (ApiStyle style : {ApiStyle::Qt, ApiStyle::Lp}) {
         EXPECT_EQ(makeHeader("m", "M", methods, style, {}, BindMode::Static, {}),
                   makeHeader("m", "M", methods, style, {}, BindMode::Static));
         EXPECT_EQ(makeSource("m", "M", "m_api.h", methods, style, {}, BindMode::Static, {}),

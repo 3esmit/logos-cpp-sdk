@@ -92,7 +92,9 @@ The codegen exposes **one** wrapper class per module — `<Module>` — with sig
 | `--api-style` | Wrapper signatures |
 |---|---|
 | `qt` (default) | `QString` / `QStringList` / `QVariantList` / `QVariantMap` / `int` / `LogosResult` |
-| `std` | `std::string` / `std::vector<std::string>` / `LogosMap` / `LogosList` / `int64_t` / `StdLogosResult` |
+| `lp` | `std::string` / `std::vector<std::string>` / `LogosMap` / `LogosList` / `int64_t` / `StdLogosResult`, over the Qt-free logos-protocol C ABI |
+
+(A third value, `std` — std signatures over a `QVariant` / `LogosAPIClient` body — was retired; the generator now rejects `--api-style=std` instead of aliasing it.)
 
 Both styles emit:
 
@@ -113,15 +115,15 @@ Only the modules explicitly listed as dependencies are exposed. The runtime's `c
 
 `ApiStyle` enum + new helpers in `generator_lib`:
 
-- `enum class ApiStyle { Qt, Std }` — passed to every wrapper-emitting function.
-- File-local `mapParamTypeStd` / `mapReturnTypeStd` / `stdParamToQVariant` / `qVariantToStdReturn` — std-side type-mapping + Qt↔std conversion expressions. Hidden from `generator_lib.h` (not part of the public surface).
-- `makeHeader(moduleName, className, methods, apiStyle, events)` / `makeSource(moduleName, className, headerBaseName, methods, apiStyle, events)` — single entry points that branch on `apiStyle` internally to emit the right include block, signature shape, and conversion bridges. `events` is loaded from a `<name>.lidl` sidecar via `--events-from`; when non-empty, the wrapper also gets one typed `on<EventName>(callback)` adapter per declared event (callback arg types follow `apiStyle`). The std-style wrapper grows the necessary `ensureReplica()` plumbing on demand.
+- `enum class ApiStyle { Qt, Lp }` — passed to every wrapper-emitting function.
+- File-local `mapParamTypeStd` / `mapReturnTypeStd` — the std-side type-mapping table the `lp` surface exposes. Hidden from `generator_lib.h` (not part of the public surface).
+- `makeHeader(moduleName, className, methods, apiStyle, events)` / `makeSource(moduleName, className, headerBaseName, methods, apiStyle, events)` — single entry points that branch on `apiStyle` internally to emit the right include block, signature shape, and conversion bridges. `events` is loaded from a `<name>.lidl` sidecar via `--events-from`; when non-empty, the wrapper also gets one typed `on<EventName>(callback)` adapter per declared event (callback arg types follow `apiStyle`).
 
 Flag plumbing:
 
-1. `metadata.json#interface == "universal"` → `mkLogosModule.nix` adds `-DLOGOS_API_STYLE=std` to `extraCmakeFlags`. Anything else (`"legacy"`, `"provider"`, absent) leaves the default `qt`.
-2. `LogosModule.cmake` reads `${LOGOS_API_STYLE}` (default `qt`) and forwards `--api-style=${LOGOS_API_STYLE}` to the `logos-cpp-generator --general-only` invocation that writes the umbrella. Each module's Nix build emits **two** header derivations (`<name>.headers-qt` and `<name>.headers-std`) via `buildHeaders.nix` — one `logos-cpp-generator --api-style=…` run per style, at the dep's build time. A consumer's `buildPlugin.nix` picks `dep.headers-${apiStyle}` and copies its `include/` straight into the build sandbox; no codegen runs at consume time. Nix's laziness means only the variant a downstream actually depends on is realised.
-3. `legacy/main.cpp` parses `--api-style` once and threads the resulting `ApiStyle` through `generateFromPlugin`, `writeUmbrellaHeader{,FromDeps}`. No `_api_std.{h,cpp}` files are ever emitted; each module gets a single `<name>_api.h` + `<name>_api.cpp` pair regardless of style.
+1. `metadata.json#interface == "universal"` (or `"cdylib"`) → `mkLogosModule.nix` adds `-DLOGOS_API_STYLE=lp` to `extraCmakeFlags`. Anything else (`"legacy"`, `"provider"`, absent) leaves the default `qt`.
+2. `LogosModule.cmake` reads `${LOGOS_API_STYLE}` (default `qt`) and forwards `--api-style=${LOGOS_API_STYLE}` to the `logos-cpp-generator --general-only` invocation that writes the umbrella. Each module's Nix build emits **two** header derivations (`<name>.headers-qt` and `<name>.headers-lp`) via `buildHeaders.nix` — one `logos-cpp-generator --api-style=…` run per style, at the dep's build time. A consumer's `buildPlugin.nix` picks `dep.headers-${apiStyle}` and copies its `include/` straight into the build sandbox; no codegen runs at consume time. Nix's laziness means only the variant a downstream actually depends on is realised.
+3. `legacy/main.cpp` parses `--api-style` once (rejecting the retired `std`) and threads the resulting `ApiStyle` through `generateFromPlugin`, `writeUmbrellaHeader{,FromDeps}`. No per-style filenames are ever emitted; each module gets a single `<name>_api.h` + `<name>_api.cpp` pair regardless of style.
 
 ### Provider Generation (logos-qt-generator)
 
@@ -191,7 +193,7 @@ The `--events-from <path>` flag points the legacy `<plugin>.dylib --module-only`
 
 ```bash
 logos-cpp-generator /path/to/plugin.dylib \
-    --module-only --api-style std \
+    --module-only --api-style lp \
     --events-from /path/to/dep/share/logos/my_module.lidl \
     --output-dir ./generated
 ```

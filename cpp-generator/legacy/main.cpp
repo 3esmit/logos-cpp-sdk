@@ -389,7 +389,7 @@ static bool writeUmbrellaHeader(const QString& genDirPath, QTextStream& err)
 {
     // Generate logos_sdk.h: include every per-module wrapper header in
     // the gen dir and aggregate them into a flat `LogosModules` struct.
-    // The wrappers may be Qt-typed or Std-typed depending on the
+    // The wrappers may be Qt-typed or std-typed (lp) depending on the
     // --api-style picked for this build; the umbrella shape doesn't
     // change because either flavor produces the same accessor name
     // (`<dep>`) on the same class name (`<Dep>`).
@@ -880,8 +880,9 @@ static int generateFromPlugin(const QString& pluginInputPath, const QString& out
 
     // Single per-module wrapper file pair. apiStyle decides the
     // signature shape: Qt-typed for legacy / handcrafted callers
-    // (default), std-typed when the consuming module's build passed
-    // --api-style=std (typically because it's `interface: "universal"`).
+    // (default), std-typed and Qt-free when the consuming module's build
+    // passed --api-style=lp (typically because it's `interface:
+    // "universal"` or `"cdylib"`).
     // Both produce the same filename and class name, so the umbrella
     // doesn't need to know which style was picked. `events` (loaded
     // from a sibling `.lidl` sidecar via --events-from) adds typed
@@ -955,14 +956,19 @@ int legacy_main(int argc, char* argv[])
     // Parse --general-only option
     bool generalOnly = args.contains("--general-only");
 
-    // Parse --api-style option (qt | std). Picks which type surface
+    // Parse --api-style option (qt | lp). Picks which type surface
     // the generated `<Module>` wrapper exposes. Default is qt for
     // backward compatibility — every existing module that doesn't
     // declare `interface: "universal"` in its metadata.json keeps
-    // its Qt-typed LogosModules surface. Universal modules get
-    // -DLOGOS_API_STYLE=std threaded through by mkLogosModule.nix /
-    // LogosModule.cmake, which becomes `--api-style=std` here.
-    // Both forms accepted: `--api-style std` and `--api-style=std`.
+    // its Qt-typed LogosModules surface. Universal / cdylib modules get
+    // -DLOGOS_API_STYLE=lp threaded through by mkLogosModule.nix /
+    // LogosModule.cmake, which becomes `--api-style=lp` here.
+    // Both forms accepted: `--api-style lp` and `--api-style=lp`.
+    //
+    // `std` was a third surface (std types over a QVariant/LogosAPIClient
+    // body). It is retired, and rejected LOUDLY rather than aliased to qt:
+    // a stale caller that still passes it wants std signatures, and silently
+    // handing it the Qt surface would only fail later, further from the cause.
     ApiStyle apiStyle = ApiStyle::Qt;
     {
         QString apiVal;
@@ -977,11 +983,17 @@ int legacy_main(int argc, char* argv[])
                 break;
             }
         }
-        if (apiVal == "std") apiStyle = ApiStyle::Std;
+        if (apiVal == "std") {
+            err << "--api-style=std was retired: the Std surface (std types over a "
+                << "QVariant/LogosAPIClient body) no longer exists.\n"
+                << "Use 'lp' for the Qt-free std-typed surface, or 'qt' for the "
+                << "Qt-typed one.\n";
+            return 1;
+        }
         else if (apiVal == "lp") apiStyle = ApiStyle::Lp;
         else if (!apiVal.isEmpty() && apiVal != "qt") {
             err << "Unknown --api-style value: " << apiVal
-                << " (expected 'qt', 'std', or 'lp')\n";
+                << " (expected 'qt' or 'lp')\n";
             return 1;
         }
     }

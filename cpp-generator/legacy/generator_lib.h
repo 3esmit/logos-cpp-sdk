@@ -17,18 +17,21 @@ struct ParsedMethod {
 // Which type surface to expose on the generated per-module wrapper.
 // Each module's build picks ONE — there's no composite output. Default
 // is Qt for backward compatibility; `interface: "universal"` modules
-// flip to Std via the -DLOGOS_API_STYLE=std CMake flag the module
-// builder threads through.
+// flip to Lp via the -DLOGOS_API_STYLE=lp CMake flag the module builder
+// threads through.
 // Qt — legacy Qt-typed surface (QString/QVariant…), body via LogosAPIClient.
-// Std — std-typed surface, but the body still bridges through QVariant +
-//       LogosAPIClient (so the wrapper .cpp links qt-sdk).
 // Lp  — std-typed surface AND a Qt-free body: the wrapper calls the
 //       logos-protocol C ABI (lp_*) directly via logos::LpClient, so the
 //       module's translation units never include Qt or link qt-sdk. This is
 //       the path that lets a cdylib module do outbound typed calls/event
 //       subscriptions while staying Qt-free (Qt confined to the QRO transport
 //       inside logos-protocol + the generated plugin glue).
-enum class ApiStyle { Qt, Std, Lp };
+//
+// A third flavour, Std, used to sit between the two: the std-typed surface
+// with a body that still bridged through QVariant + LogosAPIClient. Nothing
+// selected it any more (universal modules go straight to Lp), so it was
+// retired; `--api-style=std` is now a hard error rather than a silent alias.
+enum class ApiStyle { Qt, Lp };
 
 // Whether the generated wrapper targets ONE fixed module (the historical
 // behaviour) or binds to a module name chosen at runtime.
@@ -57,14 +60,12 @@ QString toProviderArgDecode(const QString& type, const QString& argExpr,
                             const QString& path);
 
 // makeHeader / makeSource emit the single `<Class>` wrapper for a
-// module. When `apiStyle == Std`, parameter / return types come from
-// the std-typed mapping table (std::string / std::vector<std::string>
-// / LogosMap / LogosList / int64_t / StdLogosResult) and the .cpp
-// body wraps the QVariant wire with inline Qt↔std conversions —
-// callers never include Qt headers. When `apiStyle == Qt`, the output
-// matches the legacy Qt-typed surface (QString / QStringList /
-// QVariantList / QVariantMap / int / LogosResult). The class name is
-// always `<Module>` either way; the two styles are mutually exclusive.
+// module. When `apiStyle == Qt`, the output is the legacy Qt-typed
+// surface (QString / QStringList / QVariantList / QVariantMap / int /
+// LogosResult) with a body that calls LogosAPIClient. When
+// `apiStyle == Lp`, they delegate to makeHeaderLp / makeSourceLp below,
+// which emit the std-typed, Qt-free surface. The class name is always
+// `<Module>` either way; the two styles are mutually exclusive.
 //
 // `events` carries typed event prototypes loaded from a `.lidl`
 // sidecar via --events-from. Each entry is
@@ -92,8 +93,9 @@ QString toProviderArgDecode(const QString& type, const QString& argExpr,
 QString makeHeader(const QString& moduleName, const QString& className, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle = ApiStyle::Qt, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 
-// Qt-free (ApiStyle::Lp) wrapper emission. Same std-typed surface as the Std
-// flavor, but the generated body calls the logos-protocol C ABI through
+// Qt-free (ApiStyle::Lp) wrapper emission. A std-typed surface
+// (std::string / std::vector<std::string> / LogosMap / LogosList / int64_t /
+// StdLogosResult) whose generated body calls the logos-protocol C ABI through
 // logos::LpClient instead of LogosAPIClient — no Qt in the wrapper's TU.
 // makeHeader/makeSource dispatch here when apiStyle == ApiStyle::Lp.
 QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});

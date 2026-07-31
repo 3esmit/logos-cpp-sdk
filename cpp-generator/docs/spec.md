@@ -321,7 +321,9 @@ Generated from LIDL (not from `--from-header`). Each module gets **one** `<Modul
 | `--api-style` | Wrapper signatures |
 |---|---|
 | `qt` (default) | QString / QStringList / QVariantList / QVariantMap / int / LogosResult |
-| `std` | std::string / std::vector<std::string> / LogosMap / LogosList / int64_t / StdLogosResult |
+| `lp` | std::string / std::vector<std::string> / LogosMap / LogosList / int64_t / StdLogosResult, over the Qt-free logos-protocol C ABI |
+
+(`std` — the same signatures over a `QVariant` / `LogosAPIClient` body — was retired; `--api-style=std` is now an error.)
 
 Both styles provide:
 

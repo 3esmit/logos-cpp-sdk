@@ -222,7 +222,7 @@ public:
     LogosMap doWork(const std::string& input) {
         // Cross-module call through the flat LogosModules aggregator.
         // Because this module is `interface: "universal"`, mkLogosModule.nix
-        // passed -DLOGOS_API_STYLE=std to the codegen, so every <Dep>
+        // passed -DLOGOS_API_STYLE=lp to the codegen, so every <Dep>
         // wrapper takes/returns std types — no Qt at the call site.
         std::string reply = modules().some_dep.echo(input);
         // ...
@@ -290,13 +290,18 @@ Each module's build picks **one** API style for the generated `<Module>` client 
 
 | `metadata.json#interface` | `LOGOS_API_STYLE` | Wrapper signatures |
 |---|---|---|
-| `"universal"` | `std` | `std::string`, `std::vector<std::string>`, `LogosMap`, `LogosList`, `int64_t`, `StdLogosResult` |
+| `"universal"` / `"cdylib"` | `lp` | `std::string`, `std::vector<std::string>`, `LogosMap`, `LogosList`, `int64_t`, `StdLogosResult` |
 | `"legacy"` / `"provider"` / absent | `qt` (default) | `QString`, `QStringList`, `QVariantList`, `QVariantMap`, `int`, `LogosResult` |
 
-`mkLogosModule.nix` reads `interface` and threads `-DLOGOS_API_STYLE=std` through to the codegen for universal modules; everyone else defaults to Qt and stays bit-for-bit backward compatible. Inside the universal module's `.cpp`, the call site is:
+A third value, `std`, used to name a std-typed surface whose body still went
+through `QVariant` + `LogosAPIClient`. It was retired once universal modules
+moved to `lp`; `--api-style=std` is now rejected outright rather than aliased,
+so a stale build fails loudly instead of silently getting Qt signatures.
+
+`mkLogosModule.nix` reads `interface` and threads `-DLOGOS_API_STYLE=lp` through to the codegen for universal modules; everyone else defaults to Qt and stays bit-for-bit backward compatible. Inside the universal module's `.cpp`, the call site is:
 
 ```cpp
-// Universal module (api-style=std):
+// Universal module (api-style=lp):
 std::string reply = modules().some_dep.echo("hi");
 ```
 
@@ -307,7 +312,7 @@ std::string reply = modules().some_dep.echo("hi");
 QString reply = modules().some_dep.echo(QString("hi"));
 ```
 
-The wire is identical (`QVariant` under the hood); for std mode the Qt↔std conversion is inlined in the generated wrapper's `.cpp`, so the calling translation unit needs zero Qt headers.
+The two carry the same values; the `lp` wrapper marshals them over the logos-protocol C ABI (`lp_*`) instead of `QVariant`, so the calling translation unit needs zero Qt headers and links no qt-sdk.
 
 > **Migrating to std types**: The choice is driven entirely by `interface`. A handcrafted module that wants std types should switch to `interface: "universal"` — there's no per-flag override on `metadata.json`.
 
