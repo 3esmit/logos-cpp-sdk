@@ -227,3 +227,53 @@ TEST(LidlToPascalCase, LeadingUnderscore)
 {
     EXPECT_EQ(lidlToPascalCase("_test"), "Test");
 }
+
+// ---------------------------------------------------------------------------
+// Optionality
+//
+// `?T` is TWO-state: a value of T, or empty. The two surfaces answer it
+// differently because only one of them HAS an optional type — the std surface
+// keeps T inside std::optional, the Qt surface loses it, because Qt has no
+// optional metatype and an invalid QVariant is its single empty inhabitant.
+// ---------------------------------------------------------------------------
+
+static TypeExpr opt(const TypeExpr& inner)
+{
+    return { TypeExpr::Optional, "", { inner } };
+}
+
+TEST(LidlTypeToStd, OptionalKeepsTheValueType)
+{
+    EXPECT_EQ(lidlTypeToStd(opt({ TypeExpr::Primitive, "tstr", {} })),
+              "std::optional<std::string>");
+    EXPECT_EQ(lidlTypeToStd(opt({ TypeExpr::Primitive, "uint", {} })),
+              "std::optional<uint64_t>");
+    EXPECT_EQ(lidlTypeToStd(opt({ TypeExpr::Primitive, "bstr", {} })),
+              "std::optional<std::vector<uint8_t>>");
+}
+
+// Two-state, so optionality is idempotent: `??T` denotes the same two states as
+// `?T` and must not become std::optional<std::optional<T>> — that would be a
+// third state on the C++ side with nowhere to put it on the wire.
+TEST(LidlTypeToStd, NestedOptionalCollapses)
+{
+    const TypeExpr t = opt(opt({ TypeExpr::Primitive, "tstr", {} }));
+    EXPECT_EQ(lidlTypeToStd(t), "std::optional<std::string>");
+}
+
+// A degenerate Optional carrying no element is unreachable from the parser but
+// constructible by hand and over the JSON bridge. It must not recurse forever.
+TEST(LidlTypeToStd, DegenerateOptionalTerminates)
+{
+    EXPECT_EQ(lidlTypeToStd(TypeExpr{ TypeExpr::Optional, "", {} }), "QVariant");
+}
+
+TEST(LidlTypeToQt, OptionalIsUntypedQVariant)
+{
+    // Deliberate, and the one mapping in the Qt table that loses the value
+    // type: there is no metatype for an optional, and this name is read by the
+    // host to marshal a QVariant across the plugin boundary. Two-state survives
+    // (an invalid QVariant is the empty inhabitant); T does not.
+    EXPECT_EQ(lidlTypeToQt(opt({ TypeExpr::Primitive, "tstr", {} })), "QVariant");
+    EXPECT_EQ(lidlTypeToQt(opt({ TypeExpr::Named, "Blob", {} })), "QVariant");
+}

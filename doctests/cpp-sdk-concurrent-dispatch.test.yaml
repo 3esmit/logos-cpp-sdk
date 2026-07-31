@@ -190,13 +190,14 @@ sections:
           The `{release}` overrides point the builder's C++ SDK, Qt glue, and
           protocol at the commits under test, so the concurrent-dispatch codegen +
           runtime are the ones exercised:
-        run: "sh -c 'cd slow-worker && printf \"result\\nresult-*\\n\" > .gitignore && git init -q && git add -A && nix flake update && git add flake.lock && nix build .#lgx -o worker-lgx --override-input logos-module-builder \"github:logos-co/logos-module-builder{release}\" --override-input logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\"'"
+        run: "sh -c 'cd slow-worker && printf \"result\\nresult-*\\n\" > .gitignore && git init -q && git add -A && nix flake update && git add flake.lock && nix build .#lgx -o worker-lgx --override-input logos-module-builder \"github:logos-co/logos-module-builder{release}\" --override-input logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk/logos-lidl \"github:logos-co/logos-lidl\" --override-input logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\"'"
         code_block: |
           cd slow-worker
           git init && git add -A && nix flake update && git add flake.lock
           nix build .#lgx -o worker-lgx \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
             --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol'
         check_file: "slow-worker/worker-lgx"
 
@@ -324,7 +325,7 @@ sections:
                 };
             }
       - title: "Build it"
-        run: "sh -c 'cd fanout-driver && printf \"result\\nresult-*\\n\" > .gitignore && git init -q && git add -A && nix flake update --override-input slow_worker_module path:$PWD/../slow-worker && git add flake.lock && nix build .#lgx -o driver-lgx --override-input slow_worker_module path:$PWD/../slow-worker --override-input logos-module-builder \"github:logos-co/logos-module-builder{release}\" --override-input logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\" --override-input slow_worker_module/logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input slow_worker_module/logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input slow_worker_module/logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\"'"
+        run: "sh -c 'cd fanout-driver && printf \"result\\nresult-*\\n\" > .gitignore && git init -q && git add -A && nix flake update --override-input slow_worker_module path:$PWD/../slow-worker && git add flake.lock && nix build .#lgx -o driver-lgx --override-input slow_worker_module path:$PWD/../slow-worker --override-input logos-module-builder \"github:logos-co/logos-module-builder{release}\" --override-input logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input logos-module-builder/logos-qt-sdk/logos-lidl \"github:logos-co/logos-lidl\" --override-input logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\" --override-input slow_worker_module/logos-module-builder/logos-cpp-sdk \"github:logos-co/logos-cpp-sdk{release}\" --override-input slow_worker_module/logos-module-builder/logos-qt-sdk \"github:logos-co/logos-qt-sdk{release}\" --override-input slow_worker_module/logos-module-builder/logos-qt-sdk/logos-lidl \"github:logos-co/logos-lidl\" --override-input slow_worker_module/logos-module-builder/logos-protocol \"github:logos-co/logos-protocol{release}\"'"
         code_block: |
           cd fanout-driver
           git init && git add -A
@@ -334,8 +335,10 @@ sections:
             --override-input slow_worker_module path:$PWD/../slow-worker \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
             --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol' \
-            --override-input slow_worker_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
+            --override-input slow_worker_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input slow_worker_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl'
         check_file: "fanout-driver/driver-lgx"
 
   - title: "Run it: the single driver overlaps the multi worker"

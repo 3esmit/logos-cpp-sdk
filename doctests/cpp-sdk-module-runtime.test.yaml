@@ -13,11 +13,13 @@ intro: |
 
   1. Build the `logoscore` CLI, **overriding `logos-cpp-sdk` with the commit
      under test** — and overriding it in the same way for every consumer in
-     `logoscore`'s closure (`logos-liblogos`, `logos-module-client`, and the
-     `capability_module`'s `logos-module-builder`). Because the published flakes
-     pin the SDK independently (there is no single `follows` unifying them), all
-     of these must point at the same commit so the whole runtime is built and
-     linked against one consistent SDK ABI.
+     `logoscore`'s closure (`logos-liblogos` and the `capability_module`'s
+     `logos-module-builder`). Because the published flakes pin the SDK
+     independently (there is no single `follows` unifying them), all of these
+     must point at the same commit so the whole runtime is built and linked
+     against one consistent SDK ABI. Each `logos-qt-sdk` dragged onto the new
+     SDK also gets its sibling `logos-lidl` moved with it — see the note in
+     the first section.
   2. Build the `lgpm` local package manager.
   3. Build the real [`accounts_module`](https://github.com/logos-co/logos-accounts-module)
      as an `.lgx` package straight from its own flake — **also built against the
@@ -62,31 +64,46 @@ sections:
       every consumer that pins the SDK in `logoscore`'s closure. The result is
       symlinked to `./logos/`.
 
-      > Unlike a leaf input, the SDK is pinned independently by `logos-liblogos`,
-      > `logos-module-client`, and the `capability_module`'s `logos-module-builder`
-      > — there is no single `follows` tying them together in the published
-      > flakes. So we override it at each of those paths (e.g.
+      > Unlike a leaf input, the SDK is pinned independently by `logos-liblogos`
+      > and the `capability_module`'s `logos-module-builder` — there is no single
+      > `follows` tying them together in the published flakes. So we override it
+      > at each of those paths (e.g.
       > `--override-input logos-liblogos/logos-cpp-sdk …`) to keep the whole
       > runtime on one consistent SDK ABI. Each override URL carries a `{release}`
       > placeholder the doc-test runner expands to a concrete ref: locally that is
       > this checkout's `HEAD` (see `run.sh`); in CI it is the commit being
       > tested. With no pin it falls back to latest `master`.
+
+      > **Why the `logos-qt-sdk/logos-lidl` overrides.** This SDK installs
+      > `share/lidl-frontend/lidl_compat.h`, and `logos-qt-sdk`'s
+      > `logos-qt-generator` *compiles* that header against **its own**
+      > `logos-lidl` input. `logos-lidl` is a **sibling** of `logos-cpp-sdk`
+      > under `logos-qt-sdk`, not a descendant, so overriding the SDK moves the
+      > header forward while qt-sdk keeps its older lidl — and the generator
+      > fails to compile the shim. Each `logos-qt-sdk` node that ends up on the
+      > SDK under test therefore needs its `logos-lidl` moved with it.
     steps:
       - title: "Build the CLI with the SDK override"
         run: |
           nix build 'github:logos-co/logos-logoscore-cli{release}' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
-            --override-input logos-module-client/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
-            --override-input logos-module-client/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         check_file: "logos/bin/logoscore"
         post_text: |
@@ -140,12 +157,14 @@ sections:
           nix build 'path:./logos-accounts-module#lgx' \
             --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o accounts-lgx
         code_block: |
           # From inside the clone this is simply:
           #   nix build '.#lgx' --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
           nix build 'path:./logos-accounts-module#lgx' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o accounts-lgx
         post_text: "The `.lgx` package is now under `./accounts-lgx/`:"
         extra_run:

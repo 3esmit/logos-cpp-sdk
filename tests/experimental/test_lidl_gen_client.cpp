@@ -380,3 +380,106 @@ TEST(LidlGenClient, RecordsBecomeStructsWithConversions)
     EXPECT_TRUE(h.contains("QList<Status> makeStatuses(")) << h.toStdString();
 }
 
+
+// ---------------------------------------------------------------------------
+// Optionality
+//
+// This backend is not on any live build path (real Qt consumers come from the
+// legacy interface-wrapper path), so the bar here is CONSISTENCY, not features:
+// the two spellings of an optional field must not generate different structs
+// from the same declaration.
+// ---------------------------------------------------------------------------
+
+static ModuleDecl makeOptionalRecordModule(bool useFlagSpelling)
+{
+    ModuleDecl m;
+    m.name = "opt_module";
+    m.version = "1.0.0";
+
+    TypeDecl t;
+    t.name = "Profile";
+    {
+        FieldDecl f; f.name = "required"; f.type = { TypeExpr::Primitive, "tstr", {} };
+        t.fields.push_back(f);
+    }
+    {
+        FieldDecl f;
+        f.name = "nickname";
+        if (useFlagSpelling) {                       // `? nickname: tstr`
+            f.type = { TypeExpr::Primitive, "tstr", {} };
+            f.optional = true;
+        } else {                                     // `nickname: ?tstr`
+            f.type = { TypeExpr::Optional, "", { { TypeExpr::Primitive, "tstr", {} } } };
+        }
+        t.fields.push_back(f);
+    }
+    m.types.push_back(t);
+
+    MethodDecl md;
+    md.name = "echoProfile";
+    md.returnType = { TypeExpr::Named, "Profile", {} };
+    ParamDecl p; p.name = "v"; p.type = { TypeExpr::Named, "Profile", {} };
+    md.params.push_back(p);
+    m.methods.push_back(md);
+    return m;
+}
+
+TEST(LidlGenClient, BothOptionalSpellingsEmitIdenticalCode)
+{
+    const QString flagged = lidlMakeHeader(makeOptionalRecordModule(true), BindMode::Bound);
+    const QString typed   = lidlMakeHeader(makeOptionalRecordModule(false), BindMode::Bound);
+    // Reading `f.type` alone made the flag spelling emit a bare `QString` — a
+    // type with no empty inhabitant at all — from the same declaration that the
+    // type spelling turned into a QVariant.
+    EXPECT_EQ(flagged, typed) << flagged.toStdString() << "\n---\n" << typed.toStdString();
+}
+
+TEST(LidlGenClient, OptionalRecordFieldIsTwoStateQVariant)
+{
+    const QString h = lidlMakeHeader(makeOptionalRecordModule(true), BindMode::Bound);
+
+    // QVariant, because Qt has no optional and an invalid QVariant is its one
+    // empty inhabitant.
+    EXPECT_TRUE(h.contains("QVariant nickname{};")) << h.toStdString();
+    EXPECT_TRUE(h.contains("QString required{};")) << h.toStdString();
+    // A record field is a NAMED slot: empty omits the key rather than writing an
+    // invalid QVariant into the map.
+    EXPECT_TRUE(h.contains("if (v.nickname.isValid())")) << h.toStdString();
+    // Absent and null both arrive as an invalid QVariant. Converting (the
+    // `.toString()` a required tstr field gets) would have turned "empty" into
+    // "", which is a VALUE.
+    EXPECT_TRUE(h.contains("__out.nickname = __m.value(\"nickname\");")) << h.toStdString();
+    EXPECT_FALSE(h.contains("__out.nickname = __m.value(\"nickname\").toString();"))
+        << h.toStdString();
+}
+
+// The `_bytes` collision check must read through an optional too. A PRESENT
+// `? _bytes: tstr` still encodes to {"_bytes": "..."} — the shape that decodes
+// as a byte string and loses the record — so both spellings have to be refused.
+// Reading `f.type` refused only the flag one.
+TEST(LidlGenClient, BytesTagCollisionIsRefusedThroughAnOptional)
+{
+    auto sneaky = [](bool useFlagSpelling) {
+        ModuleDecl m;
+        m.name = "sneaky_module";
+        TypeDecl t;
+        t.name = "Sneaky";
+        FieldDecl f;
+        f.name = "_bytes";
+        if (useFlagSpelling) {
+            f.type = { TypeExpr::Primitive, "tstr", {} };
+            f.optional = true;
+        } else {
+            f.type = { TypeExpr::Optional, "", { { TypeExpr::Primitive, "tstr", {} } } };
+        }
+        t.fields.push_back(f);
+        m.types.push_back(t);
+        return m;
+    };
+
+    for (bool flag : {true, false}) {
+        QString error;
+        EXPECT_FALSE(lidlCheckRecords(sneaky(flag), &error)) << "flagSpelling=" << flag;
+        EXPECT_TRUE(error.contains("Sneaky")) << error.toStdString();
+    }
+}

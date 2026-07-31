@@ -335,3 +335,222 @@ TEST(LidlGenCdylib, SupportedEventParamsRemainEligible)
     QString error;
     EXPECT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
 }
+
+// ---------------------------------------------------------------------------
+// Optionality — `?T` on the Qt-free cdylib surface.
+//
+// Two-state (a value of T, or empty), std::optional<T>, and the wire rule that
+// depends on the SLOT: empty omits the key where the slot is named (a record
+// field) and is spelled null where it is positional (an argument, a return, an
+// event parameter — those have no key to omit and their arity must not change).
+// ---------------------------------------------------------------------------
+
+TypeExpr opt(const TypeExpr& inner)
+{
+    return {TypeExpr::Optional, "", {inner}};
+}
+
+FieldDecl field(const char* name, const TypeExpr& type)
+{
+    FieldDecl f;
+    f.name = name;
+    f.type = type;
+    return f;
+}
+
+// `?T` used to be a HARD REJECT — "module not cdylib-eligible" — so nothing
+// downstream could even be reached. The gate opens exactly as far as the value
+// type allows.
+TEST(LidlGenCdylib, OptionalIsEligibleWhenItsValueTypeIs)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("echoOptional", opt(prim("tstr")),
+                               {param("v", opt(prim("tstr")))}));
+    m.methods.push_back(method("nested", opt(TypeExpr{TypeExpr::Array, "", {prim("bstr")}}),
+                               {param("v", TypeExpr{TypeExpr::Array, "", {opt(prim("int"))}})}));
+
+    QString error;
+    EXPECT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+}
+
+// `result` and `void` are return-only spellings, and neither can be optional:
+// void is the absence of a value, and result already carries its own
+// success/error discriminant. The value type is checked as a non-return
+// position, which is what makes both fall out.
+TEST(LidlGenCdylib, OptionalResultAndVoidAreRejected)
+{
+    for (const char* n : {"result", "void"}) {
+        ModuleDecl m;
+        m.name = "o_module";
+        m.methods.push_back(method("bad", opt(prim(n)), {}));
+        QString error;
+        EXPECT_FALSE(lidlCdylibSupported(m, &error)) << n;
+        EXPECT_TRUE(error.contains("bad")) << error.toStdString();
+    }
+}
+
+// R3. `? name: T` (the field flag) and `name: ?T` (the type kind) are the same
+// declaration and MUST emit byte-identical code. Nothing enforced that before —
+// a backend reading only one of the two would have silently disagreed with the
+// next one to try.
+TEST(LidlGenCdylib, BothOptionalSpellingsEmitIdenticalCode)
+{
+    auto moduleWithField = [](const FieldDecl& f) {
+        ModuleDecl m;
+        m.name = "o_module";
+        TypeDecl t;
+        t.name = "Opt";
+        t.fields = {f};
+        m.types.push_back(t);
+        return m;
+    };
+
+    FieldDecl flagged = field("maybe", prim("tstr"));
+    flagged.optional = true;                       // `? maybe: tstr`
+    const FieldDecl typed = field("maybe", opt(prim("tstr")));  // `maybe: ?tstr`
+
+    const QString a = lidlMakeTypesHeaderCdylib(moduleWithField(flagged));
+    const QString b = lidlMakeTypesHeaderCdylib(moduleWithField(typed));
+    EXPECT_EQ(a, b) << a.toStdString() << "\n---\n" << b.toStdString();
+    EXPECT_TRUE(a.contains("std::optional<std::string>")) << a.toStdString();
+}
+
+// R2, named slot: empty OMITS the key. Writing null instead would be the
+// positional spelling in a slot that has a name — and Codec<std::optional<T>>
+// cannot do this itself, because a codec only ever sees a value, never the slot.
+TEST(LidlGenCdylib, OptionalRecordFieldOmitsTheKeyWhenEmpty)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    TypeDecl t;
+    t.name = "Opt";
+    t.fields = {field("required", prim("tstr")), field("maybe", opt(prim("tstr")))};
+    m.types.push_back(t);
+
+    const QString types = lidlMakeTypesHeaderCdylib(m);
+    EXPECT_TRUE(types.contains("if (v.maybe.has_value())")) << types.toStdString();
+    EXPECT_TRUE(types.contains("out[\"maybe\"] = Codec<std::string>::to(*v.maybe);"))
+        << types.toStdString();
+    // Decode needs no optional branch: an absent key is ALREADY materialised as
+    // null right there, so absent and explicit null reach the codec
+    // indistinguishable — nullopt in an optional field, still an error in a
+    // required one.
+    EXPECT_TRUE(types.contains("out.maybe = Codec<std::optional<std::string>>::from("))
+        << types.toStdString();
+    EXPECT_TRUE(types.contains("j.contains(\"maybe\") ? j.at(\"maybe\") : nlohmann::json()"))
+        << types.toStdString();
+    // The required field is untouched by any of this.
+    EXPECT_TRUE(types.contains("out[\"required\"] = Codec<std::string>::to(v.required);"))
+        << types.toStdString();
+    EXPECT_TRUE(types.contains("#include <optional>")) << types.toStdString();
+}
+
+// A contract with no optional keeps its generated output byte-for-byte, down to
+// the include list — every cpp-sdk change rebuilds the whole module graph, so a
+// gratuitous diff here is a rebuild of everything.
+TEST(LidlGenCdylib, NoOptionalMeansNoOptionalInclude)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    TypeDecl t;
+    t.name = "Plain";
+    t.fields = {field("id", prim("tstr"))};
+    m.types.push_back(t);
+
+    EXPECT_FALSE(lidlMakeTypesHeaderCdylib(m).contains("#include <optional>"));
+}
+
+// R2, positional slot: arity never changes on the way OUT, but absent and null
+// are the same state coming IN — so the gate admits a missing trailing optional
+// and materialises it as null, exactly the way a missing record field already is.
+TEST(LidlGenCdylib, OptionalArgumentMayBeAbsentOrNull)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("f", prim("tstr"),
+                               {param("required", prim("tstr")),
+                                param("maybe", opt(prim("tstr")))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("if (args.size() < 1) return nullptr;")) << src.toStdString();
+    EXPECT_TRUE(src.contains("(args.size() > 1 ? args.at(1) : nlohmann::json())"))
+        << src.toStdString();
+    EXPECT_TRUE(src.contains("logos::fromJson<std::optional<std::string>>"))
+        << src.toStdString();
+    // The REQUIRED argument keeps the hard gate and the plain accessor.
+    EXPECT_TRUE(src.contains("logos::fromJson<std::string>(args.at(0), \"arg0\")"))
+        << src.toStdString();
+}
+
+// ...and a method with no optional parameter emits the gate it always did.
+TEST(LidlGenCdylib, RequiredOnlyArityGateIsUnchanged)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("f", prim("tstr"),
+                               {param("a", prim("tstr")), param("b", prim("tstr"))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("if (args.size() < 2) return nullptr;")) << src.toStdString();
+    EXPECT_FALSE(src.contains("args.size() > ")) << src.toStdString();
+}
+
+// R4. Optional widens the accepted domain by exactly ONE inhabitant (empty); a
+// present value is still decoded as T. For `bstr` that has to be the LENIENT
+// decode a bare `bstr` argument gets, or the identical value would be accepted
+// in a required slot and rejected in an optional one.
+TEST(LidlGenCdylib, OptionalBytesArgumentKeepsTheLenientDecode)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("f", prim("bool"), {param("v", opt(prim("bstr")))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("logos::bytesFromJsonLenient")) << src.toStdString();
+    EXPECT_TRUE(src.contains(".is_null() ? std::optional<std::vector<uint8_t>>()"))
+        << src.toStdString();
+}
+
+// `?any` collapses onto `any`. nlohmann::json already HAS null among its
+// inhabitants, so std::optional<LogosMap> would give the slot two spellings of
+// empty — three-state, which is the one thing `?T` may never be.
+TEST(LidlGenCdylib, OptionalAnyCollapsesOntoAny)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    TypeDecl t;
+    t.name = "Loose";
+    t.fields = {field("blob", opt(prim("any")))};
+    m.types.push_back(t);
+    m.methods.push_back(method("f", prim("bool"), {param("v", opt(prim("any")))}));
+
+    QString error;
+    ASSERT_TRUE(lidlCdylibSupported(m, &error)) << error.toStdString();
+
+    const QString types = lidlMakeTypesHeaderCdylib(m);
+    EXPECT_TRUE(types.contains("Codec<LogosMap>::to(v.blob)")) << types.toStdString();
+    EXPECT_FALSE(types.contains("std::optional<LogosMap>")) << types.toStdString();
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_FALSE(src.contains("std::optional<LogosMap>")) << src.toStdString();
+}
+
+// An event parameter is a POSITIONAL slot: empty is null, and the argument list
+// keeps its length. It is also taken by const reference, like every other
+// non-scalar, so the generated definition matches the author's declaration in
+// the `logos_events:` block.
+TEST(LidlGenCdylib, OptionalEventParamIsConstRefAndNullWhenEmpty)
+{
+    const ModuleDecl m = moduleWithEvent("changed", {
+        param("name",     prim("tstr")),
+        param("instance", opt(prim("tstr"))),
+    });
+
+    const QString src = eventsSourceFor(m);
+    EXPECT_TRUE(src.contains("const std::optional<std::string>& instance"))
+        << src.toStdString();
+    EXPECT_TRUE(src.contains("args.push_back(logos::toJson<std::optional<std::string>>(instance));"))
+        << src.toStdString();
+    EXPECT_TRUE(src.contains("#include <optional>")) << src.toStdString();
+}

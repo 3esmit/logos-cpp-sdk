@@ -1,0 +1,10 @@
+{
+    "name": "optional_module",
+    "version": "1.0.0",
+    "description": "Header-first optionality: std::optional<T> <-> ?T",
+    "author": "Test",
+    "type": "core",
+    "category": "testing",
+    "main": "optional_module_plugin",
+    "dependencies": []
+}

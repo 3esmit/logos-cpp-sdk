@@ -28,6 +28,23 @@ using lidl::EventDecl;
 using lidl::TypeDecl;
 using lidl::ModuleDecl;
 
+// Optionality accessors, from the SAME header — never re-derived here.
+//
+// `?T` has two equivalent spellings for a record field: the flag (`? name: T`,
+// which leaves `FieldDecl::type` as T and sets `FieldDecl::optional`) and the
+// type kind (`name: ?T`, which leaves the flag false and makes the type an
+// Optional). logos-lidl's docs/spec.md binds them to the same meaning, so they
+// MUST emit identical code — and the only way that holds is if no backend
+// answers the question itself. Reading `f.optional` alone is a bug; reading
+// `f.type.kind == Optional` alone is the same bug from the other side.
+// fieldIsOptional() / fieldValueType() are the answer.
+using lidl::typeIsOptional;
+using lidl::optionalValueType;
+using lidl::fieldIsOptional;
+using lidl::fieldValueType;
+using lidl::paramIsOptional;
+using lidl::paramValueType;
+
 // std::string -> QString, and let QTextStream accept std::string directly so
 // emission of AST string fields (`s << md.name`) keeps compiling unchanged.
 inline QString qs(const std::string& s) { return QString::fromStdString(s); }
@@ -62,12 +79,18 @@ inline lidl::ValidationResult lidlValidate(const ModuleDecl& module)
 // to name a map key `_bytes` — but a generator can at least refuse to emit the
 // one shape that is guaranteed to misdecode, instead of leaving it to be
 // discovered at runtime.
+// Optionality does not rescue it: a PRESENT `? _bytes: tstr` still encodes to
+// {"_bytes": "..."}, which is the ambiguous shape. So the check reads through
+// the optional — via fieldValueType, not f.type — and refuses both spellings.
+// Reading f.type here refused `? _bytes: tstr` (whose type stays Primitive
+// tstr) while letting `_bytes: ?tstr` straight through: one declaration, two
+// answers, which is the exact drift the accessors exist to prevent.
 inline bool lidlRecordCollidesWithBytesTag(const TypeDecl& t)
 {
-    return t.fields.size() == 1
-        && t.fields[0].name == "_bytes"
-        && t.fields[0].type.kind == TypeExpr::Primitive
-        && t.fields[0].type.name == "tstr";
+    if (t.fields.size() != 1 || t.fields[0].name != "_bytes")
+        return false;
+    const TypeExpr& vt = fieldValueType(t.fields[0]);
+    return vt.kind == TypeExpr::Primitive && vt.name == "tstr";
 }
 
 // Returns false and fills `error` when any declared record cannot round-trip.

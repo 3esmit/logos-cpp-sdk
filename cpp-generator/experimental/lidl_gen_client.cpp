@@ -180,6 +180,18 @@ static QString qtArgExpr(const TypeExpr& te, const QString& name)
     return holdsRecord ? qtToVariantExpr(te, name) : name;
 }
 
+// A record field's Qt type, honouring BOTH optionality spellings.
+//
+// `?T` is QVariant on the Qt surface — Qt has no optional template, and an
+// invalid QVariant is its single empty inhabitant. The point of routing through
+// fieldIsOptional() is that `? name: T` and `name: ?T` are the same declaration:
+// reading `f.type` alone made the flag spelling emit a bare `T` (which cannot be
+// empty at all) while the type spelling emitted QVariant, from one contract.
+static QString lidlFieldTypeQt(const FieldDecl& f)
+{
+    return fieldIsOptional(f) ? QString("QVariant") : lidlTypeToQt(f.type);
+}
+
 static void emitRecords(QTextStream& s, const ModuleDecl& module)
 {
     if (module.types.empty()) return;
@@ -188,7 +200,7 @@ static void emitRecords(QTextStream& s, const ModuleDecl& module)
         s << "/// `" << n << "` — a record declared by the `" << qs(module.name) << "` contract.\n";
         s << "struct " << n << " {\n";
         for (const FieldDecl& f : t.fields)
-            s << "    " << lidlTypeToQt(f.type) << " " << qs(f.name) << "{};\n";
+            s << "    " << lidlFieldTypeQt(f) << " " << qs(f.name) << "{};\n";
         s << "};\n\n";
     }
     // Conversions come after ALL structs so records may reference each other.
@@ -196,17 +208,35 @@ static void emitRecords(QTextStream& s, const ModuleDecl& module)
         const QString n = qs(t.name);
         s << "inline QVariant " << n << "ToVariant(const " << n << "& v)\n{\n";
         s << "    QVariantMap __m;\n";
-        for (const FieldDecl& f : t.fields)
+        for (const FieldDecl& f : t.fields) {
+            if (fieldIsOptional(f)) {
+                // A record field is a NAMED slot: empty is spelled by OMITTING
+                // the key, not by inserting an invalid QVariant. Same rule the
+                // cdylib record codec follows, on the other surface.
+                s << "    if (v." << qs(f.name) << ".isValid())\n";
+                s << "        __m.insert(\"" << qs(f.name) << "\", v." << qs(f.name) << ");\n";
+                continue;
+            }
             s << "    __m.insert(\"" << qs(f.name) << "\", "
               << qtToVariantExpr(f.type, "v." + qs(f.name)) << ");\n";
+        }
         s << "    return QVariant(__m);\n}\n\n";
 
         s << "inline " << n << " " << n << "FromVariant(const QVariant& value)\n{\n";
         s << "    const QVariantMap __m = value.toMap();\n";
         s << "    " << n << " __out;\n";
-        for (const FieldDecl& f : t.fields)
+        for (const FieldDecl& f : t.fields) {
+            if (fieldIsOptional(f)) {
+                // Absent and null both arrive as an invalid QVariant — the same
+                // state, as the contract requires. Converting (`.toString()` on
+                // a flag-optional `tstr`) would have turned "empty" into "",
+                // which is a VALUE.
+                s << "    __out." << qs(f.name) << " = __m.value(\"" << qs(f.name) << "\");\n";
+                continue;
+            }
             s << "    __out." << qs(f.name) << " = "
               << qtFromVariantExpr(f.type, "__m.value(\"" + qs(f.name) + "\")") << ";\n";
+        }
         s << "    return __out;\n}\n\n";
     }
 }

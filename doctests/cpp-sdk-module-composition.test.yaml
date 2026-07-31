@@ -539,12 +539,14 @@ sections:
           nix build 'path:./greeter_module#lgx' \
             --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o greeter-lgx
         code_block: |
           # From inside the greeter clone this is simply:
           #   nix build '.#lgx' --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
           nix build 'path:./greeter_module#lgx' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o greeter-lgx
         post_text: "The greeter package is under `./greeter-lgx/`:"
         extra_run:
@@ -562,13 +564,17 @@ sections:
             --override-input greeter_module 'path:./greeter_module' \
             --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input greeter_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input greeter_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o orchestrator-lgx
         code_block: |
           nix build 'path:./orchestrator_module#lgx' \
             --override-input greeter_module 'path:./greeter_module' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input greeter_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input greeter_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o orchestrator-lgx
         post_text: "The orchestrator package is under `./orchestrator-lgx/`:"
         extra_run:
@@ -585,17 +591,23 @@ sections:
         run: |
           nix build 'github:logos-co/logos-logoscore-cli{release}' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
-            --override-input logos-module-client/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
-            --override-input logos-module-client/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         check_file: "logos/bin/logoscore"
 

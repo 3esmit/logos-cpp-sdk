@@ -50,6 +50,52 @@ static QString lidlTypeExprToQtTypeName(const TypeExpr& te)
     return lidlTypeToQt(te);
 }
 
+// Report every optional slot this path is about to flatten.
+//
+// THE BOUNDARY. Everything below (moduleMethodsToJson / moduleRecordsToJson /
+// moduleEventsToJson -> generator_lib) consumes a single Qt TYPE-NAME STRING per
+// slot. A TypeExpr's optionality — like its nesting, its map key type and its
+// descriptions — does not survive being turned into a name, and Qt has no name
+// to survive as: there is no metatype for an optional, so the mapper answers
+// QVariant (see lidlTypeToQt).
+//
+// That leaves a Qt/Lp consumer of an optional slot with the right SHAPE and no
+// TYPE: an invalid QVariant is Qt's empty inhabitant, so two-stateness survives,
+// but the consumer gets no compile-time check on the value and cannot tell
+// `?tstr` from `?uint` or recover a `?Record`'s struct. Carrying optionality
+// past this point means widening the JSON surface these three functions produce
+// and teaching generator_lib a per-slot optional flag on both the Qt and Lp
+// emitters — real work, and not what this change is.
+//
+// So it stays flattened, and says so. Silence here is what made the gap easy to
+// miss in the first place; a build that generates a Qt consumer for an optional
+// contract should not look like a build that had nothing to lose.
+static void noteOptionalFlattened(const ModuleDecl& mod, const QString& where,
+                                  QTextStream& err)
+{
+    QStringList optSlots;
+    for (const TypeDecl& td : mod.types)
+        for (const FieldDecl& fd : td.fields)
+            if (fieldIsOptional(fd))
+                optSlots << (qs(td.name) + "." + qs(fd.name));
+    for (const MethodDecl& md : mod.methods) {
+        for (const ParamDecl& pd : md.params)
+            if (paramIsOptional(pd))
+                optSlots << (qs(md.name) + "(" + qs(pd.name) + ")");
+        if (typeIsOptional(md.returnType))
+            optSlots << (qs(md.name) + "() return");
+    }
+    for (const EventDecl& ed : mod.events)
+        for (const ParamDecl& pd : ed.params)
+            if (paramIsOptional(pd))
+                optSlots << (qs(ed.name) + "(" + qs(pd.name) + ")");
+    if (optSlots.isEmpty()) return;
+    err << "Note: " << where << ": optional slot(s) [" << optSlots.join(", ")
+        << "] are generated as untyped QVariant. The Qt/Lp consumer surface has "
+           "no optional type, so `?T` keeps its two states (an invalid QVariant "
+           "is the empty one) but loses T.\n";
+}
+
 static QJsonArray moduleRecordsToJson(const ModuleDecl& mod);
 
 // Load events from a `.lidl` sidecar shipped alongside a module's
@@ -76,6 +122,7 @@ static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err,
         return result;
     }
 
+    noteOptionalFlattened(pr.module, lidlPath, err);
     if (outRecords) *outRecords = moduleRecordsToJson(pr.module);
     for (const EventDecl& ed : pr.module.events) {
         QJsonObject obj;
@@ -299,6 +346,8 @@ static bool generateInterfaceWrappers(const QVector<InterfaceSpec>& ifaces,
                 return false;
             }
         }
+
+        noteOptionalFlattened(mod, spec.path, err);
 
         const QString className = toPascalCase(spec.name);
         const QJsonArray methods = moduleMethodsToJson(mod);

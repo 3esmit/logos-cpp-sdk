@@ -564,3 +564,128 @@ TEST_F(ImplHeaderParserTest, ParsesMultiLineSignature)
     EXPECT_TRUE(names.contains("wrapped"))
         << "got: " << names.join(",").toStdString();
 }
+
+// ---------------------------------------------------------------------------
+// Optionality, header-first
+//
+// `std::optional<T>` used to fall through to the opaque `any` fallback with no
+// diagnostic, so a header-first C++ provider could not express an optional at
+// all: it declared one and published a contract that said something else.
+// ---------------------------------------------------------------------------
+
+TEST_F(ImplHeaderParserTest, StdOptionalBecomesOptional)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/optional_impl.h",
+        "OptionalImpl",
+        fixturesDir() + "/optional_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    auto findType = [&](const char* n) -> const TypeDecl* {
+        for (const auto& t : r.module.types)
+            if (t.name == n) return &t;
+        return nullptr;
+    };
+    auto findMethod = [&](const char* n) -> const MethodDecl* {
+        for (const auto& m : r.module.methods)
+            if (m.name == n) return &m;
+        return nullptr;
+    };
+
+    const TypeDecl* profile = findType("Profile");
+    ASSERT_NE(profile, nullptr);
+    auto fieldNamed = [&](const char* n) -> const FieldDecl* {
+        for (const auto& f : profile->fields)
+            if (f.name == n) return &f;
+        return nullptr;
+    };
+
+    // A plain member stays required.
+    ASSERT_NE(fieldNamed("required"), nullptr);
+    EXPECT_FALSE(fieldIsOptional(*fieldNamed("required")));
+
+    // Optional members carry the value type, not `any`.
+    ASSERT_NE(fieldNamed("nickname"), nullptr);
+    EXPECT_TRUE(fieldIsOptional(*fieldNamed("nickname")));
+    EXPECT_EQ(fieldValueType(*fieldNamed("nickname")).name, "tstr");
+    EXPECT_EQ(fieldValueType(*fieldNamed("age")).name, "uint");
+    EXPECT_EQ(fieldValueType(*fieldNamed("avatar")).name, "bstr");
+
+    // Optional composes with a declared record — and `std::optional<Blob>` is
+    // still a MENTION of Blob, so the record survives the
+    // keep-only-referenced-records pass instead of being dropped as unused.
+    ASSERT_NE(fieldNamed("blob"), nullptr);
+    EXPECT_EQ(fieldValueType(*fieldNamed("blob")).kind, TypeExpr::Named);
+    EXPECT_EQ(fieldValueType(*fieldNamed("blob")).name, "Blob");
+    EXPECT_NE(findType("Blob"), nullptr);
+
+    // Parameters and returns, and optional nested inside a container.
+    const MethodDecl* echo = findMethod("echoOptional");
+    ASSERT_NE(echo, nullptr);
+    ASSERT_EQ(echo->params.size(), 1u);
+    EXPECT_TRUE(paramIsOptional(echo->params[0]));
+    EXPECT_EQ(paramValueType(echo->params[0]).name, "tstr");
+    EXPECT_TRUE(typeIsOptional(echo->returnType));
+
+    const MethodDecl* lst = findMethod("echoOptionalList");
+    ASSERT_NE(lst, nullptr);
+    ASSERT_EQ(lst->params.size(), 1u);
+    EXPECT_EQ(lst->params[0].type.kind, TypeExpr::Array);
+    ASSERT_EQ(lst->params[0].type.elements.size(), 1u);
+    EXPECT_EQ(lst->params[0].type.elements[0].kind, TypeExpr::Optional);
+
+    // A required method is untouched.
+    const MethodDecl* req = findMethod("required");
+    ASSERT_NE(req, nullptr);
+    EXPECT_FALSE(paramIsOptional(req->params[0]));
+    EXPECT_FALSE(typeIsOptional(req->returnType));
+
+    // The event parameter, likewise.
+    ASSERT_EQ(r.module.events.size(), 1u);
+    ASSERT_EQ(r.module.events[0].params.size(), 2u);
+    EXPECT_FALSE(paramIsOptional(r.module.events[0].params[0]));
+    EXPECT_TRUE(paramIsOptional(r.module.events[0].params[1]));
+}
+
+// std::optional<std::optional<T>> has NO LIDL type: three C++ states over a
+// two-state wire. It maps down to `?T` — which is what makes the author's own
+// declaration stop compiling against the generated codec, deliberately — and
+// says so here, rather than leaving a conversion error in generated code.
+TEST_F(ImplHeaderParserTest, NestedOptionalCollapsesAndIsReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = dir.filePath("nested_impl.h");
+    {
+        QFile f(hp);
+        ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Text));
+        f.write(
+            "#pragma once\n"
+            "#include <optional>\n"
+            "#include <string>\n"
+            "struct Rec {\n"
+            "    std::optional<std::optional<std::string>> collapsed;\n"
+            "};\n"
+            "class NestedImpl {\n"
+            "public:\n"
+            "    Rec echo(const Rec& v);\n"
+            "};\n");
+    }
+    auto r = parseImplHeader(hp, "NestedImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 1u);
+    const FieldDecl& f = r.module.types[0].fields[0];
+    EXPECT_TRUE(fieldIsOptional(f));
+    // Collapsed to ONE layer — the contract may not carry a third state.
+    EXPECT_EQ(fieldValueType(f).kind, TypeExpr::Primitive);
+    EXPECT_EQ(fieldValueType(f).name, "tstr");
+
+    err.flush();
+    EXPECT_TRUE(errOutput.contains("std::optional<std::optional<std::string>>"))
+        << errOutput.toStdString();
+    EXPECT_TRUE(errOutput.contains("no LIDL type")) << errOutput.toStdString();
+}

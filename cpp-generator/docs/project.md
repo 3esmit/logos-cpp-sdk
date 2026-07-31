@@ -72,6 +72,41 @@ Bridges the existing Qt-flavored backends onto logos-lidl's std AST so they comp
 - `lidlIsStdConvertible(TypeExpr)` — whether a type has a pure-C++ (Qt-free) representation
 - `lidlToPascalCase(name)` — converts `snake_case` to `PascalCase`
 
+### Optionality
+
+`?T` is **two-state**: a value of `T`, or empty. Never three-state — "one LIDL type ↔ one
+type per language" leaves nowhere for a third state, because every target has exactly one
+empty inhabitant.
+
+**Two spellings, one meaning.** A record field may be written `? name: T` (the flag) or
+`name: ?T` (the type kind); the spec binds them to the same declaration, so they MUST emit
+identical code. Backends never answer this themselves — logos-lidl's `fieldIsOptional(f)` /
+`fieldValueType(f)` (re-exported by `lidl_compat.h`) are the one place the two are
+reconciled. **Reading `f.optional` or `f.type.kind == Optional` on its own is a bug.**
+
+**Wire rule.** Absent and explicit null are the *same* state on decode and *different* on
+encode:
+
+| | empty is spelled |
+|---|---|
+| decode, optional slot | absent **or** null → empty |
+| decode, required slot | absent and null are both still errors |
+| encode, **named** slot (a record field) | the key is **omitted** |
+| encode, **positional** slot (argument, return, event param) | `null` — there is no key to omit, and arity must never change |
+
+A round trip therefore **canonicalises**: a peer that sent `"f": null` gets the key back
+omitted. A present-but-wrong-typed value is still an error — optional widens the domain by
+exactly one inhabitant, it does not switch type checking off.
+
+Per surface:
+
+| Surface | `?T` | Notes |
+|---|---|---|
+| cdylib / std (`lidlTypeToStd`, `lidl_gen_cdylib`) | `std::optional<T>` | encoded by logos-protocol's `Codec<std::optional<T>>`; key omission is the record emitter's job (a codec never sees the slot) |
+| `?any` / `?{tstr: any}` / `?[any]` | `LogosMap` / `LogosList` | collapses: `nlohmann::json` already carries `null`, so wrapping it would make the slot three-state |
+| Qt (`lidlTypeToQt`) | `QVariant` | two-state (an invalid QVariant is Qt's empty inhabitant) but **untyped** — see Known Limitations |
+| header-first (`impl_header_parser`) | `std::optional<T>` ↔ `?T` | `std::optional<std::optional<T>>` has no LIDL type; it collapses to `?T` and is reported on stderr |
+
 ### Client stubs (`lidl_gen_client.h/cpp`)
 
 - `lidlMakeHeader(ModuleDecl)` / `lidlMakeSource(ModuleDecl)` — typed `<Module>` client wrapper; each method (and its `…Async` twin) carries a Doxygen `///` comment generated from the method's `description`
@@ -143,6 +178,7 @@ Flag plumbing:
 - The literal `logos_events:` token (defined in `logos_module_context.h` as `#define logos_events public`) opens an events section; bare prototypes inside become `EventDecl{name, params, description}` entries appended to `ModuleDecl.events` (the `description` is the doc comment immediately above the declaration, captured via `joinDocLines` exactly as for methods)
 - Skips: constructors, destructors, typedefs, using, friend, enum, struct, `std::function` declarations
 - Recognizes `LogosMap` and `LogosList` return types (nlohmann::json aliases) and sets `MethodDecl.jsonReturn = true`
+- Recognizes `std::optional<T>` → `?T` (see Optionality). Anything it does *not* recognize still falls back to the opaque `any`, silently — that fallback is why an optional was unexpressible header-first until it was named explicitly
 - Template-aware parameter splitting (handles `std::vector<std::string>` correctly)
 
 ## CLI Usage
@@ -221,9 +257,10 @@ The frontend tests (lexer/parser/validator/serializer) moved to the **logos-lidl
 
 | Test file | What it tests |
 |-----------|---------------|
-| `test_lidl_type_mapping.cpp` | `lidlTypeToQt`, `lidlTypeToStd`, `lidlIsStdConvertible`, `lidlToPascalCase` |
-| `test_lidl_gen_client.cpp` | Client stub generation: sync/async methods, events, metadata JSON, edge cases |
-| `test_impl_header_parser.cpp` | Header parsing: type mapping, access specifiers, skipping private/protected, error cases |
+| `test_lidl_type_mapping.cpp` | `lidlTypeToQt`, `lidlTypeToStd`, `lidlIsStdConvertible`, `lidlToPascalCase`, optionality on both surfaces |
+| `test_lidl_gen_client.cpp` | Client stub generation: sync/async methods, events, metadata JSON, edge cases, both optional spellings agreeing |
+| `test_lidl_gen_cdylib.cpp` | cdylib eligibility + emission: bytes at depth, records, typed maps, optionality (key omission, arity, `?any` collapse) |
+| `test_impl_header_parser.cpp` | Header parsing: type mapping, access specifiers, skipping private/protected, error cases, `std::optional<T>` |
 
 (The lexer/parser/AST/serializer/validator round-trip + description tests live in logos-lidl's own `tests/test_lidl.cpp`.)
 
@@ -233,6 +270,7 @@ Fixture files in `tests/experimental/fixtures/`:
 - `complex_impl.h` — module with multiple access specifier sections
 - `empty_class_impl.h` — class with no public methods
 - `empty_metadata.json` — minimal metadata
+- `optional_impl.h` / `optional_metadata.json` — `std::optional<T>` header-first, incl. an optional over a declared record
 
 ## Known Limitations
 
@@ -246,3 +284,18 @@ Fixture files in `tests/experimental/fixtures/`:
 - LIDL does not support generic/parameterized types or inheritance
 - `--from-header` emits the **cdylib** backend here (the `qt` glue backend moved to logos-qt-generator); the **Rust** backend lives in logos-rust-sdk's `lidl-gen`, generating over logos-lidl's C ABI
 - Client stub generation (`lidlMakeHeader`/`lidlMakeSource`) is only available from LIDL files, not from `--from-header`
+- **Optionality is untyped on the Qt/Lp consumer surface.** The consumer wrappers real
+  modules get come from `legacy/main.cpp` → `generateInterfaceWrappers` → `generator_lib`,
+  and the AST is flattened to a single Qt **type-name string** per slot at
+  `moduleMethodsToJson` / `moduleRecordsToJson` / `moduleEventsToJson` — a boundary that
+  optionality (like nesting, map key types and descriptions) cannot cross. `?T` therefore
+  arrives as `QVariant`: the right *shape* (an invalid QVariant is Qt's empty inhabitant,
+  and the wire's `null` becomes exactly that) with no *type*, so a consumer gets no
+  compile-time check and cannot tell `?tstr` from `?uint` or recover a `?Record`'s struct.
+  Carrying it further means widening that JSON surface with a per-slot optional flag and
+  teaching both the Qt and Lp emitters to honour it. Until then the generator prints a
+  `Note:` naming every flattened slot, so an affected build is never silent.
+- `lidlRecordCollidesWithBytesTag` reads *through* an optional (via `fieldValueType`), so a
+  single-`_bytes`-field record is refused under both spellings. It used to read `f.type`,
+  which refused `? _bytes: tstr` and let `_bytes: ?tstr` through — the same declaration,
+  two answers. `?bstr` is unaffected either way: the tag lives in the value, not the slot.

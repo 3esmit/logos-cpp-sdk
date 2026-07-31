@@ -54,6 +54,22 @@ QString lidlTypeToQt(const TypeExpr& te)
             return "QMap<QString, " + QString::fromStdString(te.elements[1].name) + ">";
         return "QVariantMap";
     case TypeExpr::Optional:
+        // `?T` on the QT surface, deliberately, and this is the one mapping in
+        // this table that LOSES the value type.
+        //
+        // Qt has no optional template, and the type this name is read for is a
+        // metatype: the legacy consumer path and the cdylib's getMethods()
+        // introspection both hand it to the host, which marshals a QVariant
+        // across the plugin boundary. There is no metatype called
+        // `std::optional<QString>` — emitting one would fail exactly the way
+        // emitting a record's struct name here once made the host SIGSEGV.
+        //
+        // QVariant is at least the RIGHT SHAPE: an invalid QVariant is Qt's
+        // single empty inhabitant, and the wire's `null` becomes precisely
+        // that. So `?T` is two-state here — it is just untyped, in the same way
+        // `any` is, which means a Qt consumer gets no compile-time check on the
+        // value and cannot tell `?tstr` from `?uint`. That is a real gap, not a
+        // finished mapping; see cpp-generator/docs/project.md ("Optionality").
         return "QVariant";
     }
     return "QVariant";
@@ -103,7 +119,21 @@ QString lidlTypeToStd(const TypeExpr& te)
         return "QVariantList";
     }
     if (te.kind == TypeExpr::Map)      return "QVariantMap";
-    if (te.kind == TypeExpr::Optional) return "QVariant";
+    // `?T` -> std::optional<T>. The std surface HAS an optional, so unlike the
+    // Qt table above this one keeps the value type. std::nullopt is C++'s single
+    // empty inhabitant, which is what makes the mapping two-state; the encoder
+    // that pairs with it is logos-protocol's Codec<std::optional<T>>.
+    //
+    // Recurse through optionalValueType() rather than elements[0]: optionality
+    // is idempotent under the two-state rule, so `??T` denotes the same two
+    // states as `?T` and must not become std::optional<std::optional<T>>.
+    // A degenerate Optional carrying no element (unreachable from the parser,
+    // constructible by hand or over the JSON bridge) keeps the opaque fallback
+    // instead of recursing forever.
+    if (te.kind == TypeExpr::Optional) {
+        if (te.elements.empty()) return "QVariant";
+        return "std::optional<" + lidlTypeToStd(optionalValueType(te)) + ">";
+    }
     if (te.kind == TypeExpr::Named)    return "QVariant";
     return "QVariant";
 }

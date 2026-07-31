@@ -46,6 +46,11 @@ static QString stripDeclarationSpecifiers(QString string)
 // `any` it always was.
 static QSet<QString> g_recordNames;
 
+// C++ spellings seen that have NO LIDL type, and were mapped onto the nearest
+// one that does. Collected here because cppTypeToLidl has no diagnostic channel
+// (same reason g_recordNames is file-static); parseImplHeader drains it.
+static QStringList g_unmappableSpellings;
+
 static TypeExpr cppTypeToLidl(const QString& raw)
 {
     // Normalize: strip const, &, leading/trailing whitespace
@@ -138,6 +143,38 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     if (mm.hasMatch()) {
         TypeExpr val = cppTypeToLidl(mm.captured(1).trimmed());
         return { TypeExpr::Map, "", { {TypeExpr::Primitive, "tstr", {}}, val } };
+    }
+
+    // std::optional<T> -> ?T. Absent before, and the failure was silent: the
+    // fallback at the bottom of this function maps ANY unrecognised spelling to
+    // the opaque `any`, so a header-first C++ provider could not express
+    // optionality at all — it declared `std::optional<std::string>` and
+    // published a contract saying `any`, with no diagnostic.
+    //
+    // The derived contract uses the type-kind spelling (`name: ?T`). C++ has
+    // only one spelling, LIDL has two, and they are bound to the same meaning —
+    // so which one is emitted is a serialization choice, not a semantic one.
+    static QRegularExpression optRe("^std::optional\\s*<\\s*(.+)\\s*>$");
+    QRegularExpressionMatch om = optRe.match(t);
+    if (om.hasMatch()) {
+        TypeExpr inner = cppTypeToLidl(om.captured(1).trimmed());
+        // std::optional<std::optional<T>> has NO LIDL type.
+        //
+        // `?T` is two-state, and optionality is idempotent under that rule — so
+        // the nearest contract type is plain `?T`, and that is what gets
+        // published. But the author's C++ has THREE states (nullopt / an engaged
+        // outer holding nullopt / a value), and the wire has two: accepting the
+        // declaration as-is would make `optional(nullopt)` and `nullopt` encode
+        // to the same null and decode back as one of them, silently. So it maps
+        // down, the generated codec is written for std::optional<T>, and the
+        // author's own declaration stops compiling against it — deliberately.
+        // Say why here, where the reason is known, rather than leaving a
+        // conversion error in generated code the author never wrote.
+        if (inner.kind == TypeExpr::Optional) {
+            g_unmappableSpellings << t;
+            return inner;
+        }
+        return { TypeExpr::Optional, "", { inner } };
     }
 
     // A record the header declared. Checked LAST so it can never shadow a
@@ -375,6 +412,11 @@ ImplParseResult parseImplHeader(const QString& headerPath,
                                 QTextStream& err)
 {
     ImplParseResult result;
+
+    // Both file-statics are per-parse state: one process generates for more than
+    // one module. Cleared here rather than next to their first use because the
+    // metadata's event params are typed before the header is even read.
+    g_unmappableSpellings.clear();
 
     // --- Read metadata.json ---
     {
@@ -702,6 +744,16 @@ done:
     // mentions — a header's internal helpers must not become published
     // contract types.
     keepOnlyReferencedRecords(result.module);
+
+    if (!g_unmappableSpellings.isEmpty()) {
+        g_unmappableSpellings.removeDuplicates();
+        err << "Warning: " << headerPath << ": " << g_unmappableSpellings.join(", ")
+            << " has no LIDL type. `?T` is TWO-state — a value or empty — so a "
+               "nested optional cannot denote a third state; the contract "
+               "publishes the collapsed `?T`, and the generated codec is "
+               "written for std::optional<T>. Declare it that way, or the "
+               "generated code will not compile against this header.\n";
+    }
 
     if (result.module.methods.empty()) {
         err << "Warning: no public methods found in class " << className

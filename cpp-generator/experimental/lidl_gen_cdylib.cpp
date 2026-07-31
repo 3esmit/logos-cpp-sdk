@@ -3,6 +3,7 @@
 
 #include <QTextStream>
 
+#include <functional>
 #include <set>
 #include <string>
 
@@ -49,6 +50,18 @@ bool typeSupported(const TypeExpr& te, bool isReturn, const std::set<std::string
     // A declared record is a generated struct with a generated codec.
     if (isRecord(te, recs))
         return true;
+    // `?T` — supported exactly when its VALUE type is.
+    //
+    // The value type is checked as a NON-return position on purpose: `result`
+    // and `void` are the two spellings that only make sense as a return, and
+    // neither can be optional. `void` is the absence of a value, so `?void` is
+    // meaningless; `result` already carries its own success/error discriminant,
+    // so `?result` would be a second one. `-> ?Point` and `-> ?tstr` are the
+    // real optional returns and stay eligible.
+    if (te.kind == TypeExpr::Optional) {
+        if (te.elements.empty()) return false;
+        return typeSupported(optionalValueType(te), /*isReturn=*/false, recs);
+    }
     // Recurse rather than whitelisting element names: that admits [bstr],
     // [[int]], [Record] and [{tstr: T}] in one rule, and keeps the gate and
     // the spelling function agreeing about what is expressible.
@@ -96,6 +109,31 @@ QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& rec
 QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& path,
                      const std::set<std::string>& recs)
 {
+    // `?T` — decode is LIBERAL, and only by exactly one inhabitant.
+    //
+    // null decodes to empty; anything else is decoded as T by the SAME decoder a
+    // required T would get, so a present-but-wrong value fails with the same
+    // message at the same path. Optional widens the domain, it does not switch
+    // type checking off.
+    if (te.kind == TypeExpr::Optional && !te.elements.empty()) {
+        const QString cpp = lidlTypeToStdCdylib(te, recs);
+        const TypeExpr& vt = optionalValueType(te);
+        // `?any` collapses onto `any` (see lidlTypeToStdCdylib): untyped JSON
+        // already carries null, so there is no wrapper to build.
+        if (!cpp.startsWith("std::optional<"))
+            return jsonArgToStd(vt, expr, path, recs);
+        // A scalar `bstr` argument does NOT go through the codec — it gets the
+        // lenient bytes decode, so a caller may send the tagged form, a plain
+        // string, a number or a byte array. `?bstr` has to keep that, or the
+        // identical value would be accepted in a required slot and rejected in
+        // an optional one. Test for the empty inhabitant here and wrap.
+        if (vt.kind == TypeExpr::Primitive && vt.name == "bstr")
+            return "(" + expr + ".is_null() ? " + cpp + "() : " + cpp + "("
+                 + jsonArgToStd(vt, expr, path, recs) + "))";
+        // Everything else names std::optional<T> and lets
+        // Codec<std::optional<T>> map null -> nullopt in one expression.
+        return "logos::fromJson<" + cpp + ">(" + expr + ", \"" + path + "\")";
+    }
     if (te.kind == TypeExpr::Primitive) {
         if (te.name == "bstr")
             return "logos::bytesFromJsonLenient(" + expr + ", \"" + path + "\")";
@@ -145,6 +183,20 @@ QString stdReturnToJson(const MethodDecl& md, const QString& var,
 // compile.
 QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& recs)
 {
+    // `?T` -> std::optional<T>, EXCEPT over the untyped-JSON aliases.
+    //
+    // LogosMap / LogosList are nlohmann::json, and json already has `null` among
+    // its inhabitants — so std::optional<LogosMap> would give `?any` TWO empty
+    // spellings (nullopt and json(null)) and make it three-state, which is
+    // exactly what R1 forbids. `?any` therefore collapses onto `any`: same two
+    // states, one C++ type. (logos-lidl's validator warns on `?any` for the same
+    // reason, and the warning is about the spelling, not about this mapping.)
+    if (te.kind == TypeExpr::Optional && !te.elements.empty()) {
+        const QString inner = lidlTypeToStdCdylib(optionalValueType(te), recs);
+        if (inner == "LogosMap" || inner == "LogosList")
+            return inner;
+        return "std::optional<" + inner + ">";
+    }
     if (te.kind == TypeExpr::Primitive && te.name == "any")
         return "LogosMap";
     // `{tstr: any}` and `[any]` keep their nlohmann aliases: every existing
@@ -173,6 +225,50 @@ QString lidlTypeToStdCdylib(const TypeExpr& te, const std::set<std::string>& rec
         return "std::map<std::string, " + lidlTypeToStdCdylib(te.elements[1], recs) + ">";
 
     return lidlTypeToStd(te);
+}
+
+// The C++ spelling of a RECORD FIELD, honouring both optionality spellings.
+//
+// `? name: T` and `name: ?T` are the same declaration and must produce
+// byte-identical code (logos-lidl docs/spec.md, "Optionality"). That only holds
+// because fieldIsOptional()/fieldValueType() reconcile them in the frontend —
+// spelling one of the two out here would reintroduce the drift they exist to
+// prevent. Never write `f.optional` or `f.type.kind == Optional` in a backend.
+QString lidlFieldTypeCdylib(const FieldDecl& f, const std::set<std::string>& recs)
+{
+    if (!fieldIsOptional(f))
+        return lidlTypeToStdCdylib(f.type, recs);
+    const QString inner = lidlTypeToStdCdylib(fieldValueType(f), recs);
+    // Same collapse as lidlTypeToStdCdylib: untyped JSON already has null.
+    if (inner == "LogosMap" || inner == "LogosList")
+        return inner;
+    return "std::optional<" + inner + ">";
+}
+
+// True when anything in the contract is optional — a record field by either
+// spelling, a method parameter or return, or an event parameter. Gates the
+// `#include <optional>` in the generated TUs, so a contract that declares no
+// optional keeps its output byte-for-byte unchanged.
+bool moduleUsesOptional(const ModuleDecl& module)
+{
+    std::function<bool(const TypeExpr&)> mentions = [&](const TypeExpr& t) -> bool {
+        if (t.kind == TypeExpr::Optional) return true;
+        for (const TypeExpr& e : t.elements)
+            if (mentions(e)) return true;
+        return false;
+    };
+    for (const TypeDecl& t : module.types)
+        for (const FieldDecl& f : t.fields)
+            if (fieldIsOptional(f) || mentions(f.type)) return true;
+    for (const MethodDecl& md : module.methods) {
+        if (mentions(md.returnType)) return true;
+        for (const ParamDecl& pd : md.params)
+            if (mentions(pd.type)) return true;
+    }
+    for (const EventDecl& ed : module.events)
+        for (const ParamDecl& pd : ed.params)
+            if (mentions(pd.type)) return true;
+    return false;
 }
 
 // True when the module declares at least one `bstr` event parameter — the only
@@ -227,20 +323,45 @@ void emitRecordCodecs(QTextStream& s, const ModuleDecl& module,
         s << "    static nlohmann::json to(const " << name << "& v) {\n";
         s << "        nlohmann::json out = nlohmann::json::object();\n";
         for (const FieldDecl& f : t.fields) {
-            const QString ft = lidlTypeToStdCdylib(f.type, recs);
-            s << "        out[\"" << qs(f.name) << "\"] = Codec<" << ft << ">::to(v."
-              << qs(f.name) << ");\n";
+            const QString ft = lidlFieldTypeCdylib(f, recs);
+            const QString fn = qs(f.name);
+            if (ft.startsWith("std::optional<")) {
+                // ENCODE: a record field is a NAMED slot, so empty is spelled by
+                // OMITTING the key — never by writing null. This is the half of
+                // the rule Codec<std::optional<T>> deliberately cannot do: a
+                // codec only ever sees a VALUE, so it emits the positional
+                // spelling (null) and leaves key omission to the one place that
+                // knows there IS a key. That place is here.
+                //
+                // The round trip is therefore CANONICALISING, not identity: a
+                // peer that sent `"f": null` gets the key back omitted, and both
+                // spellings mean the same state.
+                const QString vt = lidlTypeToStdCdylib(fieldValueType(f), recs);
+                s << "        if (v." << fn << ".has_value())\n";
+                s << "            out[\"" << fn << "\"] = Codec<" << vt << ">::to(*v."
+                  << fn << ");\n";
+            } else {
+                s << "        out[\"" << fn << "\"] = Codec<" << ft << ">::to(v."
+                  << fn << ");\n";
+            }
         }
         s << "        return out;\n    }\n";
         s << "    static " << name << " from(const nlohmann::json& j, const std::string& path) {\n";
         s << "        if (!j.is_object()) detail::typeError(path, \"object\", j);\n";
         s << "        " << name << " out;\n";
         for (const FieldDecl& f : t.fields) {
-            const QString ft = lidlTypeToStdCdylib(f.type, recs);
+            const QString ft = lidlFieldTypeCdylib(f, recs);
             const QString fn = qs(f.name);
             // A missing field is reported at its own path rather than
             // default-constructed: a record that silently loses a field is the
             // failure mode this whole layer exists to prevent.
+            //
+            // DECODE needs no optional branch, and that is the point: an absent
+            // key is already materialised as null right here, so absent and
+            // explicit null arrive at the codec indistinguishable. In an
+            // optional field Codec<std::optional<T>> answers nullopt for both;
+            // in a required one Codec<T> still rejects both. One expression,
+            // both halves of the rule.
             s << "        out." << fn << " = Codec<" << ft << ">::from(\n";
             s << "            j.contains(\"" << fn << "\") ? j.at(\"" << fn
               << "\") : nlohmann::json(),\n";
@@ -452,6 +573,12 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
     s << "#include <logos_codec.h>\n";  // logos::Codec — the ONE definition
     s << "#include <cstdint>\n";
     s << "#include <map>\n";
+    // Only when the contract actually declares an optional: logos_codec.h
+    // already pulls <optional> in, so this is documentation of what the emitted
+    // codec names — and emitting it unconditionally would rewrite the types
+    // header of every contract that has no optional at all.
+    if (moduleUsesOptional(module))
+        s << "#include <optional>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n\n";
 
@@ -495,6 +622,8 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "#include <atomic>\n";
     s << "#include <map>\n";
     s << "#include <mutex>\n";
+    if (moduleUsesOptional(module))
+        s << "#include <optional>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n";
     // The Qt-free typed dependency surface: LogosModules (behind modules())
@@ -662,12 +791,29 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    try {\n";
 
     for (const MethodDecl& md : module.methods) {
+        // The arity gate, and the one place the LIBERAL half of the decode rule
+        // reaches a POSITIONAL slot.
+        //
+        // A canonical encoder never changes arity: an empty positional slot is
+        // spelled null and still occupies its position. But absent and null are
+        // the same state on decode, so an optional trailing argument may also
+        // simply not be there. The gate therefore admits anything from the last
+        // REQUIRED parameter onwards, and each optional beyond it materialises
+        // as null exactly the way an absent record field already does. Below
+        // that point nothing changes: a missing required argument is still a
+        // hard reject, and a contract with no optional parameters emits the
+        // byte-identical `args.size() < <count>` it always did.
+        size_t minArgs = 0;
+        for (size_t i = 0; i < md.params.size(); ++i)
+            if (!paramIsOptional(md.params[i])) minArgs = i + 1;
         s << "        if (m == \"" << md.name << "\") {\n";
-        s << "            if (args.size() < " << md.params.size() << ") return nullptr;\n";
+        s << "            if (args.size() < " << minArgs << ") return nullptr;\n";
         QString call = "lidlImpl()." + qs(md.name) + "(";
-        for (int i = 0; i < md.params.size(); ++i) {
-            call += jsonArgToStd(md.params[i].type,
-                                 QString("args.at(%1)").arg(i),
+        for (size_t i = 0; i < md.params.size(); ++i) {
+            const QString expr = (i < minArgs)
+                ? QString("args.at(%1)").arg(i)
+                : QString("(args.size() > %1 ? args.at(%1) : nlohmann::json())").arg(i);
+            call += jsonArgToStd(md.params[i].type, expr,
                                  QString("arg%1").arg(i), recs);
             if (i + 1 < md.params.size()) call += ", ";
         }
@@ -757,6 +903,8 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
     s << "#include <nlohmann/json.hpp>\n\n";
     s << "#include <cstdint>\n";
     s << "#include <map>\n";
+    if (moduleUsesOptional(module))
+        s << "#include <optional>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n";
     // LogosMap / LogosList (nlohmann aliases) appear in the emitted signatures
@@ -786,6 +934,7 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
             // helpful.
             if (stdType == "std::string" || stdType.startsWith("std::vector")
                 || stdType.startsWith("std::map")
+                || stdType.startsWith("std::optional")
                 || isRecord(ed.params[i].type, recsEv)
                 || stdType == "LogosMap" || stdType == "LogosList")
                 s << "const " << stdType << "& " << ed.params[i].name;
@@ -800,9 +949,16 @@ QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
             // A record or a composite carrying bytes rides the generated codec,
             // exactly like a method return — otherwise an event payload would be
             // the one place a bstr silently loses its tag.
+            //
+            // An optional joins them: an event parameter is a POSITIONAL slot,
+            // so empty is spelled null and the argument list keeps its length.
+            // Codec<std::optional<T>>::to answers exactly that. (`?any` collapsed
+            // to LogosMap above and is excluded by the same guard the untyped
+            // aliases always were.)
             if (evStd != "LogosMap" && evStd != "LogosList"
                 && (isRecord(pd.type, recsEv)
-                    || pd.type.kind == TypeExpr::Array || pd.type.kind == TypeExpr::Map)) {
+                    || pd.type.kind == TypeExpr::Array || pd.type.kind == TypeExpr::Map
+                    || pd.type.kind == TypeExpr::Optional)) {
                 s << "    args.push_back(logos::toJson<" << evStd << ">("
                   << pd.name << "));\n";
                 continue;
