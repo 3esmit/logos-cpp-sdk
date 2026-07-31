@@ -51,13 +51,151 @@ static QSet<QString> g_recordNames;
 // (same reason g_recordNames is file-static); parseImplHeader drains it.
 static QStringList g_unmappableSpellings;
 
-static TypeExpr cppTypeToLidl(const QString& raw)
+// ---------------------------------------------------------------------------
+// Spellings with NO LIDL type at all.
+//
+// These used to reach the `any` fallback at the bottom of cppTypeToLidl, and
+// `any` is ADMITTED by every backend gate — so the declaration was accepted, the
+// published contract said `any`, and the generated dispatch handed the raw
+// nlohmann::json straight to the author's parameter. That either worked by luck
+// through nlohmann's implicit conversions, threw at call time, or emitted a
+// non-canonical wire value. Nothing said a word.
+//
+// Now every one of them is recorded here and parseImplHeader turns the list into
+// a hard parse error naming the offending C++ type and the fix.
+//
+// cppTypeToLidl still RETURNS the historical `any` for these: the diagnostic and
+// the mapping are separate, so a declaration whose diagnostic is later discarded
+// (a helper struct that never reaches the contract, a reserved lifecycle hook)
+// produces byte-identical output to before.
+struct UnsupportedSpelling {
+    QString context;    // "method 'foo': parameter 'bar'"
+    QString record;     // non-empty when this came from a record field
+    QString declared;   // the full spelling as written on the declaration
+    QString offending;  // the spelling that has no LIDL type (may be nested)
+    QString hint;       // what to write instead
+};
+static QList<UnsupportedSpelling> g_unsupported;
+
+// Drop the qualifiers that are about how a value is PASSED rather than what it
+// is: cppTypeToLidl normalizes with this, and the diagnostics compare against it
+// so `const nlohmann::json&` and `nlohmann::json` are recognised as the same
+// spelling instead of reading as a type nested inside itself.
+static QString normalizeCppSpelling(const QString& raw)
 {
-    // Normalize: strip const, &, leading/trailing whitespace
     QString t = raw.trimmed();
     t.remove(QRegularExpression("^const\\s+"));
     t.remove(QRegularExpression("\\s*&$"));
-    t = t.trimmed();
+    return t.trimmed();
+}
+
+// Collapse whitespace so `unsigned  long   int` and `unsigned long int` are one
+// key, and drop the redundant `int` from the multi-word integer spellings.
+static QString normalizeNumericSpelling(QString t)
+{
+    t = t.simplified();
+    static const QRegularExpression trailingInt("\\s+int$");
+    if (t != "int" && t.contains(' '))
+        t.remove(trailingInt);
+    return t;
+}
+
+// What to write instead. Every hint names a spelling that IS in the contract,
+// because "unsupported" without a replacement just moves the guesswork.
+static QString unsupportedHint(const QString& t)
+{
+    static const QString kWidenNote =
+        "Widening is source-compatible for every caller; a narrow type on the "
+        "wire is not, which is why LIDL has none.";
+
+    // uint8_t has exactly ONE meaning in this contract and it is not a number.
+    if (t == "uint8_t" || t == "std::uint8_t")
+        return "uint8_t means BYTES here, and only as `std::vector<uint8_t>` "
+               "(LIDL `bstr`). For a small number declare `uint64_t` (LIDL "
+               "`uint`); for binary data declare `std::vector<uint8_t>`.";
+
+    const QString n = normalizeNumericSpelling(t);
+    static const QSet<QString> kUnsigned = {
+        "unsigned", "unsigned char", "unsigned short", "unsigned long",
+        "unsigned long long", "uint16_t", "uint32_t", "size_t",
+        "uintptr_t", "uintmax_t",
+        "std::uint16_t", "std::uint32_t", "std::size_t", "std::uintptr_t"
+    };
+    static const QSet<QString> kSigned = {
+        "char", "signed char", "signed", "short", "int", "long", "long long",
+        "int8_t", "int16_t", "int32_t", "ssize_t", "ptrdiff_t", "intptr_t",
+        "intmax_t", "std::int8_t", "std::int16_t", "std::int32_t",
+        "std::ptrdiff_t", "std::intptr_t"
+    };
+    static const QSet<QString> kFloating = { "float", "long double" };
+
+    if (kUnsigned.contains(n))
+        return "LIDL numbers are 64-bit only. Declare it `uint64_t` (LIDL "
+               "`uint`). " + kWidenNote;
+    if (kSigned.contains(n))
+        return "LIDL numbers are 64-bit only. Declare it `int64_t` (LIDL "
+               "`int`). " + kWidenNote;
+    if (kFloating.contains(n))
+        return "LIDL has one floating type, `float64`. Declare it `double`.";
+
+    if (t.startsWith("std::set<") || t.startsWith("std::unordered_set<")
+        || t.startsWith("std::multiset<"))
+        return "LIDL has no set type. Declare it `std::vector<T>` (LIDL `[T]`); "
+               "uniqueness is not carried on the wire, so the module has to "
+               "enforce it either way.";
+    if (t.startsWith("std::pair<") || t.startsWith("std::tuple<"))
+        return "LIDL has no pair or tuple. Declare a `struct` in this header — "
+               "it becomes a contract `type` with named fields — or, for "
+               "key/value data, `std::map<std::string, V>` (LIDL `{tstr: V}`). "
+               "A struct is usually the right answer: positional pairs have no "
+               "field names for a consumer in another language to bind to.";
+    if (t.startsWith("std::map<") || t.startsWith("std::unordered_map<")
+        || t.startsWith("std::multimap<"))
+        return "LIDL map keys are always `tstr`. Declare it "
+               "`std::map<std::string, V>` / `std::unordered_map<std::string, "
+               "V>`, or a `[T]` of a struct carrying the key as a field.";
+    if (t.startsWith("std::list<") || t.startsWith("std::deque<")
+        || t.startsWith("std::array<") || t.startsWith("std::forward_list<"))
+        return "LIDL's sequence type is `[T]`, spelled `std::vector<T>`. "
+               "Declare it that way.";
+    if (t.startsWith("Q"))
+        return "Qt types cannot appear in a universal impl header — the "
+               "module's own translation units are Qt-free, and Qt is confined "
+               "to the generated glue. Use the std spelling (`std::string`, "
+               "`std::vector<T>`, `std::map<std::string, T>`) or the untyped "
+               "`LogosMap` / `LogosList`.";
+    if (t.endsWith("*") || t.endsWith("&&"))
+        return "A pointer or rvalue reference has no wire form. Pass the value "
+               "(by value or `const T&`), or a `struct` declared in this "
+               "header.";
+
+    return "The recognised spellings are: `bool`, `int64_t`, `uint64_t`, "
+           "`double`, `std::string`, `std::vector<uint8_t>` (bytes), "
+           "`std::optional<T>`, `std::vector<T>`, `std::map<std::string, T>`, "
+           "`std::unordered_map<std::string, T>`, `LogosMap` / `LogosList` / "
+           "`nlohmann::json` (untyped JSON), `StdLogosResult` and `void` as "
+           "returns, plus any `struct` declared in this header. Rewrite the "
+           "declaration with one of them, or declare a struct for it.";
+}
+
+// `context` names the declaration being typed ("method 'foo': parameter 'bar'")
+// and `declared` the full spelling on it, so a nested offender reports both the
+// element that has no LIDL type and the declaration that carries it. `record` is
+// set only while typing a struct's fields, so a diagnostic can be withdrawn when
+// the struct turns out never to reach the contract.
+//
+// `nameEmitted` marks the slots whose C++ spelling the generator WRITES OUT into
+// code the author's own declaration has to match — a record field's codec, an
+// event's generated body. In those the derived spelling is a constraint on the
+// author; everywhere else the generated code only has to consume or produce a
+// value, and can adapt to whatever the author declared.
+static TypeExpr cppTypeToLidl(const QString& raw, const QString& context = QString(),
+                              const QString& declared = QString(),
+                              const QString& record = QString(),
+                              bool nameEmitted = false)
+{
+    // Normalize: strip const, &, leading/trailing whitespace
+    QString t = normalizeCppSpelling(raw);
 
     // Primitives
     if (t == "bool")     return { TypeExpr::Primitive, "bool", {} };
@@ -113,7 +251,7 @@ static TypeExpr cppTypeToLidl(const QString& raw)
         // [{tstr: int}]. Without it the element list above was exhaustive and
         // every other vector fell all the way through to the opaque `any`,
         // which then encoded a record as a LogosMap.
-        return { TypeExpr::Array, "", { cppTypeToLidl(inner) } };
+        return { TypeExpr::Array, "", { cppTypeToLidl(inner, context, declared, record, nameEmitted) } };
     }
 
     // Qt collection types — pass through directly (non-std-convertible)
@@ -131,17 +269,60 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     if (t == "LogosList")
         return { TypeExpr::Array, "", { {TypeExpr::Primitive, "any", {}} } };
 
+    // The alias spelled out. LogosMap / LogosList ARE nlohmann::json, and real
+    // modules write the underlying name — test_fullapi_cpp's `echoAny` /
+    // `fireAnyEvent` / `anyEvent`, and both full_api interface headers, all
+    // declare `nlohmann::json`. It reached `any` ONLY through the fallback at
+    // the bottom of this function, so naming it here is a PREREQUISITE for
+    // turning that fallback into an error: without this branch the whole
+    // cross-language conformance chain stops building.
+    //
+    // Mapped to the bare `any` primitive rather than LogosMap's `{tstr: any}` /
+    // LogosList's `[any]`: `nlohmann::json` is an untyped value of ANY kind, not
+    // specifically an object or an array. That is the type the fallback already
+    // produced for it, so nothing about the published contract moves.
+    if (t == "nlohmann::json" || t == "json")
+        return { TypeExpr::Primitive, "any", {} };
+
     // StdLogosResult — pure C++ result type for universal impls. The generator
     // emits a StdLogosResult→Qt LogosResult conversion in the glue layer.
     if (t == "StdLogosResult")
         return { TypeExpr::Primitive, "result", {} };
 
-    // std::map<std::string, T> -> {tstr: T}. Absent before, so a typed map was
-    // unspellable header-first and fell through to `any`.
-    static QRegularExpression mapRe("^std::map\\s*<\\s*std::string\\s*,\\s*(.+)\\s*>$");
+    // std::map / std::unordered_map<std::string, T> -> {tstr: T}. Absent before,
+    // so a typed map was unspellable header-first and fell through to `any`.
+    //
+    // Both containers, because logos_codec.h specializes Codec for both and they
+    // are the same wire shape — a JSON object. Only the KEY is constrained: a
+    // non-`std::string` key falls through to the unsupported report below, since
+    // `{tstr: T}` is the only map LIDL has.
+    static QRegularExpression mapRe(
+        "^std::(?:unordered_)?map\\s*<\\s*std::string\\s*,\\s*(.+)\\s*>$");
     QRegularExpressionMatch mm = mapRe.match(t);
     if (mm.hasMatch()) {
-        TypeExpr val = cppTypeToLidl(mm.captured(1).trimmed());
+        // ...with one boundary. In a `nameEmitted` slot the generator WRITES the
+        // spelling out — a record field's codec says `Codec<std::map<...>>` and
+        // an event's generated body repeats the parameter list the author
+        // declared. It has to pick one of the two container names there, and
+        // picking the wrong one is a compile error in code the author never
+        // wrote. Method parameters and returns have no such constraint: they go
+        // through logos::JsonArg / deduced logos::toJson, which instantiate with
+        // whatever the author declared.
+        if (t.startsWith("std::unordered_map") && nameEmitted && !context.isEmpty()) {
+            UnsupportedSpelling u;
+            u.context = context;
+            u.record = record;
+            u.declared = declared.isEmpty() ? t : declared;
+            u.offending = t;
+            u.hint = "`{tstr: T}` has two C++ spellings and this slot's spelling "
+                     "is written into generated code your own declaration has to "
+                     "match, so it can only be one of them: declare it "
+                     "`std::map<std::string, T>`. (A method parameter or return "
+                     "may use either container — those are decoded and encoded "
+                     "through your declared type, not a named one.)";
+            g_unsupported.append(u);
+        }
+        TypeExpr val = cppTypeToLidl(mm.captured(1).trimmed(), context, declared, record, nameEmitted);
         return { TypeExpr::Map, "", { {TypeExpr::Primitive, "tstr", {}}, val } };
     }
 
@@ -157,7 +338,7 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     static QRegularExpression optRe("^std::optional\\s*<\\s*(.+)\\s*>$");
     QRegularExpressionMatch om = optRe.match(t);
     if (om.hasMatch()) {
-        TypeExpr inner = cppTypeToLidl(om.captured(1).trimmed());
+        TypeExpr inner = cppTypeToLidl(om.captured(1).trimmed(), context, declared, record, nameEmitted);
         // std::optional<std::optional<T>> has NO LIDL type.
         //
         // `?T` is two-state, and optionality is idempotent under that rule — so
@@ -183,7 +364,34 @@ static TypeExpr cppTypeToLidl(const QString& raw)
     if (g_recordNames.contains(t))
         return { TypeExpr::Named, t.toStdString(), {} };
 
-    // Fallback: treat as opaque
+    // NOTHING above matched: this spelling has no LIDL type.
+    //
+    // It used to return the opaque `any` right here, silently. `any` is admitted
+    // by every backend gate, so the declaration was accepted and the generated
+    // dispatch handed the raw nlohmann::json to the author's parameter with no
+    // `logos::fromJson<>` and no check — the one hole left open after #113-#122
+    // closed it for every TYPED slot. A `std::vector<uint32_t>` parameter
+    // published `[any]` and worked by accident; a
+    // `std::vector<std::pair<std::string, std::string>>` published `[any]` and
+    // shipped raw binary through a UTF-8 string.
+    //
+    // The return value is UNCHANGED (`any`) on purpose: mapping and diagnosis
+    // are separate concerns. A diagnostic that is later withdrawn — a helper
+    // struct that never reaches the contract, a reserved lifecycle hook — must
+    // leave the emitted output byte-identical to what it was.
+    //
+    // An empty spelling is not a C++ type at all, it is this line-based parser
+    // failing to find one (a macro, a member initialiser). Reporting "'' has no
+    // LIDL type" would be noise, so it keeps the old behaviour.
+    if (!t.isEmpty() && !context.isEmpty()) {
+        UnsupportedSpelling u;
+        u.context = context;
+        u.record = record;
+        u.declared = declared.isEmpty() ? t : declared;
+        u.offending = t;
+        u.hint = unsupportedHint(t);
+        g_unsupported.append(u);
+    }
     return { TypeExpr::Primitive, "any", {} };
 }
 
@@ -219,6 +427,9 @@ static std::vector<TypeDecl> scanForRecords(const QStringList& lines)
 
         TypeDecl td;
         td.name = om.captured(1).toStdString();
+        // Withdraw this struct's diagnostics if it turns out to declare no
+        // fields at all — nothing is published, so nothing is misreported.
+        const int diagMark = g_unsupported.size();
         for (int j = i + 1; j < lines.size(); ++j) {
             const QString body = lines.at(j).trimmed();
             if (body.startsWith("};")) break;
@@ -235,10 +446,15 @@ static std::vector<TypeDecl> scanForRecords(const QStringList& lines)
             if (!fm.hasMatch()) continue;
             FieldDecl fd;
             fd.name = fm.captured(2).toStdString();
-            fd.type = cppTypeToLidl(fm.captured(1).trimmed());
+            const QString spelling = fm.captured(1).trimmed();
+            fd.type = cppTypeToLidl(
+                spelling,
+                QString("type '%1': field '%2'").arg(om.captured(1), fm.captured(2)),
+                spelling, om.captured(1), /*nameEmitted=*/true);
             td.fields.push_back(fd);
         }
         if (!td.fields.empty()) out.push_back(td);
+        else while (g_unsupported.size() > diagMark) g_unsupported.removeLast();
     }
     return out;
 }
@@ -296,7 +512,11 @@ static void keepOnlyReferencedRecords(ModuleDecl& module)
 // Parse a single method declaration line
 // ---------------------------------------------------------------------------
 
-static bool parseMethodLine(const QString& line, MethodDecl& out)
+// `kind` is "method" or "event" — it only labels the diagnostics an unsupported
+// C++ spelling produces, so the report matches the section the declaration was
+// written in rather than the function that happens to parse both.
+static bool parseMethodLine(const QString& line, MethodDecl& out,
+                            const QString& kind = "method")
 {
     // Find the parameter list: everything between the last '(' and ')'
     int parenOpen = -1;
@@ -347,7 +567,9 @@ static bool parseMethodLine(const QString& line, MethodDecl& out)
         return false;
     out.name = methodName.toStdString();
     QString retTypeStr = stripDeclarationSpecifiers(prefix.left(nameStart).trimmed());
-    out.returnType = cppTypeToLidl(retTypeStr);
+    out.returnType = cppTypeToLidl(
+        retTypeStr, QString("%1 '%2': return type").arg(kind, methodName), retTypeStr,
+        QString(), /*nameEmitted=*/kind == "event");
     // Flag methods whose impl returns LogosMap / LogosList so the generator
     // can emit nlohmann→Qt conversion code in the glue layer.
     out.jsonReturn = (retTypeStr == "LogosMap" || retTypeStr == "LogosList");
@@ -385,8 +607,13 @@ static bool parseMethodLine(const QString& line, MethodDecl& out)
             if (pNameStart >= pNameEnd) continue;
 
             ParamDecl pd;
-            pd.name = p.mid(pNameStart, pNameEnd - pNameStart).toStdString();
-            pd.type = cppTypeToLidl(p.left(pNameStart));
+            const QString pName = p.mid(pNameStart, pNameEnd - pNameStart);
+            const QString pSpelling = p.left(pNameStart).trimmed();
+            pd.name = pName.toStdString();
+            pd.type = cppTypeToLidl(
+                p.left(pNameStart),
+                QString("%1 '%2': parameter '%3'").arg(kind, methodName, pName),
+                pSpelling, QString(), /*nameEmitted=*/kind == "event");
             out.params.push_back(pd);
         }
     }
@@ -413,10 +640,15 @@ ImplParseResult parseImplHeader(const QString& headerPath,
 {
     ImplParseResult result;
 
-    // Both file-statics are per-parse state: one process generates for more than
-    // one module. Cleared here rather than next to their first use because the
-    // metadata's event params are typed before the header is even read.
+    // All three file-statics are per-parse state: one process generates for more
+    // than one module. g_recordNames is cleared HERE as well as beside
+    // scanForRecords, because a name left over from the previous module's header
+    // would otherwise be visible while this one's metadata events are typed.
     g_unmappableSpellings.clear();
+    g_unsupported.clear();
+    g_recordNames.clear();
+
+    QJsonArray metadataEvents;
 
     // --- Read metadata.json ---
     {
@@ -440,24 +672,12 @@ ImplParseResult parseImplHeader(const QString& headerPath,
         for (const QString& depName : dependencyNames(deps))
             result.module.depends.push_back(depName.toStdString());
 
-        // Read events declared in metadata.json
-        QJsonArray events = obj.value("events").toArray();
-        for (const QJsonValue& ev : events) {
-            QJsonObject evObj = ev.toObject();
-            EventDecl ed;
-            ed.name = evObj.value("name").toString().toStdString();
-            ed.description = evObj.value("description").toString().toStdString();
-            QJsonArray params = evObj.value("params").toArray();
-            for (const QJsonValue& pv : params) {
-                QJsonObject po = pv.toObject();
-                ParamDecl pd;
-                pd.name = po.value("name").toString().toStdString();
-                pd.type = cppTypeToLidl(po.value("type").toString());
-                ed.params.push_back(pd);
-            }
-            if (!ed.name.empty())
-                result.module.events.push_back(ed);
-        }
+        // Events declared in metadata.json. Only READ here — their parameter
+        // types are C++ spellings like any other, and typing them requires the
+        // record set, which does not exist until the header has been scanned.
+        // They used to be typed right here, against whatever g_recordNames the
+        // PREVIOUS module's parse left behind.
+        metadataEvents = obj.value("events").toArray();
     }
 
     // --- Read and parse header ---
@@ -528,6 +748,31 @@ ImplParseResult parseImplHeader(const QString& headerPath,
     // single process generates for more than one module.
     g_recordNames.clear();
     result.module.types = scanForRecords(lines);
+
+    // Now the record set exists, the metadata-declared events can be typed. They
+    // stay AHEAD of the header's `logos_events:` events, as they always were.
+    for (const QJsonValue& ev : metadataEvents) {
+        QJsonObject evObj = ev.toObject();
+        EventDecl ed;
+        ed.name = evObj.value("name").toString().toStdString();
+        ed.description = evObj.value("description").toString().toStdString();
+        const QJsonArray params = evObj.value("params").toArray();
+        for (const QJsonValue& pv : params) {
+            QJsonObject po = pv.toObject();
+            ParamDecl pd;
+            const QString pName = po.value("name").toString();
+            const QString pType = po.value("type").toString();
+            pd.name = pName.toStdString();
+            pd.type = cppTypeToLidl(
+                pType,
+                QString("event '%1': parameter '%2' (declared in metadata.json)")
+                    .arg(evObj.value("name").toString(), pName),
+                pType, QString(), /*nameEmitted=*/true);
+            ed.params.push_back(pd);
+        }
+        if (!ed.name.empty())
+            result.module.events.push_back(ed);
+    }
 
     // State machine: find "class <className>", then collect declarations.
     // `InLogosEvents` is entered by the literal `logos_events:` token
@@ -688,7 +933,7 @@ ImplParseResult parseImplHeader(const QString& headerPath,
                 if (line.endsWith(';')) {
                     QString decl = line.left(line.size() - 1).trimmed();
                     MethodDecl md;
-                    if (parseMethodLine(decl, md)) {
+                    if (parseMethodLine(decl, md, "event")) {
                         EventDecl ed;
                         ed.name = md.name;
                         ed.params = md.params;
@@ -715,6 +960,10 @@ ImplParseResult parseImplHeader(const QString& headerPath,
             if (line.endsWith(';')) {
                 QString decl = line.left(line.size() - 1).trimmed();
                 MethodDecl md;
+                // Withdraw the declaration's diagnostics if it turns out to be a
+                // reserved lifecycle hook: it is not part of the contract, so an
+                // unsupported spelling in it is not a contract defect.
+                const int diagMark = g_unsupported.size();
                 if (parseMethodLine(decl, md)) {
                     // LogosModuleContext lifecycle hooks / context accessors are
                     // framework plumbing, not part of the module's API contract.
@@ -731,6 +980,9 @@ ImplParseResult parseImplHeader(const QString& headerPath,
                     if (!reserved.contains(qs(md.name))) {
                         md.description = joinDocLines(pendingDoc).toStdString();
                         result.module.methods.push_back(md);
+                    } else {
+                        while (g_unsupported.size() > diagMark)
+                            g_unsupported.removeLast();
                     }
                 }
             }
@@ -744,6 +996,49 @@ done:
     // mentions — a header's internal helpers must not become published
     // contract types.
     keepOnlyReferencedRecords(result.module);
+
+    // A C++ spelling with no LIDL type is a BUILD ERROR, not a silent `any`.
+    //
+    // Reported after keepOnlyReferencedRecords so a helper struct that never
+    // reaches the contract cannot fail the build: publishing is what makes a
+    // declaration's type a promise, and an internal struct promises nothing.
+    {
+        std::set<std::string> published;
+        for (const TypeDecl& td : result.module.types) published.insert(td.name);
+
+        QStringList reports;
+        QSet<QString> seen;
+        for (const UnsupportedSpelling& u : g_unsupported) {
+            if (!u.record.isEmpty() && !published.count(u.record.toStdString()))
+                continue;  // struct dropped: not part of the contract
+            QString line = "  " + u.context;
+            // "declared X, whose element Y" only when Y really is nested inside
+            // X — not when the two differ by a `const` and an `&`.
+            if (normalizeCppSpelling(u.declared) != u.offending)
+                line += QString(" is declared `%1`, whose element `%2` has no "
+                                "LIDL type.\n    ").arg(u.declared, u.offending);
+            else
+                line += QString(" is `%1`, which has no LIDL type.\n    ")
+                            .arg(u.offending);
+            line += u.hint;
+            if (seen.contains(line)) continue;
+            seen.insert(line);
+            reports << line;
+        }
+        if (!reports.isEmpty()) {
+            result.error =
+                headerPath + ": " + QString::number(reports.size())
+                + (reports.size() == 1 ? " declaration uses" : " declarations use")
+                + " a C++ type that has no LIDL type.\n\n"
+                + reports.join("\n\n")
+                + "\n\nEach of these used to be published as the opaque `any`, with no "
+                  "diagnostic. `any` is admitted by every backend gate, so the generated "
+                  "dispatch handed the raw JSON straight to the parameter with no decode "
+                  "and no check — the value either converted by luck, threw at call time, "
+                  "or went onto the wire in a form no other language decodes.\n";
+            return result;
+        }
+    }
 
     if (!g_unmappableSpellings.isEmpty()) {
         g_unmappableSpellings.removeDuplicates();

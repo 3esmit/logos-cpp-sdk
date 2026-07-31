@@ -262,7 +262,7 @@ sections:
           - "void SensorModuleImpl::reading(uint64_t id, double value)"
           - "args.push_back(value);"
           - "void SensorModuleImpl::capture(uint64_t id, const std::vector<uint8_t>& frame)"
-          - "args.push_back(lidlBytesToJson(frame));"
+          - "args.push_back(logos::bytesToJson(frame));"
 
   - title: "Flow 3 — LIDL → consumer header"
     step: true

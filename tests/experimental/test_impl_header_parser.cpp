@@ -689,3 +689,244 @@ TEST_F(ImplHeaderParserTest, NestedOptionalCollapsesAndIsReported)
         << errOutput.toStdString();
     EXPECT_TRUE(errOutput.contains("no LIDL type")) << errOutput.toStdString();
 }
+
+// A one-class header written to a temp dir and parsed, for the cases that are
+// about a single declaration rather than a whole fixture module.
+namespace {
+
+QString probeHeader(QTemporaryDir& dir, const QString& body)
+{
+    const QString hp = dir.filePath("probe_impl.h");
+    QFile f(hp);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
+        return QString();
+    f.write(("#pragma once\n"
+             "#include <logos_json.h>\n"
+             "#include <cstdint>\n"
+             "#include <map>\n"
+             "#include <optional>\n"
+             "#include <set>\n"
+             "#include <string>\n"
+             "#include <unordered_map>\n"
+             "#include <utility>\n"
+             "#include <vector>\n"
+             + body).toUtf8());
+    return hp;
+}
+
+} // namespace
+
+// `nlohmann::json` reaches `any` only through the fallback, and `any` is the
+// RIGHT answer for it — test_fullapi_cpp's echoAny / fireAnyEvent / anyEvent
+// are the conformance matrix's `any` cells. Naming it is what lets the fallback
+// become an error without taking them out.
+TEST_F(ImplHeaderParserTest, NlohmannJsonIsAnyByName)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    nlohmann::json echoAny(const nlohmann::json& v);\n"
+        "    bool fireAnyEvent(const nlohmann::json& v);\n"
+        "logos_events:\n"
+        "    void anyEvent(const nlohmann::json& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    ASSERT_EQ(r.module.methods.size(), 2u);
+    EXPECT_EQ(r.module.methods[0].returnType.name, "any");
+    EXPECT_EQ(r.module.methods[0].params[0].type.name, "any");
+    EXPECT_EQ(r.module.methods[1].params[0].type.name, "any");
+    ASSERT_EQ(r.module.events.size(), 1u);
+    EXPECT_EQ(r.module.events[0].params[0].type.name, "any");
+}
+
+// ---------------------------------------------------------------------------
+// A C++ spelling with no LIDL type is a BUILD ERROR, not a silent `any`.
+//
+// cppTypeToLidl used to end with `// Fallback: treat as opaque` -> `any`, and
+// `any` is admitted by every backend gate. So an unrecognised spelling was
+// accepted in silence, published as `any`, and dispatched as a raw
+// `lidlImpl().f(args.at(0))` with no decode and no check.
+// ---------------------------------------------------------------------------
+
+TEST_F(ImplHeaderParserTest, NarrowNumericIsRejectedWithTheWidening)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    int64_t f(uint32_t depth);\n"
+        "};\n");
+    ASSERT_FALSE(hp.isEmpty());
+
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError()) << "uint32_t was admitted as `any`";
+    // Names the declaration, the offending type, and what to write instead.
+    EXPECT_TRUE(r.error.contains("method 'f': parameter 'depth'")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("`uint32_t`")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("`uint64_t`")) << r.error.toStdString();
+}
+
+// The offender may be nested. Report BOTH: the element with no LIDL type, and
+// the declaration that carries it.
+TEST_F(ImplHeaderParserTest, NestedOffenderNamesTheDeclarationToo)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    int64_t f(const std::vector<uint32_t>& instruction);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError());
+    EXPECT_TRUE(r.error.contains("const std::vector<uint32_t>&")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("`uint32_t`")) << r.error.toStdString();
+}
+
+// Each family gets a hint that names a replacement. A diagnostic without one
+// just moves the guesswork.
+TEST_F(ImplHeaderParserTest, EachUnsupportedFamilyNamesItsReplacement)
+{
+    struct Case { const char* decl; const char* mentions; };
+    const Case cases[] = {
+        {"int64_t f(float v);",                                      "`double`"},
+        {"int64_t f(uint8_t v);",                                    "std::vector<uint8_t>"},
+        {"int64_t f(size_t v);",                                     "`uint64_t`"},
+        {"int64_t f(const std::set<std::string>& v);",               "std::vector<T>"},
+        {"int64_t f(const std::pair<std::string, std::string>& v);", "struct"},
+        {"int64_t f(const std::map<int64_t, std::string>& v);",      "`tstr`"},
+    };
+    for (const Case& c : cases) {
+        QTemporaryDir dir;
+        ASSERT_TRUE(dir.isValid());
+        const QString hp = probeHeader(dir,
+            QString("class ProbeImpl {\npublic:\n    %1\n};\n").arg(c.decl));
+        QString e;
+        QTextStream es(&e);
+        auto r = parseImplHeader(hp, "ProbeImpl",
+                                 fixturesDir() + "/sample_metadata.json", es);
+        ASSERT_TRUE(r.hasError()) << c.decl;
+        EXPECT_TRUE(r.error.contains(c.mentions))
+            << c.decl << "\n" << r.error.toStdString();
+    }
+}
+
+// std::unordered_map<std::string, T> is the second C++ spelling of `{tstr: T}`.
+// logos_codec.h has always specialized Codec for it; the parser had not, so it
+// published `any`.
+TEST_F(ImplHeaderParserTest, UnorderedMapIsAStringKeyedMap)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    int64_t f(const std::unordered_map<std::string, std::string>& m);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.methods.size(), 1u);
+    const TypeExpr& t = r.module.methods[0].params[0].type;
+    EXPECT_EQ(t.kind, TypeExpr::Map);
+    ASSERT_EQ(t.elements.size(), 2u);
+    EXPECT_EQ(t.elements[0].name, "tstr");
+    EXPECT_EQ(t.elements[1].name, "tstr");
+}
+
+// ...except in the two slots whose C++ spelling the generator WRITES OUT — a
+// record field's codec and an event's generated body. There it has to pick one
+// container name, and picking the wrong one is a compile error in code the
+// author never wrote. Say so at the declaration instead.
+TEST_F(ImplHeaderParserTest, UnorderedMapIsRejectedWhereTheSpellingIsEmitted)
+{
+    for (const char* body : {
+        "struct Rec {\n"
+        "    std::unordered_map<std::string, std::string> m;\n"
+        "};\n"
+        "class ProbeImpl {\npublic:\n    Rec echo(const Rec& v);\n};\n",
+
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    bool fire();\n"
+        "logos_events:\n"
+        "    void changed(const std::unordered_map<std::string, std::string>& m);\n"
+        "};\n"}) {
+        QTemporaryDir dir;
+        ASSERT_TRUE(dir.isValid());
+        const QString hp = probeHeader(dir, body);
+        QString e;
+        QTextStream es(&e);
+        auto r = parseImplHeader(hp, "ProbeImpl",
+                                 fixturesDir() + "/sample_metadata.json", es);
+        ASSERT_TRUE(r.hasError()) << body;
+        EXPECT_TRUE(r.error.contains("std::map<std::string, T>")) << r.error.toStdString();
+    }
+}
+
+// A helper struct the API never mentions is dropped from the contract, so an
+// unsupported spelling INSIDE it promises nothing and must not fail the build.
+// Publishing is what makes a declaration's type a promise.
+TEST_F(ImplHeaderParserTest, UnreferencedHelperStructDoesNotFailTheBuild)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct PendingAction {\n"
+        "    uint32_t attempts;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    int64_t f(int64_t n);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    EXPECT_TRUE(r.module.types.empty());
+
+    // ...and the same struct DOES fail once a method publishes it.
+    QTemporaryDir dir2;
+    ASSERT_TRUE(dir2.isValid());
+    const QString hp2 = probeHeader(dir2,
+        "struct PendingAction {\n"
+        "    uint32_t attempts;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    PendingAction f(int64_t n);\n"
+        "};\n");
+    QString e2;
+    QTextStream es2(&e2);
+    auto r2 = parseImplHeader(hp2, "ProbeImpl",
+                              fixturesDir() + "/sample_metadata.json", es2);
+    ASSERT_TRUE(r2.hasError());
+    EXPECT_TRUE(r2.error.contains("type 'PendingAction': field 'attempts'"))
+        << r2.error.toStdString();
+}
+
+// The reserved LogosModuleContext hooks are framework plumbing, not contract.
+// They are dropped after parsing, so their spellings are not a contract defect.
+TEST_F(ImplHeaderParserTest, ReservedHookSpellingsAreNotContractDefects)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    void onContextReady(uint32_t generation);\n"
+        "    int64_t f(int64_t n);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.methods.size(), 1u);
+    EXPECT_EQ(r.module.methods[0].name, "f");
+}

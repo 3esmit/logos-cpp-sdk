@@ -82,10 +82,12 @@ TEST(LidlGenCdylib, BinaryEventPayloadUsesCanonicalBytesEncoding)
 
     const QString source = eventsSourceFor(m);
 
-    // The real argument is serialized, through the canonical encoder...
-    EXPECT_TRUE(source.contains("args.push_back(lidlBytesToJson(payload));"));
-    EXPECT_TRUE(source.contains("std::string lidlB64UrlEncode"));
-    EXPECT_TRUE(source.contains("nlohmann::json lidlBytesToJson"));
+    // The real argument is serialized, through THE canonical encoder — the one
+    // in logos-protocol's logos_codec.h, reached via "<module>_types.h". The
+    // sidecar used to emit its own base64 encoder beside this call.
+    EXPECT_TRUE(source.contains("args.push_back(logos::bytesToJson(payload));"));
+    EXPECT_FALSE(source.contains("lidlB64UrlEncode"));
+    EXPECT_FALSE(source.contains("lidlBytesToJson"));
 
     // ...and the empty tagged value is gone.
     EXPECT_FALSE(source.contains("nlohmann::json{{\"_bytes\", \"\"}}"));
@@ -98,22 +100,33 @@ TEST(LidlGenCdylib, BinaryEventPayloadUsesCanonicalBytesEncoding)
     EXPECT_TRUE(source.contains("const std::vector<uint8_t>& payload"));
 }
 
-// The encoder is only needed by modules that actually emit binary payloads.
-// Emitted unconditionally it is an unused static function in every other
-// module's sidecar (-Wunused-function).
-TEST(LidlGenCdylib, BytesEncoderOmittedWhenNoEventCarriesBytes)
+// No module carries a local base64 codec any more — not the ones with binary
+// events and not the ones without. The gate that used to decide which got one
+// is gone with it.
+TEST(LidlGenCdylib, NoModuleEmitsItsOwnBase64Codec)
 {
-    const ModuleDecl m = moduleWithEvent("fault", {
+    const ModuleDecl bytes = moduleWithEvent("messageReceived", {
+        param("payload", prim("bstr")),
+    });
+    const ModuleDecl plain = moduleWithEvent("fault", {
         param("code",    prim("int")),
         param("message", prim("tstr")),
         param("fatal",   prim("bool")),
     });
 
-    const QString source = eventsSourceFor(m);
-
-    EXPECT_FALSE(source.contains("lidlB64UrlEncode"));
-    EXPECT_FALSE(source.contains("lidlBytesToJson"));
-    EXPECT_TRUE(source.contains("args.push_back(code);"));
+    for (const QString& source : {eventsSourceFor(bytes), eventsSourceFor(plain),
+                                  implSourceFor(bytes), implSourceFor(plain)}) {
+        EXPECT_FALSE(source.contains("lidlB64UrlEncode")) << source.toStdString();
+        EXPECT_FALSE(source.contains("lidlB64Idx")) << source.toStdString();
+        EXPECT_FALSE(source.contains("lidlBytesToJson")) << source.toStdString();
+        // The decoder had no call site at all after #117 — emitted into every
+        // module and never once called.
+        EXPECT_FALSE(source.contains("lidlBytesFromJson")) << source.toStdString();
+        EXPECT_FALSE(source.contains(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"))
+            << source.toStdString();
+    }
+    EXPECT_TRUE(eventsSourceFor(plain).contains("args.push_back(code);"));
 }
 
 // The sidecar is compiled into the module's Qt-free cdylib, so a JSON payload
@@ -350,6 +363,16 @@ TypeExpr opt(const TypeExpr& inner)
     return {TypeExpr::Optional, "", {inner}};
 }
 
+TypeExpr arr(const TypeExpr& elem)
+{
+    return {TypeExpr::Array, "", {elem}};
+}
+
+TypeExpr map(const TypeExpr& key, const TypeExpr& value)
+{
+    return {TypeExpr::Map, "", {key, value}};
+}
+
 FieldDecl field(const char* name, const TypeExpr& type)
 {
     FieldDecl f;
@@ -473,7 +496,10 @@ TEST(LidlGenCdylib, OptionalArgumentMayBeAbsentOrNull)
                                 param("maybe", opt(prim("tstr")))}));
 
     const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
-    EXPECT_TRUE(src.contains("if (args.size() < 1) return nullptr;")) << src.toStdString();
+    // The gate counts REQUIRED parameters — the same rule the Rust generator
+    // applies, so the two report the same `expected` for the same contract.
+    EXPECT_TRUE(src.contains("if (args.size() < 1) {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("\"expected 1 arguments, got \"")) << src.toStdString();
     EXPECT_TRUE(src.contains("(args.size() > 1 ? args.at(1) : nlohmann::json())"))
         << src.toStdString();
     EXPECT_TRUE(src.contains("logos::fromJson<std::optional<std::string>>"))
@@ -483,8 +509,12 @@ TEST(LidlGenCdylib, OptionalArgumentMayBeAbsentOrNull)
         << src.toStdString();
 }
 
-// ...and a method with no optional parameter emits the gate it always did.
-TEST(LidlGenCdylib, RequiredOnlyArityGateIsUnchanged)
+// A wrong argument COUNT is reported, in the shape logos-rust-sdk's
+// args::invalid_args() emits — same three keys, same message text, same origin.
+// It used to `return nullptr`, which the Qt glue turns into an empty QVariant:
+// "you passed 1 of 2 arguments" was indistinguishable from a successful empty
+// answer.
+TEST(LidlGenCdylib, WrongArgumentCountReportsInvalidArgs)
 {
     ModuleDecl m;
     m.name = "o_module";
@@ -492,8 +522,30 @@ TEST(LidlGenCdylib, RequiredOnlyArityGateIsUnchanged)
                                {param("a", prim("tstr")), param("b", prim("tstr"))}));
 
     const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
-    EXPECT_TRUE(src.contains("if (args.size() < 2) return nullptr;")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (args.size() < 2) {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("{\"code\", \"invalid_args\"}")) << src.toStdString();
+    EXPECT_TRUE(src.contains(
+        "{\"message\", \"expected 2 arguments, got \" + std::to_string(args.size())}"))
+        << src.toStdString();
+    EXPECT_TRUE(src.contains("{\"origin\", \"o_module\"}")) << src.toStdString();
+    EXPECT_TRUE(src.contains("return lidlStrdup(err.dump());")) << src.toStdString();
+    // The silent reply is gone from the arity path.
+    EXPECT_FALSE(src.contains("if (args.size() < 2) return nullptr;")) << src.toStdString();
     EXPECT_FALSE(src.contains("args.size() > ")) << src.toStdString();
+}
+
+// `args.size()` is unsigned, so `< 0` never fires: a zero-argument method
+// carried a dead branch. The Rust generator has always skipped it; now both do.
+TEST(LidlGenCdylib, ZeroArgumentMethodEmitsNoArityGate)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("ping", prim("tstr"), {}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_FALSE(src.contains("args.size() < 0")) << src.toStdString();
+    EXPECT_FALSE(src.contains("invalid_args")) << src.toStdString();
+    EXPECT_TRUE(src.contains("lidlImpl().ping()")) << src.toStdString();
 }
 
 // R4. Optional widens the accepted domain by exactly ONE inhabitant (empty); a
@@ -553,4 +605,44 @@ TEST(LidlGenCdylib, OptionalEventParamIsConstRefAndNullWhenEmpty)
     EXPECT_TRUE(src.contains("args.push_back(logos::toJson<std::optional<std::string>>(instance));"))
         << src.toStdString();
     EXPECT_TRUE(src.contains("#include <optional>")) << src.toStdString();
+}
+
+// `{tstr: T}` is the one LIDL type with two C++ spellings (std::map and
+// std::unordered_map), and logos_codec.h specializes Codec for both. Naming one
+// of them in the generated dispatch made the other a compile error in code the
+// author never wrote, so the map slots hand the compiler a proxy / deduce
+// instead and let the author's declaration pick.
+TEST(LidlGenCdylib, TypedMapBindsTheAuthorsOwnContainer)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("echoIntMap", map(prim("tstr"), prim("int")),
+                               {param("v", map(prim("tstr"), prim("int")))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("logos::JsonArg(args.at(0), \"arg0\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("logos::toJson(result)")) << src.toStdString();
+    EXPECT_FALSE(src.contains("logos::fromJson<std::map<std::string, int64_t>>"))
+        << src.toStdString();
+    EXPECT_FALSE(src.contains("logos::toJson<std::map<std::string, int64_t>>"))
+        << src.toStdString();
+}
+
+// ...and only maps. Every other type has one C++ spelling here, and JsonArg
+// documents one target it cannot serve — std::optional<X>, whose converting
+// constructor out-ranks the proxy's conversion operator, so an empty optional
+// would decode as a wrong-typed X and throw.
+TEST(LidlGenCdylib, NonMapSlotsStillNameTheirType)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("f", prim("bool"),
+                               {param("a", arr(prim("int"))),
+                                param("b", opt(map(prim("tstr"), prim("tstr"))))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("logos::fromJson<std::vector<int64_t>>")) << src.toStdString();
+    EXPECT_TRUE(src.contains("logos::fromJson<std::optional<std::map<std::string, std::string>>>"))
+        << src.toStdString();
+    EXPECT_FALSE(src.contains("logos::JsonArg")) << src.toStdString();
 }
