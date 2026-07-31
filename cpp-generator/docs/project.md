@@ -7,9 +7,10 @@ cpp-generator/
 ├── main.cpp                        # Entry point — dispatches to legacy or experimental
 ├── CMakeLists.txt                  # Build config
 ├── compile.sh                      # Standalone build script
+├── metadata_dependencies.h         # What a metadata.json `dependencies[]` array declares
 ├── legacy/                         # Original generator (unchanged from master)
 │   ├── main.cpp                    # legacy_main() — plugin/metadata/provider-header modes
-│   ├── generator_lib.h/cpp         # Shared utilities, type mapping, header parser
+│   ├── generator_lib.h/cpp         # Shared utilities, type mapping, header parser, umbrella emission
 │   └── legacy_main.h              # Forward declaration
 ├── experimental/                   # C++/Qt-specific generator backends
 │   ├── lidl_compat.h              # Bridges the backends onto logos-lidl's std AST
@@ -148,11 +149,24 @@ struct LogosModules {
 
 Only the modules explicitly listed as dependencies are exposed. The runtime's `core_manager` is intentionally NOT in `LogosModules` — apps that need to manage the core do so via liblogos' C API, not via a typed RPC wrapper.
 
+A `dependencies[]` element is either a bare name or an object carrying that name alongside the constraints an installer resolves it by — the two declare the same dependency and generate the same code:
+
+```json
+"dependencies": [
+    "dep_a",
+    { "name": "dep_b", "version": "=1.2.3" },
+    { "name": "dep_c", "version": "^2.0", "signer": "did:jwk:abc" }
+]
+```
+
+Read the array through `dependencyNames()` (`metadata_dependencies.h`) rather than element by element. The umbrella is emitted by several passes over the same array — includes, constructor initialisers, members — and a pass that decides on its own what an element names can decide differently from its neighbours, yielding a member whose type was never included. That aggregate no longer compiles, and nothing catches it until a module builds against it. One reader, one answer.
+
 `ApiStyle` enum + new helpers in `generator_lib`:
 
 - `enum class ApiStyle { Qt, Lp }` — passed to every wrapper-emitting function.
 - File-local `mapParamTypeStd` / `mapReturnTypeStd` — the std-side type-mapping table the `lp` surface exposes. Hidden from `generator_lib.h` (not part of the public surface).
 - `makeHeader(moduleName, className, methods, apiStyle, events)` / `makeSource(moduleName, className, headerBaseName, methods, apiStyle, events)` — single entry points that branch on `apiStyle` internally to emit the right include block, signature shape, and conversion bridges. `events` is loaded from a `<name>.lidl` sidecar via `--events-from`; when non-empty, the wrapper also gets one typed `on<EventName>(callback)` adapter per declared event (callback arg types follow `apiStyle`).
+- `makeUmbrellaHeaderFromDeps(deps, interfaceNames, apiStyle, originName)` / `makeUmbrellaSourceFromDeps(deps, interfaceNames)` — the `logos_sdk.{h,cpp}` aggregate above. They return the text; `legacy/main.cpp`'s `writeUmbrella*FromDeps` write it. That split is what lets the aggregate be asserted on directly, without a filesystem.
 
 Flag plumbing:
 
@@ -162,7 +176,7 @@ Flag plumbing:
 
 ### Provider Generation (logos-qt-generator)
 
-> The Qt provider glue (`lidl_gen_provider.{h,cpp}`) is emitted by **logos-qt-sdk's `logos-qt-generator`**, not this binary — it consumes the same `logos-lidl` frontend (+ the shared `lidl_emit_common` / `impl_header_parser` / `lidl_compat.h` helpers, distributed under `share/lidl-frontend`). Documented here for reference.
+> The Qt provider glue (`lidl_gen_provider.{h,cpp}`) is emitted by **logos-qt-sdk's `logos-qt-generator`**, not this binary — it consumes the same `logos-lidl` frontend (+ the shared `lidl_emit_common` / `impl_header_parser` / `lidl_compat.h` / `metadata_dependencies.h` helpers, distributed under `share/lidl-frontend`). Documented here for reference. Adding a header to what `impl_header_parser.cpp` includes means adding it to that install list too (`nix/bin.nix`) — the qt-generator compiles that source out of the installed directory, so a header left behind breaks its build, not ours.
 
 - `lidlMakeProviderHeader(ModuleDecl, implClass, implHeader)` — generates Qt glue header
   - Emits `nlohmannToQVariant()` helper when any method has `jsonReturn = true`
@@ -247,7 +261,7 @@ The generator binary is available as `logos-cpp-generator` in module build envir
 
 ## Testing
 
-Tests are in `tests/experimental/`:
+The backends are tested in `tests/experimental/`, the legacy emitters in `tests/generator/`:
 
 ```bash
 ws test logos-cpp-sdk      # runs all tests including experimental
@@ -264,9 +278,16 @@ The frontend tests (lexer/parser/validator/serializer) moved to the **logos-lidl
 
 (The lexer/parser/AST/serializer/validator round-trip + description tests live in logos-lidl's own `tests/test_lidl.cpp`.)
 
+In `tests/generator/`, alongside the wrapper-emitter tests:
+
+| Test file | What it tests |
+|-----------|---------------|
+| `test_make_umbrella.cpp` | The `LogosModules` aggregate: both dependency forms on both API styles, that every member's type is included, dropped nameless entries, empty deps |
+
 Fixture files in `tests/experimental/fixtures/`:
 - `sample_impl.h` — module with all supported type variations
 - `sample_metadata.json` — metadata with dependencies
+- `object_deps_metadata.json` — dependencies declared in both forms, with resolution constraints
 - `complex_impl.h` — module with multiple access specifier sections
 - `empty_class_impl.h` — class with no public methods
 - `empty_metadata.json` — minimal metadata
