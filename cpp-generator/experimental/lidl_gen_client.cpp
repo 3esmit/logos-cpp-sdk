@@ -249,19 +249,6 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "    using EventCallback = std::function<void(const QVariantList&)>;\n\n";
     s << "    bool on(const QString& eventName, RawEventCallback callback);\n";
     s << "    bool on(const QString& eventName, EventCallback callback);\n";
-    s << "    void setEventSource(LogosObject* source);\n";
-    s << "    LogosObject* eventSource() const;\n";
-    s << "    void trigger(const QString& eventName);\n";
-    s << "    void trigger(const QString& eventName, const QVariantList& data);\n";
-    s << "    template<typename... Args>\n";
-    s << "    void trigger(const QString& eventName, Args&&... args) {\n";
-    s << "        trigger(eventName, packVariantList(std::forward<Args>(args)...));\n";
-    s << "    }\n";
-    s << "    void trigger(const QString& eventName, LogosObject* source, const QVariantList& data);\n";
-    s << "    template<typename... Args>\n";
-    s << "    void trigger(const QString& eventName, LogosObject* source, Args&&... args) {\n";
-    s << "        trigger(eventName, source, packVariantList(std::forward<Args>(args)...));\n";
-    s << "    }\n\n";
 
     for (const MethodDecl& md : module.methods) {
         QString ret = lidlTypeToQt(md.returnType);
@@ -300,7 +287,6 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "    LogosAPIClient* m_client;\n";
     s << "    QString m_moduleName;\n";
     s << "    LogosObject* m_eventReplica = nullptr;\n";
-    s << "    LogosObject* m_eventSource = nullptr;\n";
     s << "};\n";
 
     return h;
@@ -356,19 +342,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
     s << "    return on(eventName, [callback](const QString&, const QVariantList& data) { callback(data); });\n";
     s << "}\n\n";
 
-    s << "void " << className << "::setEventSource(LogosObject* source) { m_eventSource = source; }\n\n";
-    s << "LogosObject* " << className << "::eventSource() const { return m_eventSource; }\n\n";
-    s << "void " << className << "::trigger(const QString& eventName) { trigger(eventName, QVariantList{}); }\n\n";
 
-    s << "void " << className << "::trigger(const QString& eventName, const QVariantList& data) {\n";
-    s << "    if (!m_eventSource) { qWarning() << \"" << className << ": no event source set for trigger\" << eventName; return; }\n";
-    s << "    m_client->onEventResponse(m_eventSource, eventName, data);\n";
-    s << "}\n\n";
-
-    s << "void " << className << "::trigger(const QString& eventName, LogosObject* source, const QVariantList& data) {\n";
-    s << "    if (!source) { qWarning() << \"" << className << ": cannot trigger\" << eventName << \"with null source\"; return; }\n";
-    s << "    m_client->onEventResponse(source, eventName, data);\n";
-    s << "}\n\n";
 
     for (const MethodDecl& md : module.methods) {
         QString ret = lidlTypeToQt(md.returnType);

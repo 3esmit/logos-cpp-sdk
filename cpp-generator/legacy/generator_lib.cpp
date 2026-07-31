@@ -482,24 +482,12 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     } else {
         s << "    explicit " << className << "(LogosAPI* api);\n\n";
     }
-    // Event subscription / trigger surface — Qt-typed.
+    // Event subscription surface — Qt-typed. Receive-side only: a consumer
+    // wrapper subscribes, it does not source events.
     s << "    using RawEventCallback = std::function<void(const QString&, const QVariantList&)>;\n";
     s << "    using EventCallback = std::function<void(const QVariantList&)>;\n\n";
     s << "    bool on(const QString& eventName, RawEventCallback callback);\n";
     s << "    bool on(const QString& eventName, EventCallback callback);\n";
-    s << "    void setEventSource(LogosObject* source);\n";
-    s << "    LogosObject* eventSource() const;\n";
-    s << "    void trigger(const QString& eventName);\n";
-    s << "    void trigger(const QString& eventName, const QVariantList& data);\n";
-    s << "    template<typename... Args>\n";
-    s << "    void trigger(const QString& eventName, Args&&... args) {\n";
-    s << "        trigger(eventName, packVariantList(std::forward<Args>(args)...));\n";
-    s << "    }\n";
-    s << "    void trigger(const QString& eventName, LogosObject* source, const QVariantList& data);\n";
-    s << "    template<typename... Args>\n";
-    s << "    void trigger(const QString& eventName, LogosObject* source, Args&&... args) {\n";
-    s << "        trigger(eventName, source, packVariantList(std::forward<Args>(args)...));\n";
-    s << "    }\n\n";
     // Typed event subscribers — generated from the `.lidl` sidecar shipped
     // with the dep's pre-built headers (via --events-from). One typed
     // adapter per declared event, callback-arg types follow apiStyle.
@@ -594,7 +582,6 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     s << "    LogosAPIClient* m_client;\n";
     s << "    QString m_moduleName;\n";
     s << "    LogosObject* m_eventReplica = nullptr;\n";
-    s << "    LogosObject* m_eventSource = nullptr;\n";
     s << "};\n";
     return h;
 }
@@ -658,29 +645,6 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
     s << "    return on(eventName, [callback](const QString&, const QVariantList& data) {\n";
     s << "        callback(data);\n";
     s << "    });\n";
-    s << "}\n\n";
-    s << "void " << className << "::setEventSource(LogosObject* source) {\n";
-    s << "    m_eventSource = source;\n";
-    s << "}\n\n";
-    s << "LogosObject* " << className << "::eventSource() const {\n";
-    s << "    return m_eventSource;\n";
-    s << "}\n\n";
-    s << "void " << className << "::trigger(const QString& eventName) {\n";
-    s << "    trigger(eventName, QVariantList{});\n";
-    s << "}\n\n";
-    s << "void " << className << "::trigger(const QString& eventName, const QVariantList& data) {\n";
-    s << "    if (!m_eventSource) {\n";
-    s << "        qWarning() << \"" << className << ": no event source set for trigger\" << eventName;\n";
-    s << "        return;\n";
-    s << "    }\n";
-    s << "    m_client->onEventResponse(m_eventSource, eventName, data);\n";
-    s << "}\n\n";
-    s << "void " << className << "::trigger(const QString& eventName, LogosObject* source, const QVariantList& data) {\n";
-    s << "    if (!source) {\n";
-    s << "        qWarning() << \"" << className << ": cannot trigger\" << eventName << \"with null source\";\n";
-    s << "        return;\n";
-    s << "    }\n";
-    s << "    m_client->onEventResponse(source, eventName, data);\n";
     s << "}\n\n";
 
     // Typed event adapters — one per declared event. The callback type

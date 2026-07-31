@@ -84,8 +84,25 @@ TEST(LidlGenClient, HeaderHasEventMethods)
     auto m = makeTestModule();
     QString h = lidlMakeHeader(m);
     EXPECT_TRUE(h.contains("bool on(const QString& eventName"));
-    EXPECT_TRUE(h.contains("void trigger(const QString& eventName"));
-    EXPECT_TRUE(h.contains("void setEventSource(LogosObject* source)"));
+}
+
+// setEventSource / eventSource / trigger used to be emitted here: an
+// author-facing way to SOURCE events through a CONSUMER wrapper. They had zero
+// callers anywhere in the workspace, including the vendored SDK copies, and the
+// generated code never used them either — m_eventSource was written only by its
+// own setter and read only by trigger, so a trigger() call without a prior
+// setEventSource() just warned and returned.
+//
+// Removing them also removes the reason a Qt wrapper had to keep a
+// LogosAPIClient alongside the lp client: onEventResponse was the only lp-less
+// call left. Pinned so the surface does not quietly reappear.
+TEST(LidlGenClient, NoDeadEventSourceSurface)
+{
+    auto m = makeTestModule();
+    QString h = lidlMakeHeader(m);
+    EXPECT_FALSE(h.contains("setEventSource")) << h.toStdString();
+    EXPECT_FALSE(h.contains("m_eventSource")) << h.toStdString();
+    EXPECT_FALSE(h.contains("trigger(")) << h.toStdString();
 }
 
 TEST(LidlGenClient, HeaderHasIncludes)
@@ -139,7 +156,6 @@ TEST(LidlGenClient, SourceHasEventBoilerplate)
     auto m = makeTestModule();
     QString s = lidlMakeSource(m);
     EXPECT_TRUE(s.contains("WalletModule::on(const QString& eventName"));
-    EXPECT_TRUE(s.contains("WalletModule::trigger(const QString& eventName"));
     EXPECT_TRUE(s.contains("ensureReplica()"));
 }
 
