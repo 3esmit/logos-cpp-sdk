@@ -11,6 +11,7 @@ cpp-generator/
 ├── legacy/                         # Original generator (unchanged from master)
 │   ├── main.cpp                    # legacy_main() — plugin/metadata/provider-header modes
 │   ├── generator_lib.h/cpp         # Shared utilities, type mapping, header parser, umbrella emission
+│   ├── lidl_to_json.h/cpp         # ModuleDecl → the JSON surface generator_lib consumes
 │   └── legacy_main.h              # Forward declaration
 ├── experimental/                   # C++/Qt-specific generator backends
 │   ├── lidl_compat.h              # Bridges the backends onto logos-lidl's std AST
@@ -105,7 +106,9 @@ Per surface:
 |---|---|---|
 | cdylib / std (`lidlTypeToStd`, `lidl_gen_cdylib`) | `std::optional<T>` | encoded by logos-protocol's `Codec<std::optional<T>>`; key omission is the record emitter's job (a codec never sees the slot) |
 | `?any` / `?{tstr: any}` / `?[any]` | `LogosMap` / `LogosList` | collapses: `nlohmann::json` already carries `null`, so wrapping it would make the slot three-state |
-| Qt (`lidlTypeToQt`) | `QVariant` | two-state (an invalid QVariant is Qt's empty inhabitant) but **untyped** — see Known Limitations |
+| Qt (`lidlTypeToQt`, `lidl_gen_client`) | `QVariant` | two-state (an invalid QVariant is Qt's empty inhabitant) but **untyped** — Qt has no optional template |
+| legacy consumer, record **field** (`lidl_to_json` + `generator_lib`) | `QVariant` (Qt) / `std::optional<T>` (Lp) | same answer as the client-stub and cdylib backends respectively; the alias collapse above applies on Lp |
+| legacy consumer, **positional** slot (param, return, event param) | `QVariant` (Qt) / `LogosMap` (Lp) | still flattened — see Known Limitations |
 | header-first (`impl_header_parser`) | `std::optional<T>` ↔ `?T` | `std::optional<std::optional<T>>` has no LIDL type; it collapses to `?T` and is reported on stderr |
 
 ### Client stubs (`lidl_gen_client.h/cpp`)
@@ -305,17 +308,23 @@ Fixture files in `tests/experimental/fixtures/`:
 - LIDL does not support generic/parameterized types or inheritance
 - `--from-header` emits the **cdylib** backend here (the `qt` glue backend moved to logos-qt-generator); the **Rust** backend lives in logos-rust-sdk's `lidl-gen`, generating over logos-lidl's C ABI
 - Client stub generation (`lidlMakeHeader`/`lidlMakeSource`) is only available from LIDL files, not from `--from-header`
-- **Optionality is untyped on the Qt/Lp consumer surface.** The consumer wrappers real
-  modules get come from `legacy/main.cpp` → `generateInterfaceWrappers` → `generator_lib`,
-  and the AST is flattened to a single Qt **type-name string** per slot at
-  `moduleMethodsToJson` / `moduleRecordsToJson` / `moduleEventsToJson` — a boundary that
-  optionality (like nesting, map key types and descriptions) cannot cross. `?T` therefore
-  arrives as `QVariant`: the right *shape* (an invalid QVariant is Qt's empty inhabitant,
-  and the wire's `null` becomes exactly that) with no *type*, so a consumer gets no
-  compile-time check and cannot tell `?tstr` from `?uint` or recover a `?Record`'s struct.
-  Carrying it further means widening that JSON surface with a per-slot optional flag and
-  teaching both the Qt and Lp emitters to honour it. Until then the generator prints a
-  `Note:` naming every flattened slot, so an affected build is never silent.
+- **Optionality is still untyped in *positional* slots on the legacy consumer path.** The
+  consumer wrappers real modules get come from `legacy/main.cpp` →
+  `generateInterfaceWrappers` → `lidl_to_json` → `generator_lib`, and that JSON boundary
+  carries a single Qt **type-name string** per slot. Record *fields* now carry an
+  `optional` flag alongside the value type, so both LIDL spellings emit identical, typed
+  code (`QVariant` on Qt, `std::optional<T>` on Lp). A **method parameter, a return type
+  and an event parameter still do not**: they arrive as `QVariant` (Qt) / `LogosMap` (Lp)
+  — the right *shape* (an invalid QVariant / a JSON `null` is the empty inhabitant) with
+  no *type*, so a caller gets no compile-time check and cannot tell `?tstr` from `?uint`
+  or recover a `?Record`'s struct. There is no spelling divergence there — a positional
+  slot has no name to hang a flag on, so it only ever had the type-kind form — and closing
+  it changes generated method **signatures**, i.e. a source break for every existing call
+  site. Until then the generator prints a `Note:` naming every still-flattened slot, so an
+  affected build is never silent. `OptionalSpellings.PositionalSlotsAreStillFlattened`
+  pins the current behaviour so closing the gap is a deliberate change.
+- **Nesting, map key types and descriptions still do not cross that boundary either** —
+  the flag added for optionality is per-field, not a general widening.
 - `lidlRecordCollidesWithBytesTag` reads *through* an optional (via `fieldValueType`), so a
   single-`_bytes`-field record is refused under both spellings. It used to read `f.type`,
   which refused `? _bytes: tstr` and let `_bytes: ?tstr` through — the same declaration,

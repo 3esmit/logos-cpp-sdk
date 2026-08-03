@@ -19,7 +19,7 @@
 #include "metadata_dependencies.h"
 #include "../experimental/lidl_compat.h"
 #include "../experimental/impl_header_parser.h"
-#include "../experimental/lidl_emit_common.h"   // lidlTypeToQt — the one Qt type mapper
+#include "lidl_to_json.h"   // ModuleDecl -> the JSON surface generator_lib consumes
 
 // Escape a string for safe embedding inside a generated C++ string literal.
 static QString cppStringEscape(const QString& s)
@@ -30,73 +30,6 @@ static QString cppStringEscape(const QString& s)
     out.replace('\n', "\\n");
     return out;
 }
-
-// Convert a TypeExpr → Qt-typed string name (same surface the
-// metaobject-introspection path produces for methods, so generator_lib
-// can consume both via one code path).
-//
-// ONE Qt type mapper. This used to be a near-duplicate of `lidlTypeToQt`
-// (experimental/lidl_emit_common.cpp) and the two disagreed: this copy had no
-// `void` case, so a `-> void` method reaching it as Primitive("void") from the
-// impl-header parser fell through to QVariant and generated
-// `QVariant doVoid(...)`. (The .lidl parser spells the same thing
-// Named("void"), which survived only by accident — mapReturnType's
-// `base == "void"` early-out.) The lp/std tables are DERIVED from this name, so
-// the same bug produced `LogosMap doVoid(...)` on the Qt-free surface: not a
-// Qt-only defect, a front-end one. It is now a delegation, so there is one
-// table to disagree with.
-static QString lidlTypeExprToQtTypeName(const TypeExpr& te)
-{
-    return lidlTypeToQt(te);
-}
-
-// Report every optional slot this path is about to flatten.
-//
-// THE BOUNDARY. Everything below (moduleMethodsToJson / moduleRecordsToJson /
-// moduleEventsToJson -> generator_lib) consumes a single Qt TYPE-NAME STRING per
-// slot. A TypeExpr's optionality — like its nesting, its map key type and its
-// descriptions — does not survive being turned into a name, and Qt has no name
-// to survive as: there is no metatype for an optional, so the mapper answers
-// QVariant (see lidlTypeToQt).
-//
-// That leaves a Qt/Lp consumer of an optional slot with the right SHAPE and no
-// TYPE: an invalid QVariant is Qt's empty inhabitant, so two-stateness survives,
-// but the consumer gets no compile-time check on the value and cannot tell
-// `?tstr` from `?uint` or recover a `?Record`'s struct. Carrying optionality
-// past this point means widening the JSON surface these three functions produce
-// and teaching generator_lib a per-slot optional flag on both the Qt and Lp
-// emitters — real work, and not what this change is.
-//
-// So it stays flattened, and says so. Silence here is what made the gap easy to
-// miss in the first place; a build that generates a Qt consumer for an optional
-// contract should not look like a build that had nothing to lose.
-static void noteOptionalFlattened(const ModuleDecl& mod, const QString& where,
-                                  QTextStream& err)
-{
-    QStringList optSlots;
-    for (const TypeDecl& td : mod.types)
-        for (const FieldDecl& fd : td.fields)
-            if (fieldIsOptional(fd))
-                optSlots << (qs(td.name) + "." + qs(fd.name));
-    for (const MethodDecl& md : mod.methods) {
-        for (const ParamDecl& pd : md.params)
-            if (paramIsOptional(pd))
-                optSlots << (qs(md.name) + "(" + qs(pd.name) + ")");
-        if (typeIsOptional(md.returnType))
-            optSlots << (qs(md.name) + "() return");
-    }
-    for (const EventDecl& ed : mod.events)
-        for (const ParamDecl& pd : ed.params)
-            if (paramIsOptional(pd))
-                optSlots << (qs(ed.name) + "(" + qs(pd.name) + ")");
-    if (optSlots.isEmpty()) return;
-    err << "Note: " << where << ": optional slot(s) [" << optSlots.join(", ")
-        << "] are generated as untyped QVariant. The Qt/Lp consumer surface has "
-           "no optional type, so `?T` keeps its two states (an invalid QVariant "
-           "is the empty one) but loses T.\n";
-}
-
-static QJsonArray moduleRecordsToJson(const ModuleDecl& mod);
 
 // Load events from a `.lidl` sidecar shipped alongside a module's
 // pre-built headers. Returns a JSON array of
@@ -122,22 +55,9 @@ static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err,
         return result;
     }
 
-    noteOptionalFlattened(pr.module, lidlPath, err);
+    noteOptionalPositionalSlots(pr.module, lidlPath, err);
     if (outRecords) *outRecords = moduleRecordsToJson(pr.module);
-    for (const EventDecl& ed : pr.module.events) {
-        QJsonObject obj;
-        obj["name"] = qs(ed.name);
-        QJsonArray params;
-        for (const ParamDecl& pd : ed.params) {
-            QJsonObject p;
-            p["name"] = qs(pd.name);
-            p["type"] = lidlTypeExprToQtTypeName(pd.type);
-            params.append(p);
-        }
-        obj["params"] = params;
-        result.append(obj);
-    }
-    return result;
+    return moduleEventsToJson(pr.module);
 }
 
 // ── Dependency interfaces ───────────────────────────────────────────────────
@@ -190,72 +110,6 @@ static QVector<InterfaceSpec> parseSpecFlags(const QStringList& args, const QStr
         specs.append(spec);
     }
     return specs;
-}
-
-// Build a getMethods()-shaped QJsonArray (the surface makeHeader/makeSource
-// consume) from a parsed ModuleDecl. Every interface method is invokable.
-static QJsonArray moduleMethodsToJson(const ModuleDecl& mod)
-{
-    QJsonArray arr;
-    for (const MethodDecl& m : mod.methods) {
-        QJsonObject o;
-        o["name"] = qs(m.name);
-        o["returnType"] = lidlTypeExprToQtTypeName(m.returnType);
-        o["isInvokable"] = true;
-        QJsonArray params;
-        for (const ParamDecl& p : m.params) {
-            QJsonObject po;
-            po["type"] = lidlTypeExprToQtTypeName(p.type);
-            po["name"] = qs(p.name);
-            params.append(po);
-        }
-        o["parameters"] = params;
-        arr.append(o);
-    }
-    return arr;
-}
-
-// Build the records QJsonArray ({ name, fields:[{name,type}] }) from a parsed
-// ModuleDecl — the contract's `type Foo { ... }` declarations, which
-// generator_lib turns into structs nested in the wrapper class.
-static QJsonArray moduleRecordsToJson(const ModuleDecl& mod)
-{
-    QJsonArray arr;
-    for (const TypeDecl& td : mod.types) {
-        QJsonObject o;
-        o["name"] = qs(td.name);
-        QJsonArray fields;
-        for (const FieldDecl& fd : td.fields) {
-            QJsonObject f;
-            f["name"] = qs(fd.name);
-            f["type"] = lidlTypeExprToQtTypeName(fd.type);
-            fields.append(f);
-        }
-        o["fields"] = fields;
-        arr.append(o);
-    }
-    return arr;
-}
-
-// Build the events QJsonArray ({ name, params:[{name,type}] }) — same shape
-// loadEventsFromLidl produces — from a parsed ModuleDecl.
-static QJsonArray moduleEventsToJson(const ModuleDecl& mod)
-{
-    QJsonArray arr;
-    for (const EventDecl& ed : mod.events) {
-        QJsonObject o;
-        o["name"] = qs(ed.name);
-        QJsonArray params;
-        for (const ParamDecl& pd : ed.params) {
-            QJsonObject p;
-            p["name"] = qs(pd.name);
-            p["type"] = lidlTypeExprToQtTypeName(pd.type);
-            params.append(p);
-        }
-        o["params"] = params;
-        arr.append(o);
-    }
-    return arr;
 }
 
 // Parse an interface definition file into a ModuleDecl. `.lidl` parses
@@ -347,7 +201,7 @@ static bool generateInterfaceWrappers(const QVector<InterfaceSpec>& ifaces,
             }
         }
 
-        noteOptionalFlattened(mod, spec.path, err);
+        noteOptionalPositionalSlots(mod, spec.path, err);
 
         const QString className = toPascalCase(spec.name);
         const QJsonArray methods = moduleMethodsToJson(mod);

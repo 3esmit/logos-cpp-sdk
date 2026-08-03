@@ -162,9 +162,19 @@ static QString mapReturnTypeStd(const QString& qtType)
 // `InfoModule::Status` — because one module consuming two deps that each
 // declare `Status` includes both wrappers into the same translation unit.
 //
-// An empty record set leaves every emission path byte-for-byte as it was.
+// A field object carries an optional third key, `"optional"`. It is NOT a type
+// name — it cannot be, because neither surface's type name can express `?T` the
+// same way: Qt has no optional template and the std one does. `"type"` is
+// always the VALUE type (optionality stripped) and `"optional"` says whether the
+// slot may be empty, so the two LIDL spellings of one declaration (`? name: T`
+// and `name: ?T`) arrive here as the same object and leave as the same code.
+// The metaobject-introspection path never sets it; false is the historical
+// behaviour.
+//
+// An empty record set leaves every emission path byte-for-byte as it was, and so
+// does a record set in which nothing is optional.
 
-struct RecordField { QString name; QString type; };
+struct RecordField { QString name; QString type; bool optional = false; };
 struct RecordDef   { QString name; QVector<RecordField> fields; };
 using RecordSet = QVector<RecordDef>;
 
@@ -187,6 +197,7 @@ static RecordSet parseRecords(const QJsonArray& records)
             RecordField f;
             f.name = fo.value("name").toString();
             f.type = fo.value("type").toString();
+            f.optional = fo.value("optional").toBool();
             if (f.name.isEmpty()) continue;
             def.fields.append(f);
         }
@@ -371,6 +382,70 @@ static QString fromWireFor(const QString& qtType, ApiStyle style, const RecordSe
     return toQVariantConversion(mapParamType(qtType), wire);
 }
 
+// ─── Optional record fields ──────────────────────────────────────────────
+//
+// `?T` is TWO-state: a value of T, or empty — never three. Each surface has
+// exactly ONE empty inhabitant to spell that with, and they are different
+// inhabitants, so the two surfaces answer differently:
+//
+//   Qt  — QVariant. Qt has no optional template; an INVALID QVariant is its
+//         empty inhabitant. The value type is lost (a consumer cannot tell
+//         `?tstr` from `?uint`), which is the same answer the experimental
+//         client-stub backend gives for the same surface — see
+//         lidl_gen_client.cpp's lidlFieldTypeQt. Deliberately identical: two
+//         Qt consumer generators disagreeing about one contract is the bug
+//         class this whole change is about.
+//
+//   Lp  — std::optional<T>, so the std surface KEEPS the value type.
+//         std::nullopt is C++'s single empty inhabitant, and the encoder that
+//         pairs with it is logos-protocol's Codec<std::optional<T>>. Same
+//         answer the cdylib backend gives (lidlFieldTypeCdylib).
+//
+// EXCEPT over the untyped-JSON aliases, on the Lp surface only: LogosMap and
+// LogosList are nlohmann::json, and json already has `null` among its
+// inhabitants, so std::optional<LogosMap> would give `?any` TWO empty
+// spellings and make it three-state. `?any` / `?{K:V}` / `?[any]` therefore
+// collapse onto the bare alias — same two states, one C++ type. (Again the
+// cdylib rule, verbatim.)
+static bool lpAliasIsAlreadyNullable(const QString& lpType)
+{
+    return lpType == "LogosMap" || lpType == "LogosList";
+}
+
+// The C++ spelling of a record FIELD. Non-optional fields go through
+// paramTypeFor unchanged, so a contract that declares no optional emits
+// byte-for-byte what it emitted before.
+static QString fieldTypeFor(const RecordField& f, ApiStyle style, const RecordSet& rs)
+{
+    const QString value = paramTypeFor(f.type, style, rs);
+    if (!f.optional) return value;
+    if (style == ApiStyle::Qt) return QStringLiteral("QVariant");
+    if (lpAliasIsAlreadyNullable(value)) return value;
+    return "std::optional<" + value + ">";
+}
+
+// True when some field actually materialises a std::optional on the Lp surface
+// — gates the generated `#include <optional>`, so a contract with no optional
+// (or one whose only optionals are untyped-JSON aliases) keeps its header
+// byte-for-byte unchanged.
+static bool recordsUseStdOptional(const RecordSet& rs)
+{
+    for (const RecordDef& d : rs)
+        for (const RecordField& f : d.fields)
+            if (f.optional && !lpAliasIsAlreadyNullable(paramTypeFor(f.type, ApiStyle::Lp, rs)))
+                return true;
+    return false;
+}
+
+// Whether an optional field is carried in a std::optional (as opposed to an
+// alias that is already nullable, or the Qt surface's QVariant). Decides which
+// encode/decode shape the conversions below emit.
+static bool fieldIsWrappedOptional(const RecordField& f, ApiStyle style, const RecordSet& rs)
+{
+    return f.optional && style == ApiStyle::Lp
+        && !lpAliasIsAlreadyNullable(paramTypeFor(f.type, style, rs));
+}
+
 // The struct declarations, emitted inside the wrapper class.
 static void emitRecordStructs(QTextStream& s, const RecordSet& rs, ApiStyle style)
 {
@@ -379,7 +454,7 @@ static void emitRecordStructs(QTextStream& s, const RecordSet& rs, ApiStyle styl
     for (const RecordDef& d : rs) {
         s << "    struct " << d.name << " {\n";
         for (const RecordField& f : d.fields)
-            s << "        " << paramTypeFor(f.type, style, rs) << " " << f.name << "{};\n";
+            s << "        " << fieldTypeFor(f, style, rs) << " " << f.name << "{};\n";
         s << "    };\n";
     }
     s << "\n";
@@ -409,13 +484,35 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
           << "(const " << qual << d.name << "& v) {\n";
         if (style == ApiStyle::Lp) {
             s << "    nlohmann::json __j = nlohmann::json::object();\n";
-            for (const RecordField& f : d.fields)
+            for (const RecordField& f : d.fields) {
+                if (fieldIsWrappedOptional(f, style, rs)) {
+                    // A record field is a NAMED slot, so empty is spelled by
+                    // OMITTING the key — never by writing null. (A positional
+                    // slot has no key to omit and writes null instead; arity
+                    // must never change.) The round trip is therefore
+                    // canonicalising, not identity: a peer that sent
+                    // `"f": null` gets the key back omitted, and both spellings
+                    // decode to the same single empty state.
+                    s << "    if (v." << f.name << ".has_value()) __j[\"" << f.name << "\"] = "
+                      << toWireFor(f.type, style, rs, "(*v." + f.name + ")") << ";\n";
+                    continue;
+                }
                 s << "    __j[\"" << f.name << "\"] = "
                   << toWireFor(f.type, style, rs, "v." + f.name) << ";\n";
+            }
             s << "    return __j;\n";
         } else {
             s << "    QVariantMap __m;\n";
             for (const RecordField& f : d.fields) {
+                if (f.optional) {
+                    // Same named-slot rule on the Qt surface: an INVALID
+                    // QVariant is empty, and empty omits the key. Inserting it
+                    // would encode `"f": null`, which is the positional
+                    // spelling.
+                    s << "    if (v." << f.name << ".isValid()) __m.insert(QStringLiteral(\""
+                      << f.name << "\"), v." << f.name << ");\n";
+                    continue;
+                }
                 // Qt's surface type IS the wire type for non-record fields, so
                 // fromValue is what puts it in the map; records/containers
                 // already produce a QVariant-compatible value.
@@ -438,6 +535,16 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
             s << "    if (!w.is_object()) return __out;\n";
             for (const RecordField& f : d.fields) {
                 const QString acc = "w.at(\"" + f.name + "\")";
+                if (fieldIsWrappedOptional(f, style, rs)) {
+                    // An absent key and an explicit null are the SAME state on
+                    // decode, so both must leave the field nullopt. Testing
+                    // only `contains` would decode `"f": null` through the
+                    // value conversion and turn empty into a VALUE (0, "").
+                    s << "    if (w.contains(\"" << f.name << "\") && !" << acc
+                      << ".is_null()) __out." << f.name << " = "
+                      << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
+                    continue;
+                }
                 s << "    if (w.contains(\"" << f.name << "\")) __out." << f.name << " = "
                   << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
             }
@@ -445,6 +552,14 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
             s << "    const QVariantMap __m = w.toMap();\n";
             for (const RecordField& f : d.fields) {
                 const QString acc = "__m.value(QStringLiteral(\"" + f.name + "\"))";
+                if (f.optional) {
+                    // Absent and null both arrive as an INVALID QVariant — the
+                    // same state, as the contract requires. Converting (a
+                    // `.toString()` on an optional `tstr`) would have turned
+                    // empty into "", which is a value.
+                    s << "    __out." << f.name << " = " << acc << ";\n";
+                    continue;
+                }
                 s << "    __out." << f.name << " = "
                   << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
             }
@@ -1145,6 +1260,9 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     s << "#include <cstdint>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n";
+    // Only when a field actually materialises one, so a contract with no
+    // optional keeps its header byte-for-byte unchanged.
+    if (recordsUseStdOptional(rs)) s << "#include <optional>\n";
     s << "#include <functional>\n";
     s << "#include <nlohmann/json.hpp>\n";
     s << "#include \"logos_json.h\"\n";
