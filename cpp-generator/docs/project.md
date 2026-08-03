@@ -320,3 +320,16 @@ Fixture files in `tests/experimental/fixtures/`:
   single-`_bytes`-field record is refused under both spellings. It used to read `f.type`,
   which refused `? _bytes: tstr` and let `_bytes: ?tstr` through — the same declaration,
   two answers. `?bstr` is unaffected either way: the tag lives in the value, not the slot.
+- **A provider REJECTION reaches an async consumer callback only as a log line.** A
+  provider that refuses a call answers the canonical
+  `{"code":"dispatch_failed", "message":…, "origin":…}` object as its RESULT, not as a
+  transport error, and the Qt return table would convert it like any other value —
+  erasing it (`_result.toList()` on that map is `[]`). The Qt consumer emitter therefore
+  detects it and folds it into the `logos::CallError` out-parameter the sync wrapper
+  already carries, so `mod.echoUintList(v, &err)` can tell a rejection from an empty
+  return. The generated `…Async` overload has no such channel — its callback is
+  `std::function<void(T)>`, and adding an error parameter would change the generated
+  public surface (which logos-qt-sdk's `qt-generator --backend consumer` veneer mirrors
+  1:1) — so an async rejection is reported with `qWarning` and the callback still
+  receives the default-converted value. Giving async an error channel is an API change,
+  not a code-generation fix.

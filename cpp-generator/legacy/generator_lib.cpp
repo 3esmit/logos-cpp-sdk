@@ -588,20 +588,89 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     return h;
 }
 
+// The Qt consumer's rejection detector, emitted once per generated wrapper.
+//
+// A provider that REJECTS a call answers the canonical
+// {"code":"dispatch_failed", "message":..., "origin":...} object as its RESULT,
+// not as a transport error. Every provider flavour produces the same object
+// (logos-qt-sdk `dispatchFailedVariant`, the generated cdylib dispatch, the Rust
+// provider's `args::dispatch_failed`), and the Qt return table converts it like
+// any other value — which ERASES it: `_result.toList()` on a map is `[]`,
+// `.toString()` is "", `.toLongLong()` is 0. A caller then cannot tell "you sent
+// me the wrong thing" from "the provider returned nothing".
+//
+// Detected here and folded into the logos::CallError out-channel the wrapper
+// already uses to report a failed call, so a rejection reads exactly like every
+// other failure on this surface — no new signature, no new type, and no change
+// to any return value.
+// Guarded because the umbrella (`logos_sdk.cpp`) textually #includes EVERY
+// generated `<dep>_api.cpp`, so a module with more than one dependency puts
+// several of these in ONE translation unit. Internal linkage handles the
+// separate-TU case; only the preprocessor handles this one.
+static void emitDispatchRejectionDetector(QTextStream& s)
+{
+    s << "#ifndef LOGOS_GENERATED_DISPATCH_REJECTION\n";
+    s << "#define LOGOS_GENERATED_DISPATCH_REJECTION\n\n";
+    s << "namespace {\n\n";
+    s << "// True when `v` is the canonical provider REJECTION object rather than a\n";
+    s << "// value; fills `out` with its {code, message, origin} on a match.\n";
+    s << "//\n";
+    s << "// The match is exact — those three fields, all strings, and that code — for the\n";
+    s << "// same reason logos_rpc_status.h's isUnauthorizedSentinel is exact: an `any` or\n";
+    s << "// map return carrying user data must never false-match.\n";
+    s << "bool logosDispatchRejection(const QVariant& v, logos::CallError& out)\n";
+    s << "{\n";
+    s << "    QVariantMap m;\n";
+    s << "    switch (v.userType()) {\n";
+    s << "    case QMetaType::QVariantMap: m = v.toMap(); break;\n";
+    s << "    // Defensive: some json_convert paths historically produced QJsonObject.\n";
+    s << "    case QMetaType::QJsonObject: m = v.toJsonObject().toVariantMap(); break;\n";
+    s << "    default: return false;\n";
+    s << "    }\n";
+    s << "    if (m.size() != 3) return false;\n";
+    s << "    const QVariant code = m.value(QStringLiteral(\"code\"));\n";
+    s << "    const QVariant message = m.value(QStringLiteral(\"message\"));\n";
+    s << "    const QVariant origin = m.value(QStringLiteral(\"origin\"));\n";
+    s << "    if (code.userType() != QMetaType::QString\n";
+    s << "        || message.userType() != QMetaType::QString\n";
+    s << "        || origin.userType() != QMetaType::QString) return false;\n";
+    s << "    if (code.toString() != QStringLiteral(\"dispatch_failed\")) return false;\n";
+    s << "    out.code = code.toString().toStdString();\n";
+    s << "    out.message = message.toString().toStdString();\n";
+    s << "    out.origin = origin.toString().toStdString();\n";
+    s << "    return true;\n";
+    s << "}\n\n";
+    s << "} // namespace\n\n";
+    s << "#endif  // LOGOS_GENERATED_DISPATCH_REJECTION\n\n";
+}
+
 QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
     if (apiStyle == ApiStyle::Lp)
         return makeSourceLp(moduleName, className, headerBaseName, methods, events, bindMode, records);
     const RecordSet rs = parseRecords(records);
+    // The rejection detector is only reachable from a method body, so a
+    // contract with no invokable method must not emit it (an unused function in
+    // an anonymous namespace is a -Wunused-function warning, and such a
+    // contract's wrapper stays byte-identical to what it generated before).
+    bool anyInvokable = false;
+    for (const QJsonValue& mv : methods) {
+        if (mv.toObject().value("isInvokable").toBool()) { anyInvokable = true; break; }
+    }
     QString c;
     QTextStream s(&c);
     s << "#include \"" << headerBaseName << "\"\n\n";
     s << "#include <QDebug>\n";
-    if (!rs.isEmpty()) {
-        // Record conversions build QVariantMaps.
+    if (!rs.isEmpty() || anyInvokable) {
+        // Record conversions build QVariantMaps; so does the rejection detector.
         s << "#include <QVariantMap>\n";
     }
+    if (anyInvokable) {
+        // The rejection detector reads a QJsonObject-shaped result defensively.
+        s << "#include <QJsonObject>\n";
+    }
     s << "\n";
+    if (anyInvokable) emitDispatchRejectionDetector(s);
     emitRecordConversions(s, rs, apiStyle, className);
     // The expression every remote call uses to name its target module.
     // Static: the baked string literal "<moduleName>" (unchanged
@@ -748,13 +817,15 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
 
         // Body: perform call through the err-out overload. When the caller
         // passes a logos::CallError* it can distinguish a failed remote call
-        // (e.g. the bound module is missing) from a legitimately
-        // default-valued result; without it the historical default-on-failure
-        // behavior is kept, now with a warning so failures are at least
-        // visible in the module log.
+        // (e.g. the bound module is missing, or the provider REJECTED the
+        // arguments) from a legitimately default-valued result; without it the
+        // historical default-on-failure behavior is kept, now with a warning so
+        // failures are at least visible in the module log.
+        //
+        // The result is captured even for a `void` return: a void method can be
+        // rejected too, and the rejection object is the only place that says so.
         s << "    logos::CallError _err;\n";
-        if (ret != "void") s << "    QVariant _result = ";
-        else               s << "    ";
+        s << "    QVariant _result = ";
 
         // Wrap each argument in QVariant::fromValue so it becomes exactly ONE
         // element of the args list. A bare `QVariantList{v}` CONCATENATES a
@@ -768,6 +839,11 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             if (i + 1 < params.size()) s << ", ";
         }
         s << "}, Timeout(), &_err);\n";
+        // A provider REJECTION arrives as the result, not as a transport error.
+        // Fold it into the same error channel BEFORE the return table converts
+        // it, or the conversion erases it (a rejected `[uint]` call answered []
+        // — the whole list, not the bad element).
+        s << "    if (_err.ok()) logosDispatchRejection(_result, _err);\n";
         s << "    if (err) *err = _err;\n";
         s << "    else if (!_err.ok()) qWarning() << \"" << className << "::" << name
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
@@ -836,6 +912,13 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             s << "}";
         }
         s << ", [callback](QVariant v) {\n";
+        // The async callback carries the value only — there is no CallError
+        // parameter to fill, and adding one would change the generated public
+        // surface. A rejection is at least made visible in the module log
+        // instead of vanishing into the return conversion below.
+        s << "        { logos::CallError _rej; if (logosDispatchRejection(v, _rej))\n";
+        s << "              qWarning() << \"" << className << "::" << name
+          << "Async: remote call failed:\" << QString::fromStdString(_rej.message); }\n";
         if (ret == "void") {
             s << "        (void)v; callback();\n";
         } else if (retIsRecord) {
