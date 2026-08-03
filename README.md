@@ -203,6 +203,53 @@ logos-cpp-generator --metadata metadata.json --general-only --output-dir ./gener
 
 This approach gives you fine-grained control over which modules to include and allows rebuilding just the umbrella headers without regenerating all module wrappers.
 
+#### The three call surfaces on a generated wrapper
+
+Every LIDL `method foo(...) -> T` produces three entry points:
+
+```cpp
+// 1. sync — optional error out-channel, optional deadline. Both trailing and
+//    defaulted, so `dep.foo(a, b)` and `dep.foo(a, b, &err)` are unchanged.
+T    foo(params…, logos::CallError* err = nullptr, Timeout timeout = Timeout());
+
+// 2. async, value only — the historical form, unchanged.
+void fooAsync(params…, std::function<void(T)> cb, Timeout timeout = Timeout());
+
+// 3. async, value + error.
+void fooAsyncResult(params…, std::function<void(logos::AsyncResult<T>)> cb,
+                    Timeout timeout = Timeout());
+```
+
+Use (3) whenever a default-constructed `T` is also a legal success value — which
+is almost always. `fooAsync` hands the callback a bare `T`, so a failed call and
+a provider that genuinely returned `0` / `""` / `false` are indistinguishable;
+that is exactly the ambiguity the sync form's `CallError*` exists to resolve.
+
+```cpp
+dep.balanceAsyncResult(account, [](logos::AsyncResult<qlonglong> r) {
+    if (!r.ok()) {                       // r.error is {code, message, origin}
+        qWarning() << "balance failed:" << r.error.code.c_str();
+        return;
+    }
+    use(r.value);                        // now known to be a real answer
+});
+```
+
+`logos::AsyncResult<T>` (`logos_async_result.h`) is `{ T value; CallError error; }`
+plus `ok()`; `AsyncResult<void>` carries only the error, so a `void`-returning
+method has the same callback shape as every other one.
+
+The name is deliberately distinct rather than an overload of `fooAsync`: two
+overloads differing only in `std::function<void(T)>` vs
+`std::function<void(AsyncResult<T>)>` are ambiguous for a generic lambda
+(`[](auto v){…}`), which would break existing call sites.
+
+**Qt-free (`--api-style lp`) wrappers** spell the deadline `int timeout_ms = 0`
+(`<= 0` selects the protocol default) because `Timeout` lives in a Qt header,
+and they do **not** yet get `fooAsyncResult` — logos-protocol's
+`lp_invoke_async` does not report the call error to its callback, so an
+`AsyncResult` there would report success on a failed call.
+
 ### Universal modules: LogosModuleContext
 
 Universal (codegen-driven) modules — those built from a `package_xxx_impl.h` header rather than a handcrafted `QObject` plugin — don't see the raw `LogosAPI` at all. Instead, the codegen-generated provider populates a narrow `LogosModuleContext` base class with everything an impl typically needs:

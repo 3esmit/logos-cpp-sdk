@@ -589,6 +589,7 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     s << "#include \"logos_api.h\"\n";
     s << "#include \"logos_api_client.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
+    s << "#include \"logos_async_result.h\"\n";
     s << "#include \"logos_object.h\"\n\n";
     s << "class " << className << " {\n";
     s << "public:\n";
@@ -662,25 +663,56 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         // Optional error out-channel: pass a logos::CallError* to distinguish
         // a failed remote call from a legitimately default-valued result.
         // Existing call sites compile unchanged.
+        //
+        // ...and an optional Timeout AFTER it, so the sync surface can say how
+        // long it is willing to wait. Appending (rather than inserting next to
+        // the value args, where the async overload carries it) keeps every
+        // existing call site source-compatible, including the ones that already
+        // pass `&err` positionally. The transport has taken both since it grew
+        // the error channel — logos_api_client.h's
+        // `invokeRemoteMethod(obj, method, args, Timeout, CallError*)` — and the
+        // generated body simply hard-coded `Timeout()` there.
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err = nullptr);\n";
+        s << "logos::CallError* err = nullptr, Timeout timeout = Timeout());\n";
+
+        // Param list shared by both async entry points.
+        auto emitAsyncParams = [&]() {
+            for (int i = 0; i < params.size(); ++i) {
+                QJsonObject p = params.at(i).toObject();
+                QString qtPt = p.value("type").toString();
+                QString pt = paramTypeFor(qtPt, apiStyle, rs);
+                QString pn = p.value("name").toString();
+                bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
+                if (byRef) s << "const " << pt << "& " << pn;
+                else       s << pt << " " << pn;
+                if (i + 1 < params.size()) s << ", ";
+            }
+            if (params.size() > 0) s << ", ";
+        };
+
         // Async overload: same params + callback + optional Timeout
         QString asyncCallbackType = (ret == "void")
             ? QString("std::function<void()>")
             : QString("std::function<void(") + ret + ")>";
         s << "    void " << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            QJsonObject p = params.at(i).toObject();
-            QString qtPt = p.value("type").toString();
-            QString pt = paramTypeFor(qtPt, apiStyle, rs);
-            QString pn = p.value("name").toString();
-            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
-            if (byRef) s << "const " << pt << "& " << pn;
-            else       s << pt << " " << pn;
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (params.size() > 0) s << ", ";
+        emitAsyncParams();
         s << asyncCallbackType << " callback, Timeout timeout = Timeout());\n";
+
+        // Result-carrying async entry point. The plain `<name>Async` above
+        // hands the callback a bare value, so a failed call is
+        // INDISTINGUISHABLE from a provider that legitimately returned
+        // 0 / "" / false — the exact ambiguity the sync `CallError*` exists to
+        // resolve. This one delivers logos::AsyncResult<T> {value, error}.
+        //
+        // A DISTINCT NAME, not an overload of `<name>Async`: two overloads
+        // differing only in std::function<void(T)> vs
+        // std::function<void(AsyncResult<T>)> are ambiguous for a generic
+        // lambda (`[](auto v){...}` is invocable with either), which would
+        // break existing call sites. A distinct name has zero resolution risk.
+        s << "    void " << name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback"
+          << ", Timeout timeout = Timeout());\n";
     }
     s << "\nprivate:\n";
     // ensureReplica() is needed whenever the wrapper subscribes to events,
@@ -928,7 +960,7 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             if (i + 1 < params.size()) s << ", ";
         }
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err) {\n";
+        s << "logos::CallError* err, Timeout timeout) {\n";
 
         // Body: perform call through the err-out overload. When the caller
         // passes a logos::CallError* it can distinguish a failed remote call
@@ -953,7 +985,11 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
             if (i + 1 < params.size()) s << ", ";
         }
-        s << "}, Timeout(), &_err);\n";
+        // `timeout` — the caller's, defaulted to Timeout() at the declaration —
+        // not a hard-coded Timeout(). This is the overload that carries BOTH
+        // the deadline and the error out-channel; the generator used to call it
+        // with the error and drop the deadline on the floor.
+        s << "}, timeout, &_err);\n";
         // A provider REJECTION arrives as the result, not as a transport error.
         // Fold it into the same error channel BEFORE the return table converts
         // it, or the conversion erases it (a rejected `[uint]` call answered []
@@ -1003,44 +1039,41 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         }
         s << "}\n\n";
 
-        // Async implementation
-        s << "void " << className << "::" << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            bool byRef;
-            emitParam(params.at(i).toObject(), byRef);
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (params.size() > 0) s << ", ";
-        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
-        s << "    if (!callback) return;\n";
-        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
-        if (params.size() == 0) {
-            s << "QVariantList()";
-        } else {
-            // Same one-element-per-arg wrapping as the sync path (see above): a
-            // QVariantList-typed arg must not be spread across the args list.
-            s << "QVariantList{";
+        // Shared pieces of the two async entry points, so `<name>Async` and
+        // `<name>AsyncResult` cannot drift apart in how they marshal args or
+        // decode the reply.
+        auto emitAsyncParams = [&]() {
             for (int i = 0; i < params.size(); ++i) {
-                s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
+                bool byRef;
+                emitParam(params.at(i).toObject(), byRef);
                 if (i + 1 < params.size()) s << ", ";
             }
-            s << "}";
-        }
-        s << ", [callback](QVariant v) {\n";
-        // The async callback carries the value only — there is no CallError
-        // parameter to fill, and adding one would change the generated public
-        // surface. A rejection is at least made visible in the module log
-        // instead of vanishing into the return conversion below.
-        s << "        { logos::CallError _rej; if (logosDispatchRejection(v, _rej))\n";
-        s << "              qWarning() << \"" << className << "::" << name
-          << "Async: remote call failed:\" << QString::fromStdString(_rej.message); }\n";
-        if (ret == "void") {
-            s << "        (void)v; callback();\n";
-        } else if (retIsRecord) {
-            // A record decodes field by field; an invalid QVariant yields a
-            // default-constructed struct, matching the scalar paths.
-            s << "        callback(" << fromWireFor(qtRet, apiStyle, rs, "v", className + "::") << ");\n";
-        } else {
+            if (params.size() > 0) s << ", ";
+        };
+        auto emitAsyncArgs = [&]() {
+            if (params.size() == 0) {
+                s << "QVariantList()";
+            } else {
+                // Same one-element-per-arg wrapping as the sync path (see above): a
+                // QVariantList-typed arg must not be spread across the args list.
+                s << "QVariantList{";
+                for (int i = 0; i < params.size(); ++i) {
+                    s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
+                    if (i + 1 < params.size()) s << ", ";
+                }
+                s << "}";
+            }
+        };
+        // The QVariant -> typed-return expression, given the QVariant's name.
+        // Empty for a void return.
+        auto asyncDecodeExpr = [&](const QString& var) -> QString {
+            if (ret == "void") return QString();
+            if (retIsRecord) {
+                // A record decodes field by field; an invalid QVariant yields a
+                // default-constructed struct, matching the scalar paths.
+                return fromWireFor(qtRet, apiStyle, rs, var, className + "::");
+            }
+            if (ret == "QVariant") return var;
             QString defaultVal;
             if (ret == "bool") defaultVal = "false";
             else if (ret == "int" || ret == "qlonglong" || ret == "qulonglong"
@@ -1051,12 +1084,61 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             else if (ret == "QVariantList") defaultVal = "QVariantList()";
             else if (ret == "QVariantMap") defaultVal = "QVariantMap()";
             else defaultVal = ret + "{}";
-            if (ret == "QVariant") {
-                s << "        callback(v);\n";
-            } else {
-                s << "        callback(v.isValid() ? qvariant_cast<" << ret << ">(v) : " << defaultVal << ");\n";
-            }
-        }
+            return var + ".isValid() ? qvariant_cast<" + ret + ">(" + var + ") : " + defaultVal;
+        };
+
+        // Async implementation
+        s << "void " << className << "::" << name << "Async(";
+        emitAsyncParams();
+        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
+        emitAsyncArgs();
+        // A ONE-argument lambda: it is invocable only as
+        // LogosAPIClient::AsyncResultCallback, so this keeps binding to the
+        // historical value-only overload even though a CallError-aware one
+        // exists next to it.
+        s << ", [callback](QVariant v) {\n";
+        // The value-only async callback has nowhere to put an error — there is
+        // no CallError parameter to fill, and adding one would change the
+        // historical public surface. A rejection is at least made visible in
+        // the module log instead of vanishing into the return conversion below.
+        // `<name>AsyncResult` is the surface that can actually REPORT it.
+        s << "        { logos::CallError _rej; if (logosDispatchRejection(v, _rej))\n";
+        s << "              qWarning() << \"" << className << "::" << name
+          << "Async: remote call failed:\" << QString::fromStdString(_rej.message); }\n";
+        if (ret == "void") s << "        (void)v; callback();\n";
+        else               s << "        callback(" << asyncDecodeExpr("v") << ");\n";
+        s << "    }, timeout);\n";
+        s << "}\n\n";
+
+        // Result-carrying async implementation. Routes to the transport's
+        // CallError-aware async overload (AsyncResultErrorCallback) — a TWO
+        // argument lambda, which is invocable only as that overload, so the
+        // pair above and below resolve unambiguously.
+        //
+        // On failure the value stays default-constructed exactly as
+        // `<name>Async` would have delivered it; what changes is that the
+        // callback can now TELL, via r.error / r.ok().
+        //
+        // That includes a provider REJECTION, which arrives as the RESULT and
+        // not as a transport error: it is folded into `_r.error` exactly as the
+        // sync path folds it into the caller's CallError. `<name>Async` can only
+        // warn about one because its callback has no error slot; this one has,
+        // so a rejected call must NOT report ok() here.
+        s << "void " << className << "::" << name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
+        emitAsyncArgs();
+        s << ", [callback](QVariant v, const logos::CallError& _err) {\n";
+        s << "        logos::AsyncResult<" << ret << "> _r;\n";
+        s << "        _r.error = _err;\n";
+        s << "        if (_r.error.ok()) logosDispatchRejection(v, _r.error);\n";
+        if (ret == "void") s << "        (void)v;\n";
+        else               s << "        _r.value = " << asyncDecodeExpr("v") << ";\n";
+        s << "        callback(_r);\n";
         s << "    }, timeout);\n";
         s << "}\n\n";
     }
@@ -1305,7 +1387,30 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     }
     if (!events.isEmpty()) s << "\n";
 
-    // Methods: sync (with optional CallError out-param) + async overload.
+    // Methods: sync (with optional CallError out-param + timeout) + async
+    // overload.
+    //
+    // TIMEOUTS ARE SPELLED `int timeout_ms`, NOT `Timeout`, on this surface.
+    // `Timeout` lives in logos-protocol's logos_mode.h, which includes <QDebug>
+    // — naming it here would drag Qt into a translation unit whose whole reason
+    // for existing is not to have any. logos::LpClient already spells its
+    // deadlines `int timeout_ms` with the C ABI's rule (`<= 0` selects the
+    // protocol default), and this matches it.
+    //
+    // NO `<name>AsyncResult` HERE — deliberately, for now. The Qt surface gets
+    // one because its transport reports the error
+    // (LogosAPIClient::AsyncResultErrorCallback). This surface's transport does
+    // NOT: logos-protocol's lp_invoke_async (cpp/logos_protocol.cpp) subscribes
+    // with the VALUE-ONLY invokeRemoteMethodAsync overload and unconditionally
+    // calls back `cb(1, json, ...)` — ok is hard-coded to 1 — even though
+    // lp_result_cb is documented as "ok == 0 → `json` is the canonical error
+    // object", and even though its own sync twin lp_invoke does return
+    // LP_ERR_UNAVAILABLE + makeErrorJson. So an AsyncResult emitted here would
+    // report ok() on a failed call to a module that is not loaded: an error
+    // channel that lies is worse than no error channel. (Measured, not assumed:
+    // a wrapper wired to it fires its callback with the default value and an
+    // EMPTY error code.) Once lp_invoke_async reports the error, emitting the
+    // AsyncResult twin here is the same few lines as above.
     for (const QJsonValue& v : methods) {
         const QJsonObject o = v.toObject();
         if (!o.value("isInvokable").toBool()) continue;
@@ -1313,31 +1418,29 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         const QString ret = returnTypeFor(o.value("returnType").toString(), ApiStyle::Lp, rs);
         const QJsonArray params = o.value("parameters").toArray();
 
+        auto emitDeclParams = [&]() {
+            for (int i = 0; i < params.size(); ++i) {
+                const QJsonObject p = params.at(i).toObject();
+                const QString qtPt = p.value("type").toString();
+                const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+                if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
+                else                                     s << pt << " " << p.value("name").toString();
+                if (i + 1 < params.size()) s << ", ";
+            }
+            if (!params.isEmpty()) s << ", ";
+        };
+
         s << "    " << ret << " " << name << "(";
-        for (int i = 0; i < params.size(); ++i) {
-            const QJsonObject p = params.at(i).toObject();
-            const QString qtPt = p.value("type").toString();
-            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
-            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
-            else                                     s << pt << " " << p.value("name").toString();
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err = nullptr);\n";
+        emitDeclParams();
+        // Trailing, defaulted, and in that order — existing call sites,
+        // including ones already passing `&err` positionally, are unaffected.
+        s << "logos::CallError* err = nullptr, int timeout_ms = 0);\n";
 
         const QString asyncCb = (ret == "void")
             ? QString("std::function<void()>")
             : QString("std::function<void(") + ret + ")>";
         s << "    void " << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            const QJsonObject p = params.at(i).toObject();
-            const QString qtPt = p.value("type").toString();
-            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
-            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
-            else                                     s << pt << " " << p.value("name").toString();
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (!params.isEmpty()) s << ", ";
+        emitDeclParams();
         s << asyncCb << " callback);\n";
     }
 
@@ -1430,16 +1533,18 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
             }
         };
 
-        // Sync
+        // Sync — routes the caller's deadline to LpClient::invoke's
+        // `timeout_ms` parameter, which the generated body used to leave at its
+        // default (i.e. silently drop).
         s << retQual << " " << className << "::" << name << "(";
         emitParams();
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err) {\n";
+        s << "logos::CallError* err, int timeout_ms) {\n";
         emitArgsArray();
         if (ret == "void") {
-            s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
+            s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
         } else {
-            s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
+            s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
             s << "    return " << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ";\n";
         }
         s << "}\n\n";
@@ -1462,6 +1567,7 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         }
         s << "    });\n";
         s << "}\n\n";
+        // (No <name>AsyncResult on this surface yet — see makeHeaderLp.)
     }
     return c;
 }

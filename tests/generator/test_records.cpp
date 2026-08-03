@@ -88,7 +88,7 @@ TEST(Records, QtWrapperExposesTheStruct)
     EXPECT_TRUE(h.contains("        QList<Status> items{};"));
     EXPECT_TRUE(h.contains("        QMap<QString, Status> tags{};"));
 
-    EXPECT_TRUE(h.contains("Status getStatus(logos::CallError* err = nullptr);"));
+    EXPECT_TRUE(h.contains("Status getStatus(logos::CallError* err = nullptr, Timeout timeout = Timeout());"));
     EXPECT_TRUE(h.contains("QString describeStatus(const Status& s,"));
     EXPECT_TRUE(h.contains("QList<Status> listStatuses("));
 

@@ -44,7 +44,7 @@ TEST(MakeSourceTest, ZeroParams)
     QJsonArray methods;
     methods.append(makeMethod("doStuff", "int", 0));
     QString src = makeSource("mod", "Mod", "mod.h", methods);
-    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"doStuff\", QVariantList{}, Timeout(), &_err)"));
+    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"doStuff\", QVariantList{}, timeout, &_err)"));
     EXPECT_TRUE(src.contains("return _result.toInt()"));
 }
 
@@ -53,7 +53,7 @@ TEST(MakeSourceTest, OneParam)
     QJsonArray methods;
     methods.append(makeMethod("fn", "bool", 1));
     QString src = makeSource("mod", "Mod", "mod.h", methods);
-    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"fn\", QVariantList{QVariant::fromValue(p0)}, Timeout(), &_err)"));
+    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"fn\", QVariantList{QVariant::fromValue(p0)}, timeout, &_err)"));
     EXPECT_TRUE(src.contains("return _result.toBool()"));
 }
 
@@ -62,7 +62,7 @@ TEST(MakeSourceTest, TwoParams)
     QJsonArray methods;
     methods.append(makeMethod("fn", "void", 2));
     QString src = makeSource("mod", "Mod", "mod.h", methods);
-    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"fn\", QVariantList{QVariant::fromValue(p0), QVariant::fromValue(p1)}, Timeout(), &_err)"));
+    EXPECT_TRUE(src.contains("m_client->invokeRemoteMethod(\"mod\", \"fn\", QVariantList{QVariant::fromValue(p0), QVariant::fromValue(p1)}, timeout, &_err)"));
 }
 
 TEST(MakeSourceTest, ThreeParams)
@@ -121,7 +121,7 @@ TEST(MakeSourceTest, ListArgWrappedAsOneElement)
     methods.append(m);
 
     QString src = makeSource("mod", "Mod", "mod.h", methods);
-    EXPECT_TRUE(src.contains("invokeRemoteMethod(\"mod\", \"echoList\", QVariantList{QVariant::fromValue(v)}, Timeout(), &_err)"));
+    EXPECT_TRUE(src.contains("invokeRemoteMethod(\"mod\", \"echoList\", QVariantList{QVariant::fromValue(v)}, timeout, &_err)"));
     EXPECT_TRUE(src.contains("invokeRemoteMethodAsync(\"mod\", \"echoList\", QVariantList{QVariant::fromValue(v)}"));
     // The bare (spreading) form must not appear.
     EXPECT_FALSE(src.contains("QVariantList{v}"));

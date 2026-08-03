@@ -269,8 +269,12 @@ sections:
     text: |
       The consumer side. From the same contract, `--module-only` emits the typed
       wrapper a *consumer* compiles against to call `sensor_module`. Each LIDL
-      `method` becomes a synchronous caller plus an `…Async` variant, and each
-      `event` an `on(...)` subscription. The type mapping is the Qt caller style:
+      `method` becomes three entry points — a synchronous caller, an `…Async`
+      variant that hands the callback a bare value, and an `…AsyncResult`
+      variant that hands it a `logos::AsyncResult<T>` (`{value, error}`) so a
+      failed call is distinguishable from a legitimately default-valued one —
+      and each `event` an `on(...)` subscription. The type mapping is the Qt
+      caller style:
       `float64`→`double`, `tstr`→`QString`, `int`→`qlonglong`, `uint`→
       `qulonglong`, `bstr`→`QByteArray`, `[tstr]`→`QStringList`, other
       arrays→`QVariantList`, and `result`→`LogosResult`.
@@ -300,6 +304,24 @@ sections:
           - "QByteArray firmware(const QByteArray& image"
           - "QStringList labels(const QVariantList& ids"
           - "LogosResult reset(const QString& id"
+      - title: "The three call surfaces per method"
+        text: |
+          One method, three entry points. The sync form takes an optional
+          `logos::CallError*` **and** an optional `Timeout` — both trailing and
+          defaulted, so `temperature()` and `temperature(&err)` still compile.
+          `temperatureAsync` delivers the value alone; `temperatureAsyncResult`
+          delivers `logos::AsyncResult<double>`, whose `.error` tells a failed
+          call apart from a provider that legitimately returned `0.0`. The
+          result-carrying entry point has its own name rather than being an
+          overload: a `std::function<void(AsyncResult<T>)>` overload alongside
+          `std::function<void(T)>` is ambiguous for a generic `[](auto v){…}`.
+        run: "grep -E 'temperature' consumer/sensor_module_api.h"
+        code_block: |
+          grep -E 'temperature' consumer/sensor_module_api.h
+        expect_contains:
+          - "double temperature(logos::CallError* err = nullptr, Timeout timeout = Timeout());"
+          - "void temperatureAsync(std::function<void(double)> callback, Timeout timeout = Timeout());"
+          - "void temperatureAsyncResult(std::function<void(logos::AsyncResult<double>)> callback, Timeout timeout = Timeout());"
 
   - title: "The full type system: composite types"
     step: true

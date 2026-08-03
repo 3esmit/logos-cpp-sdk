@@ -329,16 +329,22 @@ Fixture files in `tests/experimental/fixtures/`:
   single-`_bytes`-field record is refused under both spellings. It used to read `f.type`,
   which refused `? _bytes: tstr` and let `_bytes: ?tstr` through — the same declaration,
   two answers. `?bstr` is unaffected either way: the tag lives in the value, not the slot.
-- **A provider REJECTION reaches an async consumer callback only as a log line.** A
-  provider that refuses a call answers the canonical
-  `{"code":"dispatch_failed", "message":…, "origin":…}` object as its RESULT, not as a
-  transport error, and the Qt return table would convert it like any other value —
+- **A provider REJECTION reaches `…Async`'s callback only as a log line** (but
+  `…AsyncResult`'s callback gets it properly). A provider that refuses a call answers the
+  canonical `{"code":"dispatch_failed", "message":…, "origin":…}` object as its RESULT, not
+  as a transport error, and the Qt return table would convert it like any other value —
   erasing it (`_result.toList()` on that map is `[]`). The Qt consumer emitter therefore
-  detects it and folds it into the `logos::CallError` out-parameter the sync wrapper
-  already carries, so `mod.echoUintList(v, &err)` can tell a rejection from an empty
-  return. The generated `…Async` overload has no such channel — its callback is
-  `std::function<void(T)>`, and adding an error parameter would change the generated
-  public surface (which logos-qt-sdk's `qt-generator --backend consumer` veneer mirrors
-  1:1) — so an async rejection is reported with `qWarning` and the callback still
-  receives the default-converted value. Giving async an error channel is an API change,
-  not a code-generation fix.
+  detects it (`logosDispatchRejection`, emitted once per wrapper) and folds it into the
+  error channel of every surface that HAS one:
+  - **sync** — the `logos::CallError*` out-parameter, so `mod.echoUintList(v, &err)` can
+    tell a rejection from an empty return;
+  - **`…AsyncResult`** — `logos::AsyncResult<T>::error`, so `r.ok()` is false and
+    `r.error.code == "dispatch_failed"` exactly as on the sync path.
+
+  The historical **`…Async`** overload is the one exception: its callback is
+  `std::function<void(T)>`, and adding an error parameter would change a generated public
+  surface (which logos-qt-sdk's `qt-generator --backend consumer` veneer mirrors 1:1). It
+  is left untouched, so there an async rejection is reported with `qWarning` and the
+  callback still receives the default-converted value. `…AsyncResult` exists precisely
+  because giving async an error channel was an API addition rather than a code-generation
+  fix — a caller that needs to SEE the rejection uses it.
