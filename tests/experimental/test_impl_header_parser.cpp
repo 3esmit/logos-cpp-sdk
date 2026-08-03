@@ -930,3 +930,392 @@ TEST_F(ImplHeaderParserTest, ReservedHookSpellingsAreNotContractDefects)
     ASSERT_EQ(r.module.methods.size(), 1u);
     EXPECT_EQ(r.module.methods[0].name, "f");
 }
+
+// ---------------------------------------------------------------------------
+// Structure the record scanner could not read
+//
+// #127 made an unknown TYPE a build error. These cover the same hole one level
+// down: STRUCTURE. A line inside a struct body the scanner could not read as a
+// field used to be `continue`d and the record published without it, and a
+// contract missing a field is exactly as well-formed as one that has it — so
+// nothing downstream, in any language, could tell.
+// ---------------------------------------------------------------------------
+
+// A field declaration wrapped across physical lines is the field the author
+// wrote. It used to be ABSENT from the published record, with exit code 0.
+TEST_F(ImplHeaderParserTest, WrappedFieldDeclarationIsStillOneField)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct SplitRecord {\n"
+        "    std::string id;\n"
+        "    std::vector<std::string>\n"
+        "        tags;\n"
+        "    uint64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    SplitRecord echoSplit(const SplitRecord& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    const TypeDecl& td = r.module.types[0];
+    ASSERT_EQ(td.fields.size(), 3u) << "a wrapped field was dropped from the record";
+    EXPECT_EQ(td.fields[0].name, "id");
+    EXPECT_EQ(td.fields[1].name, "tags");
+    EXPECT_EQ(td.fields[1].type.kind, TypeExpr::Array);
+    EXPECT_EQ(td.fields[2].name, "n");
+}
+
+// Where the opening brace sits cannot decide what a header means. Allman used
+// to make the struct not a record AT ALL, so every mention of it fell through
+// to `any` — and since #127 to an error telling the author to declare a struct,
+// which is the thing they declared.
+TEST_F(ImplHeaderParserTest, AllmanBraceStructIsARecord)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct AllmanRecord\n"
+        "{\n"
+        "    std::string id;\n"
+        "    uint64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    AllmanRecord echoAllman(const AllmanRecord& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    EXPECT_EQ(r.module.types[0].name, "AllmanRecord");
+    ASSERT_EQ(r.module.types[0].fields.size(), 2u);
+    ASSERT_EQ(r.module.methods.size(), 1u);
+    EXPECT_EQ(r.module.methods[0].returnType.kind, TypeExpr::Named);
+    EXPECT_EQ(r.module.methods[0].returnType.name, "AllmanRecord");
+}
+
+// The K&R form has to keep parsing exactly as it did — this is the form every
+// record in the workspace is written in.
+TEST_F(ImplHeaderParserTest, KandRStructStillParses)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct NormalRecord {\n"
+        "    std::string          id;\n"
+        "    uint64_t             n;\n"
+        "    std::vector<uint8_t> payload;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    NormalRecord echoNormal(const NormalRecord& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 3u);
+    EXPECT_EQ(r.module.types[0].fields[2].type.name, "bstr");
+}
+
+// A nested type is not a field — and the scanner used to walk into its body,
+// publish the INNER type's members as the outer record's field list, and stop
+// at the inner `};` so none of the outer's own fields were ever seen.
+TEST_F(ImplHeaderParserTest, NestedTypeInARecordIsReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        int64_t a;\n"
+        "    };\n"
+        "    Inner inner;\n"
+        "    std::string label;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Outer echoOuter(const Outer& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError()) << "the outer record was published made of the "
+                                 "inner type's fields";
+    EXPECT_TRUE(r.error.contains("type 'Outer'")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("namespace scope")) << r.error.toStdString();
+}
+
+// Two declarations sharing a line matched nothing, so the struct published no
+// field, so no `type` was emitted at all — and the .lidl still named it in the
+// signature. That contract references a type it never declares.
+TEST_F(ImplHeaderParserTest, RecordThatPublishesNothingIsReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Pair {\n"
+        "    std::string first; std::string second;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Pair echoPair(const Pair& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError()) << "emitted a contract naming an undeclared type";
+    EXPECT_TRUE(r.error.contains("type 'Pair'")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("ONE declaration per line")) << r.error.toStdString();
+}
+
+// A body of nothing but member functions reads perfectly well and yields no
+// record. No single line is at fault, so it is reported on its own terms.
+TEST_F(ImplHeaderParserTest, RecordWithNoFieldsAtAllIsReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Fieldless {\n"
+        "    std::string toString() const;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Fieldless echo(const Fieldless& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError());
+    EXPECT_TRUE(r.error.contains("type 'Fieldless'")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("never declares")) << r.error.toStdString();
+}
+
+// A base class carries members this line-based parser cannot see, so publishing
+// the struct would drop exactly the fields it cannot read.
+TEST_F(ImplHeaderParserTest, RecordWithABaseClassIsReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Base {\n"
+        "    std::string id;\n"
+        "};\n"
+        "struct Derived : Base {\n"
+        "    uint64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Derived echo(const Derived& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_TRUE(r.hasError()) << "published `Derived` without the base's fields";
+    EXPECT_TRUE(r.error.contains("type 'Derived'")) << r.error.toStdString();
+    EXPECT_TRUE(r.error.contains("base class")) << r.error.toStdString();
+}
+
+// Constructs that definitively are NOT fields are skipped by RULE, so a record
+// that legitimately carries them still parses — the error is for what the
+// scanner cannot read, not for everything that is not a field.
+TEST_F(ImplHeaderParserTest, NonFieldMembersAreSkippedNotReported)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Rich {\n"
+        "    Rich() = default;\n"
+        "    ~Rich();\n"
+        "    std::string toString() const;\n"
+        "    static const int64_t kMax = 5;\n"
+        "    using Alias = std::string;\n"
+        "    std::string id;\n"
+        "    int64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Rich echo(const Rich& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 2u);
+    EXPECT_EQ(r.module.types[0].fields[0].name, "id");
+    EXPECT_EQ(r.module.types[0].fields[1].name, "n");
+}
+
+// A default value is part of the field, whichever way it is written, and may
+// itself contain parentheses — only parentheses in the DECLARATOR make a line a
+// member function. The brace form used to be dropped outright.
+TEST_F(ImplHeaderParserTest, DefaultedFieldsAreStillFields)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Defaulted {\n"
+        "    std::string id{\"none\"};\n"
+        "    int64_t n = 0;\n"
+        "    std::string made = makeId();\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Defaulted echo(const Defaulted& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 3u);
+    EXPECT_EQ(r.module.types[0].fields[0].name, "id");
+    EXPECT_EQ(r.module.types[0].fields[2].name, "made");
+}
+
+// Comments come off before anything else — but a `//` inside a string literal
+// is not a comment. Truncating there ends the declaration before its `;`, which
+// used to drop the field and would now reject valid code.
+TEST_F(ImplHeaderParserTest, CommentStripKnowsWhatALiteralIs)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Commented {\n"
+        "    std::string url = \"http://example.invalid/x\";\n"
+        "    std::string id;  // what it is\n"
+        "    int64_t n;  /* and this one */\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Commented echo(const Commented& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 3u);
+    EXPECT_EQ(r.module.types[0].fields[0].name, "url");
+    EXPECT_EQ(r.module.types[0].fields[1].name, "id");
+    EXPECT_EQ(r.module.types[0].fields[2].name, "n");
+}
+
+// The withdrawal that makes the whole thing safe: a helper struct the API never
+// names is not part of the contract, so structure the scanner could not read
+// inside it promises nothing. Every real module in the workspace carries one of
+// these (openmetrics `ModuleSource`, the package manager's `PendingAction`).
+TEST_F(ImplHeaderParserTest, UnreadableHelperStructDoesNotFailTheBuild)
+{
+    const QString helper =
+        "struct Helper {\n"
+        "    struct Nested {\n"
+        "        int64_t a;\n"
+        "    };\n"
+        "    std::string first; std::string second;\n"
+        "};\n";
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir, helper +
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    int64_t f(int64_t n);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    // ...and the same struct DOES fail the build once a method publishes it.
+    QTemporaryDir dir2;
+    ASSERT_TRUE(dir2.isValid());
+    const QString hp2 = probeHeader(dir2, helper +
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Helper f(const Helper& v);\n"
+        "};\n");
+    QString e2;
+    QTextStream es2(&e2);
+    auto r2 = parseImplHeader(hp2, "ProbeImpl",
+                              fixturesDir() + "/sample_metadata.json", es2);
+    ASSERT_TRUE(r2.hasError());
+    EXPECT_TRUE(r2.error.contains("type 'Helper'")) << r2.error.toStdString();
+}
+
+// A member function DEFINED inline is a declaration of its own. The body's
+// braces, and any `;` inside it, belong to the member — not to the record — so
+// the fields declared after it are still the record's fields. (An earlier cut of
+// this change ended the scan at the body's closing brace and lost them.)
+TEST_F(ImplHeaderParserTest, InlineMemberBodyDoesNotEndTheRecord)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Inlined {\n"
+        "    std::string id;\n"
+        "    void reset() {\n"
+        "        id = \"\";\n"
+        "    }\n"
+        "    std::string mark() const { return id; }\n"
+        "    int64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Inlined echo(const Inlined& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 2u)
+        << "an inline member-function body swallowed a field";
+    EXPECT_EQ(r.module.types[0].fields[0].name, "id");
+    EXPECT_EQ(r.module.types[0].fields[1].name, "n");
+}
+
+// A brace INITIALISER may wrap across lines too, and its braces must not read
+// as a scope the scanner should skip.
+TEST_F(ImplHeaderParserTest, WrappedBraceInitialiserIsStillOneField)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Init {\n"
+        "    std::vector<std::string> tags{\n"
+        "        \"a\", \"b\"};\n"
+        "    int64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Init echo(const Init& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 2u);
+    EXPECT_EQ(r.module.types[0].fields[0].name, "tags");
+    EXPECT_EQ(r.module.types[0].fields[0].type.kind, TypeExpr::Array);
+    EXPECT_EQ(r.module.types[0].fields[1].name, "n");
+}
+
+// A brace inside a string literal is not a scope. Believing the text would make
+// the scanner miss the end of the struct entirely.
+TEST_F(ImplHeaderParserTest, BraceInAStringLiteralIsNotAScope)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = probeHeader(dir,
+        "struct Literal {\n"
+        "    std::string tmpl = \"{\";\n"
+        "    int64_t n;\n"
+        "};\n"
+        "class ProbeImpl {\n"
+        "public:\n"
+        "    Literal echo(const Literal& v);\n"
+        "};\n");
+    auto r = parseImplHeader(hp, "ProbeImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    ASSERT_EQ(r.module.types.size(), 1u);
+    ASSERT_EQ(r.module.types[0].fields.size(), 2u);
+    EXPECT_EQ(r.module.types[0].fields[1].name, "n");
+}
