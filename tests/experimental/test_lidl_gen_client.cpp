@@ -552,6 +552,15 @@ TEST(LidlGenClient, DispatchRejectionDetectorHandlesJsonObjectsAndUmbrellaInclud
     EXPECT_EQ(second.count("bool logosLidlDispatchRejection"), 1);
 }
 
+TEST(LidlGenClient, EventOnlySourceOmitsDispatchRejectionDetector)
+{
+    auto module = makeTestModule();
+    module.methods.clear();
+    const QString source = lidlMakeSource(module, BindMode::Static);
+    EXPECT_FALSE(source.contains("logosLidlDispatchRejection"));
+    EXPECT_FALSE(source.contains("#include <QJsonObject>"));
+}
+
 TEST(LidlGenClient, ThePlainAsyncEntryPointIsUnchanged)
 {
     auto m = makeTestModule();
