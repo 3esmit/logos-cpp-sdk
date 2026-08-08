@@ -22,6 +22,7 @@ add_executable(logos-cpp-generator
     main.cpp
     legacy/main.cpp
     legacy/generator_lib.cpp
+    legacy/lidl_to_json.cpp
     experimental/lidl_emit_common.cpp
     experimental/lidl_gen_client.cpp
     experimental/lidl_gen_cdylib.cpp

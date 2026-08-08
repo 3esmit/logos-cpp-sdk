@@ -28,7 +28,7 @@ pkgs.stdenv.mkDerivation {
     # include/cpp/, a single TU would pull logos_result.h through two
     # distinct realpaths and #pragma once could not dedup them
     # (redefinition of StdLogosResult). Ship every std header in BOTH roots.
-    for file in logos_module_context.h logos_json.h logos_result.h logos_lp_client.h; do
+    for file in logos_module_context.h logos_json.h logos_result.h logos_lp_client.h logos_async_result.h; do
       cp cpp/$file $out/include/cpp/
       cp cpp/$file $out/include/
     done

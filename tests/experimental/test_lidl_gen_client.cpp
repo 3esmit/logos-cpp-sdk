@@ -483,3 +483,69 @@ TEST(LidlGenClient, BytesTagCollisionIsRefusedThroughAnOptional)
         EXPECT_TRUE(error.contains("Sneaky")) << error.toStdString();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sync timeout + result-carrying async
+//
+// This emitter and legacy/generator_lib.cpp produce the SAME consumer surface
+// for the same contract — one is reached from a published `.lidl`, the other
+// through the module builder — so the two must agree. tests/generator/
+// test_async_result.cpp holds the legacy twin of these assertions.
+// ---------------------------------------------------------------------------
+
+TEST(LidlGenClient, SyncTakesBothErrorAndTimeout)
+{
+    auto m = makeTestModule();
+    QString h = lidlMakeHeader(m);
+    // Trailing and defaulted, err first — `createAccount(p)` and
+    // `createAccount(p, &err)` are both unaffected.
+    EXPECT_TRUE(h.contains("QString createAccount(const QString& passphrase, "
+                           "logos::CallError* err = nullptr, Timeout timeout = Timeout());"));
+    EXPECT_TRUE(h.contains("QStringList listAccounts(logos::CallError* err = nullptr, "
+                           "Timeout timeout = Timeout());"));
+}
+
+TEST(LidlGenClient, SyncBodyForwardsTheCallersTimeout)
+{
+    auto m = makeTestModule();
+    QString s = lidlMakeSource(m);
+    EXPECT_TRUE(s.contains("WalletModule::createAccount(const QString& passphrase, "
+                           "logos::CallError* err, Timeout timeout)"));
+    EXPECT_TRUE(s.contains("), timeout, &_err);"));
+    EXPECT_FALSE(s.contains("), Timeout(), &_err);"));
+}
+
+TEST(LidlGenClient, HeaderDeclaresTheResultCarryingAsyncEntryPoint)
+{
+    auto m = makeTestModule();
+    QString h = lidlMakeHeader(m);
+    EXPECT_TRUE(h.contains("#include \"logos_async_result.h\""));
+    EXPECT_TRUE(h.contains("void createAccountAsyncResult(const QString& passphrase, "
+                           "std::function<void(logos::AsyncResult<QString>)> callback, "
+                           "Timeout timeout = Timeout());"));
+    EXPECT_TRUE(h.contains("void listAccountsAsyncResult("
+                           "std::function<void(logos::AsyncResult<QStringList>)> callback, "
+                           "Timeout timeout = Timeout());"));
+}
+
+TEST(LidlGenClient, ResultCarryingAsyncRoutesToTheCallErrorAwareOverload)
+{
+    auto m = makeTestModule();
+    QString s = lidlMakeSource(m);
+    // Two-argument lambda: only AsyncResultErrorCallback is invocable with it.
+    EXPECT_TRUE(s.contains("[callback](QVariant v, const logos::CallError& _err) {"));
+    EXPECT_TRUE(s.contains("logos::AsyncResult<QString> _r;"));
+    EXPECT_TRUE(s.contains("_r.error = _err;"));
+    EXPECT_TRUE(s.contains("callback(_r);"));
+}
+
+TEST(LidlGenClient, ThePlainAsyncEntryPointIsUnchanged)
+{
+    auto m = makeTestModule();
+    QString h = lidlMakeHeader(m);
+    EXPECT_TRUE(h.contains("void createAccountAsync(const QString& passphrase, "
+                           "std::function<void(QString)> callback, Timeout timeout = Timeout());"));
+    QString s = lidlMakeSource(m);
+    // Still a ONE-argument lambda -> still the value-only transport overload.
+    EXPECT_TRUE(s.contains("[callback](QVariant v) {"));
+}

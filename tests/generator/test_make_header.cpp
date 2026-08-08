@@ -94,8 +94,8 @@ TEST(MakeHeaderTest, ContainsMethodDeclarations)
     QJsonArray methods = makeTestMethods();
     QString h = makeHeader("test_mod", "TestMod", methods);
 
-    EXPECT_TRUE(h.contains("int add(int a, int b, logos::CallError* err = nullptr)"));
-    EXPECT_TRUE(h.contains("void reset(logos::CallError* err = nullptr)"));
+    EXPECT_TRUE(h.contains("int add(int a, int b, logos::CallError* err = nullptr, Timeout timeout = Timeout())"));
+    EXPECT_TRUE(h.contains("void reset(logos::CallError* err = nullptr, Timeout timeout = Timeout())"));
     // Non-invokable should not appear
     EXPECT_FALSE(h.contains("internal"));
 }
@@ -197,7 +197,7 @@ TEST(MakeHeaderTest, QVariantListAsyncOverload)
     }
 
     QString h = makeHeader("mod", "Mod", methods);
-    EXPECT_TRUE(h.contains("QVariantList getItems(logos::CallError* err = nullptr)"));
+    EXPECT_TRUE(h.contains("QVariantList getItems(logos::CallError* err = nullptr, Timeout timeout = Timeout())"));
     EXPECT_TRUE(h.contains("getItemsAsync("));
     EXPECT_TRUE(h.contains("std::function<void(QVariantList)> callback"));
 }
@@ -215,7 +215,7 @@ TEST(MakeHeaderTest, QVariantMapAsyncOverload)
     }
 
     QString h = makeHeader("mod", "Mod", methods);
-    EXPECT_TRUE(h.contains("QVariantMap getData(logos::CallError* err = nullptr)"));
+    EXPECT_TRUE(h.contains("QVariantMap getData(logos::CallError* err = nullptr, Timeout timeout = Timeout())"));
     EXPECT_TRUE(h.contains("getDataAsync("));
     EXPECT_TRUE(h.contains("std::function<void(QVariantMap)> callback"));
 }

@@ -162,9 +162,19 @@ static QString mapReturnTypeStd(const QString& qtType)
 // `InfoModule::Status` — because one module consuming two deps that each
 // declare `Status` includes both wrappers into the same translation unit.
 //
-// An empty record set leaves every emission path byte-for-byte as it was.
+// A field object carries an optional third key, `"optional"`. It is NOT a type
+// name — it cannot be, because neither surface's type name can express `?T` the
+// same way: Qt has no optional template and the std one does. `"type"` is
+// always the VALUE type (optionality stripped) and `"optional"` says whether the
+// slot may be empty, so the two LIDL spellings of one declaration (`? name: T`
+// and `name: ?T`) arrive here as the same object and leave as the same code.
+// The metaobject-introspection path never sets it; false is the historical
+// behaviour.
+//
+// An empty record set leaves every emission path byte-for-byte as it was, and so
+// does a record set in which nothing is optional.
 
-struct RecordField { QString name; QString type; };
+struct RecordField { QString name; QString type; bool optional = false; };
 struct RecordDef   { QString name; QVector<RecordField> fields; };
 using RecordSet = QVector<RecordDef>;
 
@@ -187,6 +197,7 @@ static RecordSet parseRecords(const QJsonArray& records)
             RecordField f;
             f.name = fo.value("name").toString();
             f.type = fo.value("type").toString();
+            f.optional = fo.value("optional").toBool();
             if (f.name.isEmpty()) continue;
             def.fields.append(f);
         }
@@ -371,6 +382,70 @@ static QString fromWireFor(const QString& qtType, ApiStyle style, const RecordSe
     return toQVariantConversion(mapParamType(qtType), wire);
 }
 
+// ─── Optional record fields ──────────────────────────────────────────────
+//
+// `?T` is TWO-state: a value of T, or empty — never three. Each surface has
+// exactly ONE empty inhabitant to spell that with, and they are different
+// inhabitants, so the two surfaces answer differently:
+//
+//   Qt  — QVariant. Qt has no optional template; an INVALID QVariant is its
+//         empty inhabitant. The value type is lost (a consumer cannot tell
+//         `?tstr` from `?uint`), which is the same answer the experimental
+//         client-stub backend gives for the same surface — see
+//         lidl_gen_client.cpp's lidlFieldTypeQt. Deliberately identical: two
+//         Qt consumer generators disagreeing about one contract is the bug
+//         class this whole change is about.
+//
+//   Lp  — std::optional<T>, so the std surface KEEPS the value type.
+//         std::nullopt is C++'s single empty inhabitant, and the encoder that
+//         pairs with it is logos-protocol's Codec<std::optional<T>>. Same
+//         answer the cdylib backend gives (lidlFieldTypeCdylib).
+//
+// EXCEPT over the untyped-JSON aliases, on the Lp surface only: LogosMap and
+// LogosList are nlohmann::json, and json already has `null` among its
+// inhabitants, so std::optional<LogosMap> would give `?any` TWO empty
+// spellings and make it three-state. `?any` / `?{K:V}` / `?[any]` therefore
+// collapse onto the bare alias — same two states, one C++ type. (Again the
+// cdylib rule, verbatim.)
+static bool lpAliasIsAlreadyNullable(const QString& lpType)
+{
+    return lpType == "LogosMap" || lpType == "LogosList";
+}
+
+// The C++ spelling of a record FIELD. Non-optional fields go through
+// paramTypeFor unchanged, so a contract that declares no optional emits
+// byte-for-byte what it emitted before.
+static QString fieldTypeFor(const RecordField& f, ApiStyle style, const RecordSet& rs)
+{
+    const QString value = paramTypeFor(f.type, style, rs);
+    if (!f.optional) return value;
+    if (style == ApiStyle::Qt) return QStringLiteral("QVariant");
+    if (lpAliasIsAlreadyNullable(value)) return value;
+    return "std::optional<" + value + ">";
+}
+
+// True when some field actually materialises a std::optional on the Lp surface
+// — gates the generated `#include <optional>`, so a contract with no optional
+// (or one whose only optionals are untyped-JSON aliases) keeps its header
+// byte-for-byte unchanged.
+static bool recordsUseStdOptional(const RecordSet& rs)
+{
+    for (const RecordDef& d : rs)
+        for (const RecordField& f : d.fields)
+            if (f.optional && !lpAliasIsAlreadyNullable(paramTypeFor(f.type, ApiStyle::Lp, rs)))
+                return true;
+    return false;
+}
+
+// Whether an optional field is carried in a std::optional (as opposed to an
+// alias that is already nullable, or the Qt surface's QVariant). Decides which
+// encode/decode shape the conversions below emit.
+static bool fieldIsWrappedOptional(const RecordField& f, ApiStyle style, const RecordSet& rs)
+{
+    return f.optional && style == ApiStyle::Lp
+        && !lpAliasIsAlreadyNullable(paramTypeFor(f.type, style, rs));
+}
+
 // The struct declarations, emitted inside the wrapper class.
 static void emitRecordStructs(QTextStream& s, const RecordSet& rs, ApiStyle style)
 {
@@ -379,7 +454,7 @@ static void emitRecordStructs(QTextStream& s, const RecordSet& rs, ApiStyle styl
     for (const RecordDef& d : rs) {
         s << "    struct " << d.name << " {\n";
         for (const RecordField& f : d.fields)
-            s << "        " << paramTypeFor(f.type, style, rs) << " " << f.name << "{};\n";
+            s << "        " << fieldTypeFor(f, style, rs) << " " << f.name << "{};\n";
         s << "    };\n";
     }
     s << "\n";
@@ -409,13 +484,35 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
           << "(const " << qual << d.name << "& v) {\n";
         if (style == ApiStyle::Lp) {
             s << "    nlohmann::json __j = nlohmann::json::object();\n";
-            for (const RecordField& f : d.fields)
+            for (const RecordField& f : d.fields) {
+                if (fieldIsWrappedOptional(f, style, rs)) {
+                    // A record field is a NAMED slot, so empty is spelled by
+                    // OMITTING the key — never by writing null. (A positional
+                    // slot has no key to omit and writes null instead; arity
+                    // must never change.) The round trip is therefore
+                    // canonicalising, not identity: a peer that sent
+                    // `"f": null` gets the key back omitted, and both spellings
+                    // decode to the same single empty state.
+                    s << "    if (v." << f.name << ".has_value()) __j[\"" << f.name << "\"] = "
+                      << toWireFor(f.type, style, rs, "(*v." + f.name + ")") << ";\n";
+                    continue;
+                }
                 s << "    __j[\"" << f.name << "\"] = "
                   << toWireFor(f.type, style, rs, "v." + f.name) << ";\n";
+            }
             s << "    return __j;\n";
         } else {
             s << "    QVariantMap __m;\n";
             for (const RecordField& f : d.fields) {
+                if (f.optional) {
+                    // Same named-slot rule on the Qt surface: an INVALID
+                    // QVariant is empty, and empty omits the key. Inserting it
+                    // would encode `"f": null`, which is the positional
+                    // spelling.
+                    s << "    if (v." << f.name << ".isValid()) __m.insert(QStringLiteral(\""
+                      << f.name << "\"), v." << f.name << ");\n";
+                    continue;
+                }
                 // Qt's surface type IS the wire type for non-record fields, so
                 // fromValue is what puts it in the map; records/containers
                 // already produce a QVariant-compatible value.
@@ -438,6 +535,16 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
             s << "    if (!w.is_object()) return __out;\n";
             for (const RecordField& f : d.fields) {
                 const QString acc = "w.at(\"" + f.name + "\")";
+                if (fieldIsWrappedOptional(f, style, rs)) {
+                    // An absent key and an explicit null are the SAME state on
+                    // decode, so both must leave the field nullopt. Testing
+                    // only `contains` would decode `"f": null` through the
+                    // value conversion and turn empty into a VALUE (0, "").
+                    s << "    if (w.contains(\"" << f.name << "\") && !" << acc
+                      << ".is_null()) __out." << f.name << " = "
+                      << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
+                    continue;
+                }
                 s << "    if (w.contains(\"" << f.name << "\")) __out." << f.name << " = "
                   << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
             }
@@ -445,6 +552,14 @@ static void emitRecordConversions(QTextStream& s, const RecordSet& rs, ApiStyle 
             s << "    const QVariantMap __m = w.toMap();\n";
             for (const RecordField& f : d.fields) {
                 const QString acc = "__m.value(QStringLiteral(\"" + f.name + "\"))";
+                if (f.optional) {
+                    // Absent and null both arrive as an INVALID QVariant — the
+                    // same state, as the contract requires. Converting (a
+                    // `.toString()` on an optional `tstr`) would have turned
+                    // empty into "", which is a value.
+                    s << "    __out." << f.name << " = " << acc << ";\n";
+                    continue;
+                }
                 s << "    __out." << f.name << " = "
                   << fromWireFor(f.type, style, rs, acc, qual) << ";\n";
             }
@@ -474,6 +589,7 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     s << "#include \"logos_api.h\"\n";
     s << "#include \"logos_api_client.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
+    s << "#include \"logos_async_result.h\"\n";
     s << "#include \"logos_object.h\"\n\n";
     s << "class " << className << " {\n";
     s << "public:\n";
@@ -547,25 +663,56 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
         // Optional error out-channel: pass a logos::CallError* to distinguish
         // a failed remote call from a legitimately default-valued result.
         // Existing call sites compile unchanged.
+        //
+        // ...and an optional Timeout AFTER it, so the sync surface can say how
+        // long it is willing to wait. Appending (rather than inserting next to
+        // the value args, where the async overload carries it) keeps every
+        // existing call site source-compatible, including the ones that already
+        // pass `&err` positionally. The transport has taken both since it grew
+        // the error channel — logos_api_client.h's
+        // `invokeRemoteMethod(obj, method, args, Timeout, CallError*)` — and the
+        // generated body simply hard-coded `Timeout()` there.
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err = nullptr);\n";
+        s << "logos::CallError* err = nullptr, Timeout timeout = Timeout());\n";
+
+        // Param list shared by both async entry points.
+        auto emitAsyncParams = [&]() {
+            for (int i = 0; i < params.size(); ++i) {
+                QJsonObject p = params.at(i).toObject();
+                QString qtPt = p.value("type").toString();
+                QString pt = paramTypeFor(qtPt, apiStyle, rs);
+                QString pn = p.value("name").toString();
+                bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
+                if (byRef) s << "const " << pt << "& " << pn;
+                else       s << pt << " " << pn;
+                if (i + 1 < params.size()) s << ", ";
+            }
+            if (params.size() > 0) s << ", ";
+        };
+
         // Async overload: same params + callback + optional Timeout
         QString asyncCallbackType = (ret == "void")
             ? QString("std::function<void()>")
             : QString("std::function<void(") + ret + ")>";
         s << "    void " << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            QJsonObject p = params.at(i).toObject();
-            QString qtPt = p.value("type").toString();
-            QString pt = paramTypeFor(qtPt, apiStyle, rs);
-            QString pn = p.value("name").toString();
-            bool byRef = byRefFor(qtPt, pt, apiStyle, rs);
-            if (byRef) s << "const " << pt << "& " << pn;
-            else       s << pt << " " << pn;
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (params.size() > 0) s << ", ";
+        emitAsyncParams();
         s << asyncCallbackType << " callback, Timeout timeout = Timeout());\n";
+
+        // Result-carrying async entry point. The plain `<name>Async` above
+        // hands the callback a bare value, so a failed call is
+        // INDISTINGUISHABLE from a provider that legitimately returned
+        // 0 / "" / false — the exact ambiguity the sync `CallError*` exists to
+        // resolve. This one delivers logos::AsyncResult<T> {value, error}.
+        //
+        // A DISTINCT NAME, not an overload of `<name>Async`: two overloads
+        // differing only in std::function<void(T)> vs
+        // std::function<void(AsyncResult<T>)> are ambiguous for a generic
+        // lambda (`[](auto v){...}` is invocable with either), which would
+        // break existing call sites. A distinct name has zero resolution risk.
+        s << "    void " << name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback"
+          << ", Timeout timeout = Timeout());\n";
     }
     s << "\nprivate:\n";
     // ensureReplica() is needed whenever the wrapper subscribes to events,
@@ -588,20 +735,89 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     return h;
 }
 
+// The Qt consumer's rejection detector, emitted once per generated wrapper.
+//
+// A provider that REJECTS a call answers the canonical
+// {"code":"dispatch_failed", "message":..., "origin":...} object as its RESULT,
+// not as a transport error. Every provider flavour produces the same object
+// (logos-qt-sdk `dispatchFailedVariant`, the generated cdylib dispatch, the Rust
+// provider's `args::dispatch_failed`), and the Qt return table converts it like
+// any other value — which ERASES it: `_result.toList()` on a map is `[]`,
+// `.toString()` is "", `.toLongLong()` is 0. A caller then cannot tell "you sent
+// me the wrong thing" from "the provider returned nothing".
+//
+// Detected here and folded into the logos::CallError out-channel the wrapper
+// already uses to report a failed call, so a rejection reads exactly like every
+// other failure on this surface — no new signature, no new type, and no change
+// to any return value.
+// Guarded because the umbrella (`logos_sdk.cpp`) textually #includes EVERY
+// generated `<dep>_api.cpp`, so a module with more than one dependency puts
+// several of these in ONE translation unit. Internal linkage handles the
+// separate-TU case; only the preprocessor handles this one.
+static void emitDispatchRejectionDetector(QTextStream& s)
+{
+    s << "#ifndef LOGOS_GENERATED_DISPATCH_REJECTION\n";
+    s << "#define LOGOS_GENERATED_DISPATCH_REJECTION\n\n";
+    s << "namespace {\n\n";
+    s << "// True when `v` is the canonical provider REJECTION object rather than a\n";
+    s << "// value; fills `out` with its {code, message, origin} on a match.\n";
+    s << "//\n";
+    s << "// The match is exact — those three fields, all strings, and that code — for the\n";
+    s << "// same reason logos_rpc_status.h's isUnauthorizedSentinel is exact: an `any` or\n";
+    s << "// map return carrying user data must never false-match.\n";
+    s << "bool logosDispatchRejection(const QVariant& v, logos::CallError& out)\n";
+    s << "{\n";
+    s << "    QVariantMap m;\n";
+    s << "    switch (v.userType()) {\n";
+    s << "    case QMetaType::QVariantMap: m = v.toMap(); break;\n";
+    s << "    // Defensive: some json_convert paths historically produced QJsonObject.\n";
+    s << "    case QMetaType::QJsonObject: m = v.toJsonObject().toVariantMap(); break;\n";
+    s << "    default: return false;\n";
+    s << "    }\n";
+    s << "    if (m.size() != 3) return false;\n";
+    s << "    const QVariant code = m.value(QStringLiteral(\"code\"));\n";
+    s << "    const QVariant message = m.value(QStringLiteral(\"message\"));\n";
+    s << "    const QVariant origin = m.value(QStringLiteral(\"origin\"));\n";
+    s << "    if (code.userType() != QMetaType::QString\n";
+    s << "        || message.userType() != QMetaType::QString\n";
+    s << "        || origin.userType() != QMetaType::QString) return false;\n";
+    s << "    if (code.toString() != QStringLiteral(\"dispatch_failed\")) return false;\n";
+    s << "    out.code = code.toString().toStdString();\n";
+    s << "    out.message = message.toString().toStdString();\n";
+    s << "    out.origin = origin.toString().toStdString();\n";
+    s << "    return true;\n";
+    s << "}\n\n";
+    s << "} // namespace\n\n";
+    s << "#endif  // LOGOS_GENERATED_DISPATCH_REJECTION\n\n";
+}
+
 QString makeSource(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, ApiStyle apiStyle, const QJsonArray& events, BindMode bindMode, const QJsonArray& records)
 {
     if (apiStyle == ApiStyle::Lp)
         return makeSourceLp(moduleName, className, headerBaseName, methods, events, bindMode, records);
     const RecordSet rs = parseRecords(records);
+    // The rejection detector is only reachable from a method body, so a
+    // contract with no invokable method must not emit it (an unused function in
+    // an anonymous namespace is a -Wunused-function warning, and such a
+    // contract's wrapper stays byte-identical to what it generated before).
+    bool anyInvokable = false;
+    for (const QJsonValue& mv : methods) {
+        if (mv.toObject().value("isInvokable").toBool()) { anyInvokable = true; break; }
+    }
     QString c;
     QTextStream s(&c);
     s << "#include \"" << headerBaseName << "\"\n\n";
     s << "#include <QDebug>\n";
-    if (!rs.isEmpty()) {
-        // Record conversions build QVariantMaps.
+    if (!rs.isEmpty() || anyInvokable) {
+        // Record conversions build QVariantMaps; so does the rejection detector.
         s << "#include <QVariantMap>\n";
     }
+    if (anyInvokable) {
+        // The rejection detector reads a QJsonObject-shaped result defensively.
+        s << "#include <QJsonObject>\n";
+    }
     s << "\n";
+    if (anyInvokable) emitDispatchRejectionDetector(s);
     emitRecordConversions(s, rs, apiStyle, className);
     // The expression every remote call uses to name its target module.
     // Static: the baked string literal "<moduleName>" (unchanged
@@ -744,17 +960,19 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             if (i + 1 < params.size()) s << ", ";
         }
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err) {\n";
+        s << "logos::CallError* err, Timeout timeout) {\n";
 
         // Body: perform call through the err-out overload. When the caller
         // passes a logos::CallError* it can distinguish a failed remote call
-        // (e.g. the bound module is missing) from a legitimately
-        // default-valued result; without it the historical default-on-failure
-        // behavior is kept, now with a warning so failures are at least
-        // visible in the module log.
+        // (e.g. the bound module is missing, or the provider REJECTED the
+        // arguments) from a legitimately default-valued result; without it the
+        // historical default-on-failure behavior is kept, now with a warning so
+        // failures are at least visible in the module log.
+        //
+        // The result is captured even for a `void` return: a void method can be
+        // rejected too, and the rejection object is the only place that says so.
         s << "    logos::CallError _err;\n";
-        if (ret != "void") s << "    QVariant _result = ";
-        else               s << "    ";
+        s << "    QVariant _result = ";
 
         // Wrap each argument in QVariant::fromValue so it becomes exactly ONE
         // element of the args list. A bare `QVariantList{v}` CONCATENATES a
@@ -767,7 +985,16 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
             if (i + 1 < params.size()) s << ", ";
         }
-        s << "}, Timeout(), &_err);\n";
+        // `timeout` — the caller's, defaulted to Timeout() at the declaration —
+        // not a hard-coded Timeout(). This is the overload that carries BOTH
+        // the deadline and the error out-channel; the generator used to call it
+        // with the error and drop the deadline on the floor.
+        s << "}, timeout, &_err);\n";
+        // A provider REJECTION arrives as the result, not as a transport error.
+        // Fold it into the same error channel BEFORE the return table converts
+        // it, or the conversion erases it (a rejected `[uint]` call answered []
+        // — the whole list, not the bad element).
+        s << "    if (_err.ok()) logosDispatchRejection(_result, _err);\n";
         s << "    if (err) *err = _err;\n";
         s << "    else if (!_err.ok()) qWarning() << \"" << className << "::" << name
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
@@ -812,37 +1039,41 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         }
         s << "}\n\n";
 
-        // Async implementation
-        s << "void " << className << "::" << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            bool byRef;
-            emitParam(params.at(i).toObject(), byRef);
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (params.size() > 0) s << ", ";
-        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
-        s << "    if (!callback) return;\n";
-        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
-        if (params.size() == 0) {
-            s << "QVariantList()";
-        } else {
-            // Same one-element-per-arg wrapping as the sync path (see above): a
-            // QVariantList-typed arg must not be spread across the args list.
-            s << "QVariantList{";
+        // Shared pieces of the two async entry points, so `<name>Async` and
+        // `<name>AsyncResult` cannot drift apart in how they marshal args or
+        // decode the reply.
+        auto emitAsyncParams = [&]() {
             for (int i = 0; i < params.size(); ++i) {
-                s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
+                bool byRef;
+                emitParam(params.at(i).toObject(), byRef);
                 if (i + 1 < params.size()) s << ", ";
             }
-            s << "}";
-        }
-        s << ", [callback](QVariant v) {\n";
-        if (ret == "void") {
-            s << "        (void)v; callback();\n";
-        } else if (retIsRecord) {
-            // A record decodes field by field; an invalid QVariant yields a
-            // default-constructed struct, matching the scalar paths.
-            s << "        callback(" << fromWireFor(qtRet, apiStyle, rs, "v", className + "::") << ");\n";
-        } else {
+            if (params.size() > 0) s << ", ";
+        };
+        auto emitAsyncArgs = [&]() {
+            if (params.size() == 0) {
+                s << "QVariantList()";
+            } else {
+                // Same one-element-per-arg wrapping as the sync path (see above): a
+                // QVariantList-typed arg must not be spread across the args list.
+                s << "QVariantList{";
+                for (int i = 0; i < params.size(); ++i) {
+                    s << "QVariant::fromValue(" << wireArg(params.at(i).toObject()) << ")";
+                    if (i + 1 < params.size()) s << ", ";
+                }
+                s << "}";
+            }
+        };
+        // The QVariant -> typed-return expression, given the QVariant's name.
+        // Empty for a void return.
+        auto asyncDecodeExpr = [&](const QString& var) -> QString {
+            if (ret == "void") return QString();
+            if (retIsRecord) {
+                // A record decodes field by field; an invalid QVariant yields a
+                // default-constructed struct, matching the scalar paths.
+                return fromWireFor(qtRet, apiStyle, rs, var, className + "::");
+            }
+            if (ret == "QVariant") return var;
             QString defaultVal;
             if (ret == "bool") defaultVal = "false";
             else if (ret == "int" || ret == "qlonglong" || ret == "qulonglong"
@@ -853,12 +1084,61 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             else if (ret == "QVariantList") defaultVal = "QVariantList()";
             else if (ret == "QVariantMap") defaultVal = "QVariantMap()";
             else defaultVal = ret + "{}";
-            if (ret == "QVariant") {
-                s << "        callback(v);\n";
-            } else {
-                s << "        callback(v.isValid() ? qvariant_cast<" << ret << ">(v) : " << defaultVal << ");\n";
-            }
-        }
+            return var + ".isValid() ? qvariant_cast<" + ret + ">(" + var + ") : " + defaultVal;
+        };
+
+        // Async implementation
+        s << "void " << className << "::" << name << "Async(";
+        emitAsyncParams();
+        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
+        emitAsyncArgs();
+        // A ONE-argument lambda: it is invocable only as
+        // LogosAPIClient::AsyncResultCallback, so this keeps binding to the
+        // historical value-only overload even though a CallError-aware one
+        // exists next to it.
+        s << ", [callback](QVariant v) {\n";
+        // The value-only async callback has nowhere to put an error — there is
+        // no CallError parameter to fill, and adding one would change the
+        // historical public surface. A rejection is at least made visible in
+        // the module log instead of vanishing into the return conversion below.
+        // `<name>AsyncResult` is the surface that can actually REPORT it.
+        s << "        { logos::CallError _rej; if (logosDispatchRejection(v, _rej))\n";
+        s << "              qWarning() << \"" << className << "::" << name
+          << "Async: remote call failed:\" << QString::fromStdString(_rej.message); }\n";
+        if (ret == "void") s << "        (void)v; callback();\n";
+        else               s << "        callback(" << asyncDecodeExpr("v") << ");\n";
+        s << "    }, timeout);\n";
+        s << "}\n\n";
+
+        // Result-carrying async implementation. Routes to the transport's
+        // CallError-aware async overload (AsyncResultErrorCallback) — a TWO
+        // argument lambda, which is invocable only as that overload, so the
+        // pair above and below resolve unambiguously.
+        //
+        // On failure the value stays default-constructed exactly as
+        // `<name>Async` would have delivered it; what changes is that the
+        // callback can now TELL, via r.error / r.ok().
+        //
+        // That includes a provider REJECTION, which arrives as the RESULT and
+        // not as a transport error: it is folded into `_r.error` exactly as the
+        // sync path folds it into the caller's CallError. `<name>Async` can only
+        // warn about one because its callback has no error slot; this one has,
+        // so a rejected call must NOT report ok() here.
+        s << "void " << className << "::" << name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << name << "\", ";
+        emitAsyncArgs();
+        s << ", [callback](QVariant v, const logos::CallError& _err) {\n";
+        s << "        logos::AsyncResult<" << ret << "> _r;\n";
+        s << "        _r.error = _err;\n";
+        s << "        if (_r.error.ok()) logosDispatchRejection(v, _r.error);\n";
+        if (ret == "void") s << "        (void)v;\n";
+        else               s << "        _r.value = " << asyncDecodeExpr("v") << ";\n";
+        s << "        callback(_r);\n";
         s << "    }, timeout);\n";
         s << "}\n\n";
     }
@@ -1062,6 +1342,9 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     s << "#include <cstdint>\n";
     s << "#include <string>\n";
     s << "#include <vector>\n";
+    // Only when a field actually materialises one, so a contract with no
+    // optional keeps its header byte-for-byte unchanged.
+    if (recordsUseStdOptional(rs)) s << "#include <optional>\n";
     s << "#include <functional>\n";
     s << "#include <nlohmann/json.hpp>\n";
     s << "#include \"logos_json.h\"\n";
@@ -1104,7 +1387,30 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     }
     if (!events.isEmpty()) s << "\n";
 
-    // Methods: sync (with optional CallError out-param) + async overload.
+    // Methods: sync (with optional CallError out-param + timeout) + async
+    // overload.
+    //
+    // TIMEOUTS ARE SPELLED `int timeout_ms`, NOT `Timeout`, on this surface.
+    // `Timeout` lives in logos-protocol's logos_mode.h, which includes <QDebug>
+    // — naming it here would drag Qt into a translation unit whose whole reason
+    // for existing is not to have any. logos::LpClient already spells its
+    // deadlines `int timeout_ms` with the C ABI's rule (`<= 0` selects the
+    // protocol default), and this matches it.
+    //
+    // NO `<name>AsyncResult` HERE — deliberately, for now. The Qt surface gets
+    // one because its transport reports the error
+    // (LogosAPIClient::AsyncResultErrorCallback). This surface's transport does
+    // NOT: logos-protocol's lp_invoke_async (cpp/logos_protocol.cpp) subscribes
+    // with the VALUE-ONLY invokeRemoteMethodAsync overload and unconditionally
+    // calls back `cb(1, json, ...)` — ok is hard-coded to 1 — even though
+    // lp_result_cb is documented as "ok == 0 → `json` is the canonical error
+    // object", and even though its own sync twin lp_invoke does return
+    // LP_ERR_UNAVAILABLE + makeErrorJson. So an AsyncResult emitted here would
+    // report ok() on a failed call to a module that is not loaded: an error
+    // channel that lies is worse than no error channel. (Measured, not assumed:
+    // a wrapper wired to it fires its callback with the default value and an
+    // EMPTY error code.) Once lp_invoke_async reports the error, emitting the
+    // AsyncResult twin here is the same few lines as above.
     for (const QJsonValue& v : methods) {
         const QJsonObject o = v.toObject();
         if (!o.value("isInvokable").toBool()) continue;
@@ -1112,31 +1418,29 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         const QString ret = returnTypeFor(o.value("returnType").toString(), ApiStyle::Lp, rs);
         const QJsonArray params = o.value("parameters").toArray();
 
+        auto emitDeclParams = [&]() {
+            for (int i = 0; i < params.size(); ++i) {
+                const QJsonObject p = params.at(i).toObject();
+                const QString qtPt = p.value("type").toString();
+                const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
+                if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
+                else                                     s << pt << " " << p.value("name").toString();
+                if (i + 1 < params.size()) s << ", ";
+            }
+            if (!params.isEmpty()) s << ", ";
+        };
+
         s << "    " << ret << " " << name << "(";
-        for (int i = 0; i < params.size(); ++i) {
-            const QJsonObject p = params.at(i).toObject();
-            const QString qtPt = p.value("type").toString();
-            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
-            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
-            else                                     s << pt << " " << p.value("name").toString();
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err = nullptr);\n";
+        emitDeclParams();
+        // Trailing, defaulted, and in that order — existing call sites,
+        // including ones already passing `&err` positionally, are unaffected.
+        s << "logos::CallError* err = nullptr, int timeout_ms = 0);\n";
 
         const QString asyncCb = (ret == "void")
             ? QString("std::function<void()>")
             : QString("std::function<void(") + ret + ")>";
         s << "    void " << name << "Async(";
-        for (int i = 0; i < params.size(); ++i) {
-            const QJsonObject p = params.at(i).toObject();
-            const QString qtPt = p.value("type").toString();
-            const QString pt = paramTypeFor(qtPt, ApiStyle::Lp, rs);
-            if (byRefFor(qtPt, pt, ApiStyle::Lp, rs)) s << "const " << pt << "& " << p.value("name").toString();
-            else                                     s << pt << " " << p.value("name").toString();
-            if (i + 1 < params.size()) s << ", ";
-        }
-        if (!params.isEmpty()) s << ", ";
+        emitDeclParams();
         s << asyncCb << " callback);\n";
     }
 
@@ -1229,16 +1533,18 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
             }
         };
 
-        // Sync
+        // Sync — routes the caller's deadline to LpClient::invoke's
+        // `timeout_ms` parameter, which the generated body used to leave at its
+        // default (i.e. silently drop).
         s << retQual << " " << className << "::" << name << "(";
         emitParams();
         if (!params.isEmpty()) s << ", ";
-        s << "logos::CallError* err) {\n";
+        s << "logos::CallError* err, int timeout_ms) {\n";
         emitArgsArray();
         if (ret == "void") {
-            s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
+            s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
         } else {
-            s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err);\n";
+            s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
             s << "    return " << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ";\n";
         }
         s << "}\n\n";
@@ -1261,6 +1567,7 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         }
         s << "    });\n";
         s << "}\n\n";
+        // (No <name>AsyncResult on this surface yet — see makeHeaderLp.)
     }
     return c;
 }

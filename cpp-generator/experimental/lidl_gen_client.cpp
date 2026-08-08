@@ -264,6 +264,7 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "#include \"logos_api.h\"\n";
     s << "#include \"logos_api_client.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
+    s << "#include \"logos_async_result.h\"\n";
     s << "#include \"logos_object.h\"\n\n";
 
     emitRecords(s, module);
@@ -288,19 +289,38 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
             if (i + 1 < md.params.size()) s << ", ";
         }
         // Optional error out-channel: pass a logos::CallError* to distinguish
-        // a failed remote call from a legitimately default-valued result.
+        // a failed remote call from a legitimately default-valued result —
+        // followed by an optional Timeout. Both trailing and defaulted, so
+        // existing call sites (including ones passing `&err` positionally)
+        // compile unchanged. Mirrors the legacy emitter in
+        // legacy/generator_lib.cpp; the two must agree, since a consumer can
+        // reach either (this one from a published `.lidl`, that one through the
+        // module builder) for the same contract.
         if (!md.params.empty()) s << ", ";
-        s << "logos::CallError* err = nullptr);\n";
+        s << "logos::CallError* err = nullptr, Timeout timeout = Timeout());\n";
+
+        auto emitAsyncParams = [&]() {
+            for (int i = 0; i < md.params.size(); ++i) {
+                emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
+                if (i + 1 < md.params.size()) s << ", ";
+            }
+            if (!md.params.empty()) s << ", ";
+        };
+
         QString asyncCb = (ret == "void")
             ? QString("std::function<void()>")
             : QString("std::function<void(") + ret + ")>";
         s << "    void " << md.name << "Async(";
-        for (int i = 0; i < md.params.size(); ++i) {
-            emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
-            if (i + 1 < md.params.size()) s << ", ";
-        }
-        if (!md.params.empty()) s << ", ";
+        emitAsyncParams();
         s << asyncCb << " callback, Timeout timeout = Timeout());\n";
+
+        // Result-carrying async entry point. Distinct name, not an overload:
+        // std::function<void(AsyncResult<T>)> alongside std::function<void(T)>
+        // is ambiguous for a generic lambda.
+        s << "    void " << md.name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback"
+          << ", Timeout timeout = Timeout());\n";
     }
 
     s << "\nprivate:\n";
@@ -384,7 +404,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
             if (i + 1 < nParams) s << ", ";
         }
         if (nParams > 0) s << ", ";
-        s << "logos::CallError* err) {\n";
+        s << "logos::CallError* err, Timeout timeout) {\n";
 
         // Call through the err-out overload: with a logos::CallError* the
         // caller can distinguish a failed remote call from a legitimately
@@ -404,7 +424,9 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
             s << qtArgExpr(md.params[i].type, qs(md.params[i].name));
             if (i + 1 < nParams) s << ", ";
         }
-        s << "), Timeout(), &_err);\n";
+        // The caller's deadline, not a hard-coded default: this is the overload
+        // that carries BOTH the deadline and the error out-channel.
+        s << "), timeout, &_err);\n";
         s << "    if (err) *err = _err;\n";
         s << "    else if (!_err.ok()) qWarning() << \"" << className << "::" << md.name
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
@@ -413,31 +435,63 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
             s << "    " << returnConversionFor(md.returnType, ret) << "\n";
         s << "}\n\n";
 
-        s << "void " << className << "::" << md.name << "Async(";
-        for (int i = 0; i < nParams; ++i) {
-            emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
-            if (i + 1 < nParams) s << ", ";
-        }
-        if (nParams > 0) s << ", ";
-        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
-        s << "    if (!callback) return;\n";
+        // Shared between the two async entry points so they cannot drift in how
+        // they marshal args or decode the reply.
+        auto emitAsyncParams = [&]() {
+            for (int i = 0; i < nParams; ++i) {
+                emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
+                if (i + 1 < nParams) s << ", ";
+            }
+            if (nParams > 0) s << ", ";
+        };
         // Same one-element-per-arg packing as the sync path (see above): a
         // QVariantList-typed arg must not be spread across the args list.
-        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << md.name << "\", packVariantList(";
-        for (int i = 0; i < nParams; ++i) {
-            s << qtArgExpr(md.params[i].type, qs(md.params[i].name));
-            if (i + 1 < nParams) s << ", ";
-        }
-        s << ")";
+        auto emitAsyncArgs = [&]() {
+            s << "packVariantList(";
+            for (int i = 0; i < nParams; ++i) {
+                s << qtArgExpr(md.params[i].type, qs(md.params[i].name));
+                if (i + 1 < nParams) s << ", ";
+            }
+            s << ")";
+        };
+        // The QVariant -> typed-return expression, given the QVariant's name.
+        auto asyncDecodeExpr = [&](const QString& var) -> QString {
+            if (ret == "void") return QString();
+            if (ret == "QVariant") return var;
+            return var + ".isValid() ? " + asyncReturnConversionFor(md.returnType, ret)
+                 + " : " + asyncDefaultVal(ret);
+        };
+
+        s << "void " << className << "::" << md.name << "Async(";
+        emitAsyncParams();
+        s << "std::function<void(" << (ret == "void" ? "void" : ret) << ")> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << md.name << "\", ";
+        emitAsyncArgs();
+        // ONE-argument lambda -> LogosAPIClient::AsyncResultCallback, i.e. the
+        // historical value-only transport overload.
         s << ", [callback](QVariant v) {\n";
-        if (ret == "void") {
-            s << "        callback();\n";
-        } else if (ret == "QVariant") {
-            s << "        callback(v);\n";
-        } else {
-            s << "        callback(v.isValid() ? " << asyncReturnConversionFor(md.returnType, ret)
-              << " : " << asyncDefaultVal(ret) << ");\n";
-        }
+        if (ret == "void") s << "        callback();\n";
+        else               s << "        callback(" << asyncDecodeExpr("v") << ");\n";
+        s << "    }, timeout);\n";
+        s << "}\n\n";
+
+        // Result-carrying async: a TWO-argument lambda, so it binds to the
+        // transport's CallError-aware AsyncResultErrorCallback overload. The
+        // value on failure is exactly what `<name>Async` would have delivered;
+        // what changes is that the callback can now tell.
+        s << "void " << className << "::" << md.name << "AsyncResult(";
+        emitAsyncParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback, Timeout timeout) {\n";
+        s << "    if (!callback) return;\n";
+        s << "    m_client->invokeRemoteMethodAsync(" << targetExpr << ", \"" << md.name << "\", ";
+        emitAsyncArgs();
+        s << ", [callback](QVariant v, const logos::CallError& _err) {\n";
+        s << "        logos::AsyncResult<" << ret << "> _r;\n";
+        s << "        _r.error = _err;\n";
+        if (ret == "void") s << "        (void)v;\n";
+        else               s << "        _r.value = " << asyncDecodeExpr("v") << ";\n";
+        s << "        callback(_r);\n";
         s << "    }, timeout);\n";
         s << "}\n\n";
     }
