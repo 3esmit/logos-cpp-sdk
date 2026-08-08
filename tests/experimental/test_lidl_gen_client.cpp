@@ -536,6 +536,7 @@ TEST(LidlGenClient, ResultCarryingAsyncRoutesToTheCallErrorAwareOverload)
     EXPECT_TRUE(s.contains("[callback](QVariant v, const logos::CallError& _err) {"));
     EXPECT_TRUE(s.contains("logos::AsyncResult<QString> _r;"));
     EXPECT_TRUE(s.contains("_r.error = _err;"));
+    EXPECT_TRUE(s.contains("if (_r.error.ok()) logosLidlDispatchRejection(v, _r.error);"));
     EXPECT_TRUE(s.contains("callback(_r);"));
 }
 
