@@ -355,15 +355,22 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
 
     s << "#include \"" << headerRel << "\"\n\n";
     s << "#include <QDebug>\n\n";
+    s << "#include <QJsonObject>\n\n";
 
     // Provider validation failures are returned as a canonical QVariant map,
     // not as a transport CallError. Keep the result-carrying async surface from
     // turning that rejection into a successful default value.
-    s << "namespace {\n"
+    s << "#ifndef LOGOS_GENERATED_LIDL_DISPATCH_REJECTION\n"
+         "#define LOGOS_GENERATED_LIDL_DISPATCH_REJECTION\n\n"
+         "namespace {\n"
          "bool logosLidlDispatchRejection(const QVariant& value, logos::CallError& error)\n"
          "{\n"
-         "    if (value.userType() != QMetaType::QVariantMap) return false;\n"
-         "    const QVariantMap map = value.toMap();\n"
+         "    QVariantMap map;\n"
+         "    switch (value.userType()) {\n"
+         "    case QMetaType::QVariantMap: map = value.toMap(); break;\n"
+         "    case QMetaType::QJsonObject: map = value.toJsonObject().toVariantMap(); break;\n"
+         "    default: return false;\n"
+         "    }\n"
          "    if (map.size() != 3) return false;\n"
          "    const QVariant code = map.value(QStringLiteral(\"code\"));\n"
          "    const QVariant message = map.value(QStringLiteral(\"message\"));\n"
@@ -377,7 +384,8 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
          "    error.origin = origin.toString().toStdString();\n"
          "    return true;\n"
          "}\n"
-         "}\n\n";
+         "} // namespace\n"
+         "#endif  // LOGOS_GENERATED_LIDL_DISPATCH_REJECTION\n\n";
 
     // Target expression for every remote call: a baked literal in Static
     // mode, the runtime m_moduleName member in Bound (interface) mode.

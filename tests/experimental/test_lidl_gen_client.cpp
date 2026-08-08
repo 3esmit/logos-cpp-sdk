@@ -540,6 +540,18 @@ TEST(LidlGenClient, ResultCarryingAsyncRoutesToTheCallErrorAwareOverload)
     EXPECT_TRUE(s.contains("callback(_r);"));
 }
 
+TEST(LidlGenClient, DispatchRejectionDetectorHandlesJsonObjectsAndUmbrellaIncludes)
+{
+    const QString source = lidlMakeSource(makeTestModule(), BindMode::Static);
+    EXPECT_TRUE(source.contains("#ifndef LOGOS_GENERATED_LIDL_DISPATCH_REJECTION"));
+    EXPECT_TRUE(source.contains("case QMetaType::QVariantMap: map = value.toMap(); break;"));
+    EXPECT_TRUE(source.contains("case QMetaType::QJsonObject: map = value.toJsonObject().toVariantMap(); break;"));
+    EXPECT_TRUE(source.contains("#endif  // LOGOS_GENERATED_LIDL_DISPATCH_REJECTION"));
+
+    const auto second = lidlMakeSource(makeTestModule(), BindMode::Static);
+    EXPECT_EQ(second.count("bool logosLidlDispatchRejection"), 1);
+}
+
 TEST(LidlGenClient, ThePlainAsyncEntryPointIsUnchanged)
 {
     auto m = makeTestModule();
