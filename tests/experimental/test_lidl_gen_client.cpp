@@ -536,7 +536,29 @@ TEST(LidlGenClient, ResultCarryingAsyncRoutesToTheCallErrorAwareOverload)
     EXPECT_TRUE(s.contains("[callback](QVariant v, const logos::CallError& _err) {"));
     EXPECT_TRUE(s.contains("logos::AsyncResult<QString> _r;"));
     EXPECT_TRUE(s.contains("_r.error = _err;"));
+    EXPECT_TRUE(s.contains("if (_r.error.ok()) logosLidlDispatchRejection(v, _r.error);"));
     EXPECT_TRUE(s.contains("callback(_r);"));
+}
+
+TEST(LidlGenClient, DispatchRejectionDetectorHandlesJsonObjectsAndUmbrellaIncludes)
+{
+    const QString source = lidlMakeSource(makeTestModule(), BindMode::Static);
+    EXPECT_TRUE(source.contains("#ifndef LOGOS_GENERATED_LIDL_DISPATCH_REJECTION"));
+    EXPECT_TRUE(source.contains("case QMetaType::QVariantMap: map = value.toMap(); break;"));
+    EXPECT_TRUE(source.contains("case QMetaType::QJsonObject: map = value.toJsonObject().toVariantMap(); break;"));
+    EXPECT_TRUE(source.contains("#endif  // LOGOS_GENERATED_LIDL_DISPATCH_REJECTION"));
+
+    const auto second = lidlMakeSource(makeTestModule(), BindMode::Static);
+    EXPECT_EQ(second.count("bool logosLidlDispatchRejection"), 1);
+}
+
+TEST(LidlGenClient, EventOnlySourceOmitsDispatchRejectionDetector)
+{
+    auto module = makeTestModule();
+    module.methods.clear();
+    const QString source = lidlMakeSource(module, BindMode::Static);
+    EXPECT_FALSE(source.contains("logosLidlDispatchRejection"));
+    EXPECT_FALSE(source.contains("#include <QJsonObject>"));
 }
 
 TEST(LidlGenClient, ThePlainAsyncEntryPointIsUnchanged)
