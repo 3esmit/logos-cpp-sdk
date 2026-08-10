@@ -108,15 +108,17 @@ jobs:
           # report is complete. The job still fails (non-zero exit) if any step
           # failed; this only changes whether we stop early.
           #
-          # Both specs run back-to-back into one combined report (one dropdown
-          # entry each): the module-runtime spec and the module-composition spec,
-          # which builds two modules against this SDK and has one call the other.
+          # Every spec runs back-to-back into one combined report (one dropdown
+          # entry each). cpp-sdk-qt-api-events is the only one whose modules are
+          # NOT `interface: universal`, so it is the only one that compiles and
+          # runs the Qt-typed dependency-wrapper emission.
           nix run github:logos-co/logos-doctest -- run \
             doctests/cpp-sdk-module-runtime.test.yaml \
             doctests/cpp-sdk-module-composition.test.yaml \
             doctests/cpp-sdk-worker-thread-http.test.yaml \
             doctests/cpp-sdk-concurrent-dispatch.test.yaml \
             doctests/cpp-sdk-generator-roundtrip.test.yaml \
+            doctests/cpp-sdk-qt-api-events.test.yaml \
             --verbose \
             --continue-on-fail \
             --release-for logos-cpp-sdk=${{ steps.commit.outputs.sha }} \
@@ -144,7 +146,7 @@ jobs:
 
       - name: Verify markdown generation
         run: |
-          for spec in cpp-sdk-module-runtime cpp-sdk-module-composition cpp-sdk-worker-thread-http; do
+          for spec in cpp-sdk-module-runtime cpp-sdk-module-composition cpp-sdk-worker-thread-http cpp-sdk-qt-api-events; do
             nix run github:logos-co/logos-doctest -- generate \
               "doctests/$spec.test.yaml" \
               --release-for logos-cpp-sdk=${{ steps.commit.outputs.sha }} \

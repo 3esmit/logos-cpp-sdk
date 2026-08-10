@@ -1,0 +1,733 @@
+name: "A Qt-typed Consumer Subscribing to Another Module's Event"
+output: cpp-sdk-qt-api-events.md
+release: ""
+
+intro: |
+  This SDK's code generator emits a dependency wrapper in **two type
+  surfaces**, and which one a module gets is decided by its `metadata.json`,
+  not by anything it writes:
+
+  | the module declares | generated `modules().<dep>` signatures | selected by |
+  |---|---|---|
+  | `"interface": "universal"` | `std::string`, `std::vector<uint8_t>`, … | `LOGOS_API_STYLE=lp` |
+  | `"interface": "provider"` — the Qt provider style | `QString`, `QVariantList`, … | `LOGOS_API_STYLE=qt`, the default |
+
+  The other doc-tests in this directory all take the first row. This one takes
+  the second, because the two surfaces are **separately generated code**: an
+  emission bug in the Qt path cannot be caught by any amount of coverage on the
+  lp path.
+
+  What it builds:
+
+  1. `notifier_module`, an ordinary `interface: universal` callee that emits a
+     `greeted` event.
+  2. `qt_watcher_module`, a **Qt provider-style** consumer (`LOGOS_PROVIDER` +
+     `LOGOS_METHOD`) that declares `notifier_module` as a dependency and
+     subscribes to `greeted` through the generated Qt-typed
+     `m_logos->notifier_module.onGreeted(...)`.
+  3. Both `.lgx` packages, built against the C++ SDK commit under test, loaded
+     together in `logoscore`, with the notifier made to fire and the watcher
+     asked what it received.
+
+  **Where the watcher subscribes is the point.** It subscribes from `onInit()`,
+  not from a method a test calls later. `onInit()` runs while the host has
+  spawned `notifier_module`'s process but before that process has called
+  `listen()` — the dependency is not reachable yet. That is the moment every
+  real C++ consumer subscribes, and it is the moment a wrapper that asks *"is
+  this module reachable right now?"* gets the answer *no* and gives up. A
+  subscription made there and delivered later is the whole assertion.
+
+what_you_build: "Two modules — an `interface: universal` notifier and a Qt provider-style watcher — built against this SDK commit and run together in `logoscore`, with the watcher receiving an event it subscribed to before the notifier was reachable."
+
+what_you_learn:
+  - How `metadata.json` selects between the Qt-typed and Qt-free dependency-wrapper surfaces
+  - How a Qt provider-style module is written — `LOGOS_PROVIDER`, `LOGOS_METHOD`, and a `PluginInterface` loader
+  - How to reach a dependency through `LogosModules` with Qt types (`QString`, not `std::string`)
+  - Why subscribing from `onInit()` is both the realistic shape and the demanding one
+  - How to load two modules in `logoscore` and prove an event crossed the process boundary
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+
+    Verify: `nix flake --help >/dev/null 2>&1 && echo "Flakes enabled"`
+  - "**git** — nix flakes only see files tracked by git."
+  - "A Linux or macOS machine."
+
+sections:
+  - title: "Create the callee: notifier_module"
+    step: true
+    text: |
+      Nothing about this module is Qt-aware or unusual — it is the same
+      `interface: universal` shape as every other callee in these doc-tests. It
+      is here to emit an event on demand.
+    steps:
+      - title: "metadata.json"
+        text: "`interface: universal` selects the pure-C++ pattern: you write one plain class and the builder generates the plugin glue."
+        file:
+          path: notifier_module/metadata.json
+          language: json
+          content: |
+            {
+              "name": "notifier_module",
+              "version": "1.0.0",
+              "type": "core",
+              "category": "general",
+              "description": "A callee module that emits an event other modules subscribe to",
+              "main": "notifier_module_plugin",
+              "interface": "universal",
+              "dependencies": [],
+
+              "nix": {
+                "packages": {
+                  "build": [],
+                  "runtime": []
+                },
+                "external_libraries": [],
+                "cmake": {
+                  "find_packages": [],
+                  "extra_sources": []
+                }
+              }
+            }
+
+      - title: "CMakeLists.txt"
+        text: "For a universal module you list only your plain C++ sources; the generated glue is compiled automatically."
+        file:
+          path: notifier_module/CMakeLists.txt
+          language: cmake
+          content: |
+            cmake_minimum_required(VERSION 3.14)
+            project(NotifierModulePlugin LANGUAGES CXX)
+
+            if(DEFINED ENV{LOGOS_MODULE_BUILDER_ROOT})
+                include($ENV{LOGOS_MODULE_BUILDER_ROOT}/cmake/LogosModule.cmake)
+            elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/LogosModule.cmake")
+                include(cmake/LogosModule.cmake)
+            else()
+                message(FATAL_ERROR "LogosModule.cmake not found")
+            endif()
+
+            logos_module(
+                NAME notifier_module
+                SOURCES
+                    src/notifier_module_impl.h
+                    src/notifier_module_impl.cpp
+            )
+
+      - title: "flake.nix"
+        file:
+          path: notifier_module/flake.nix
+          language: nix
+          content: |
+            {
+              description = "Notifier core module - emits an event for the Qt-api doc-test";
+
+              inputs = {
+                logos-module-builder.url = "github:logos-co/logos-module-builder{release}";
+              };
+
+              outputs = inputs@{ logos-module-builder, ... }:
+                logos-module-builder.lib.mkLogosModule {
+                  src = ./.;
+                  configFile = ./metadata.json;
+                  flakeInputs = inputs;
+                };
+            }
+
+      - title: "src/notifier_module_impl.h — the class"
+        text: |
+          The `logos_events:` block declares the event. The token expands to
+          `public` under a normal compile; the generator reads it and emits the
+          event body, plus a LIDL contract that consumers turn into a typed
+          subscriber.
+        file:
+          path: notifier_module/src/notifier_module_impl.h
+          language: cpp
+          content: |
+            #pragma once
+
+            #include <cstdint>
+            #include <string>
+
+            #include <logos_module_context.h>  // LogosModuleContext base + logos_events
+
+            // A callee module. It exists to emit `greeted` on demand, so a consumer
+            // can prove its subscription is live.
+            class NotifierModuleImpl : public LogosModuleContext {
+            public:
+                NotifierModuleImpl() = default;
+                ~NotifierModuleImpl() = default;
+
+                /// Returns a greeting for the given name.
+                std::string greet(const std::string& name);
+
+                /// Greets the name and also emits a `greeted` event carrying it.
+                void greetNotify(const std::string& name);
+
+            logos_events:
+                /// Emitted by greetNotify() with the produced greeting string.
+                void greeted(const std::string& greeting);
+            };
+
+      - title: "src/notifier_module_impl.cpp — the implementation"
+        text: "Plain C++ — no Qt, no IPC plumbing. `greetNotify` fires the generated event."
+        file:
+          path: notifier_module/src/notifier_module_impl.cpp
+          language: cpp
+          content: |
+            #include "notifier_module_impl.h"
+
+            std::string NotifierModuleImpl::greet(const std::string& name)
+            {
+                return "Hello, " + name + "!";
+            }
+
+            void NotifierModuleImpl::greetNotify(const std::string& name)
+            {
+                // Emit the event declared in logos_events:. When loaded by a host
+                // this reaches every subscriber; constructed outside a host it is a
+                // safe no-op.
+                greeted("Hello, " + name + "!");
+            }
+
+  - title: "Create the Qt-typed consumer: qt_watcher_module"
+    step: true
+    text: |
+      This is the module the doc-test exists for. Two things make it Qt-typed,
+      and neither is a flag anyone passes by hand:
+
+      - **`"interface": "provider"`.** Only `universal` asks for the Qt-free
+        surface, so every other interface leaves `LOGOS_API_STYLE` at its default
+        of `qt`, which is what `LogosModule.cmake` forwards to the generator.
+        There is no `"interface": "qt"` to write.
+      - **It declares `notifier_module` as a dependency.** That is what makes the
+        builder emit a `notifier_module` accessor on `LogosModules` — with
+        `QString` in its signatures, and one `on<Event>` subscriber per event the
+        notifier declares.
+    steps:
+      - title: "metadata.json — no interface key, one dependency"
+        text: |
+          Compare with the notifier's: one word differs, and it decides the whole
+          type surface. `provider` is the hand-written Qt plugin style
+          (`LOGOS_PROVIDER` + `LOGOS_METHOD`); `universal` is the pure-C++ one.
+          Qt typing is not requested — it is what you get by not asking for the
+          Qt-free surface.
+
+          Leaving `interface` out entirely is **not** the same as writing
+          `provider`. An absent key means `legacy`, which runs no code generation
+          at all: the provider dispatch is never emitted and the build fails at
+          CMake's generate step.
+        file:
+          path: qt_watcher_module/metadata.json
+          language: json
+          content: |
+            {
+              "name": "qt_watcher_module",
+              "version": "1.0.0",
+              "type": "core",
+              "category": "general",
+              "description": "A Qt-typed consumer: subscribes to notifier_module's event from onInit()",
+              "main": "qt_watcher_module_plugin",
+              "interface": "provider",
+              "dependencies": ["notifier_module"],
+
+              "nix": {
+                "packages": {
+                  "build": [],
+                  "runtime": []
+                },
+                "external_libraries": [],
+                "cmake": {
+                  "find_packages": [],
+                  "extra_sources": []
+                }
+              }
+            }
+
+      - title: "CMakeLists.txt — PROVIDER_HEADER"
+        text: |
+          Only your own sources. The builder generates
+          `logos_provider_dispatch.cpp` — the table mapping an incoming IPC call
+          to one of the `LOGOS_METHOD`s — into `generated_code/`, and
+          `LogosModule.cmake` compiles everything it finds there.
+
+          Two things deliberately absent, both of which break this build:
+
+          - **No `logos_provider_dispatch.cpp` under `SOURCES`.** Named there it
+            resolves against the source directory, where a generated file does not
+            exist, and CMake fails at its generate step.
+          - **No `PROVIDER_HEADER` argument.** It exists for the non-Nix source
+            layout, where it adds a rule to run the generator. In a Nix build the
+            generator has already run (`"interface": "provider"` is what schedules
+            it), so passing it only re-adds the same file a second time and marks
+            it `GENERATED` — which puts it in front of AUTOMOC and produces a
+            ninja dependency cycle through the target's own autogen timestamp.
+        file:
+          path: qt_watcher_module/CMakeLists.txt
+          language: cmake
+          content: |
+            cmake_minimum_required(VERSION 3.14)
+            project(QtWatcherModulePlugin LANGUAGES CXX)
+
+            if(DEFINED ENV{LOGOS_MODULE_BUILDER_ROOT})
+                include($ENV{LOGOS_MODULE_BUILDER_ROOT}/cmake/LogosModule.cmake)
+            elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/LogosModule.cmake")
+                include(cmake/LogosModule.cmake)
+            else()
+                message(FATAL_ERROR "LogosModule.cmake not found")
+            endif()
+
+            logos_module(
+                NAME qt_watcher_module
+                SOURCES
+                    src/qt_watcher_module_loader.h
+                    src/qt_watcher_module_impl.h
+                    src/qt_watcher_module_impl.cpp
+            )
+
+      - title: "flake.nix — add the dependency input"
+        text: |
+          The input name **must match** the dependency name in `metadata.json`.
+          The `path:` value is a placeholder — we lock it to the real notifier
+          checkout in the build step with `--override-input` (Nix will not accept
+          a relative `../` path written directly into `flake.nix`).
+        file:
+          path: qt_watcher_module/flake.nix
+          language: nix
+          content: |
+            {
+              description = "Qt-typed consumer of notifier_module";
+
+              inputs = {
+                logos-module-builder.url = "github:logos-co/logos-module-builder{release}";
+
+                # The module this one depends on. Placeholder path — locked to the
+                # real checkout in the build step via --override-input.
+                notifier_module.url = "path:/path/to/your/notifier_module";
+              };
+
+              outputs = inputs@{ logos-module-builder, notifier_module, ... }:
+                logos-module-builder.lib.mkLogosModule {
+                  src = ./.;
+                  configFile = ./metadata.json;
+                  flakeInputs = inputs;
+                };
+            }
+
+      - title: "src/qt_watcher_module_impl.h — the class"
+        text: |
+          `LOGOS_PROVIDER` declares the module identity; each `LOGOS_METHOD` is
+          exposed over IPC. Note the types: `QString`, not `std::string` — this
+          is the Qt surface on both the inbound side (what callers send) and the
+          outbound one (what the dependency wrapper takes).
+        file:
+          path: qt_watcher_module/src/qt_watcher_module_impl.h
+          language: cpp
+          content: |
+            #ifndef QT_WATCHER_MODULE_IMPL_H
+            #define QT_WATCHER_MODULE_IMPL_H
+
+            #include "logos_provider_object.h"
+            #include "logos_api.h"
+            #include "logos_sdk.h"    // LogosModules — one Qt-typed accessor per dependency
+            #include "logos_types.h"
+
+            // A Qt-typed consumer of notifier_module.
+            //
+            // The point of this module is WHERE it subscribes: onInit() runs while
+            // the host has spawned notifier_module's process but before that
+            // process has called listen(), so the dependency is not reachable yet.
+            // That is the moment every real C++ consumer subscribes, and the moment
+            // a wrapper that probes for reachability gives up permanently.
+            class QtWatcherModuleImpl : public LogosProviderBase
+            {
+                LOGOS_PROVIDER(QtWatcherModuleImpl, "qt_watcher_module", "1.0.0")
+
+            protected:
+                void onInit(LogosAPI* api) override;
+
+            public:
+                /// A plain sync call through the generated Qt-typed wrapper.
+                LOGOS_METHOD QString greetThrough(const QString& name);
+
+                /// Whether the subscription made in onInit() was ACCEPTED. Accepted
+                /// is not the same as armed: it means the wrapper took the
+                /// subscription rather than refusing it because the module was
+                /// unreachable at that instant.
+                LOGOS_METHOD bool subscriptionAccepted();
+
+                /// The greeting carried by the last `greeted` event, or empty.
+                LOGOS_METHOD QString lastGreeted();
+
+                /// How many `greeted` events have arrived.
+                LOGOS_METHOD int greetedCount();
+
+            private:
+                LogosModules* m_logos = nullptr;
+                bool          m_accepted = false;
+                QString       m_lastGreeted;
+                int           m_greetedCount = 0;
+            };
+
+            #endif // QT_WATCHER_MODULE_IMPL_H
+
+      - title: "src/qt_watcher_module_loader.h — the plugin entry point"
+        text: |
+          A provider-style module supplies its own loader: a small `QObject` that
+          Qt's plugin system instantiates, and which hands back the
+          implementation. `Q_PLUGIN_METADATA` embeds `metadata.json` into the
+          compiled plugin, which is how `lm` and the host read a module's
+          identity without loading it.
+        file:
+          path: qt_watcher_module/src/qt_watcher_module_loader.h
+          language: cpp
+          content: |
+            #ifndef QT_WATCHER_MODULE_LOADER_H
+            #define QT_WATCHER_MODULE_LOADER_H
+
+            #include <QObject>
+            #include "interface.h"
+            #include "logos_provider_object.h"
+            #include "qt_watcher_module_impl.h"
+
+            class QtWatcherModuleLoader : public QObject,
+                                          public PluginInterface,
+                                          public LogosProviderPlugin
+            {
+                Q_OBJECT
+                Q_PLUGIN_METADATA(IID LogosProviderPlugin_iid FILE "metadata.json")
+                Q_INTERFACES(PluginInterface LogosProviderPlugin)
+
+            public:
+                QString name() const override { return "qt_watcher_module"; }
+                QString version() const override { return "1.0.0"; }
+                LogosProviderObject* createProviderObject() override
+                {
+                    return new QtWatcherModuleImpl();
+                }
+            };
+
+            #endif // QT_WATCHER_MODULE_LOADER_H
+
+      - title: "src/qt_watcher_module_impl.cpp — subscribing at init"
+        text: |
+          `onGreeted` is generated from the notifier's `logos_events:` block, one
+          accessor per event, named `on` + the capitalized event name. Its
+          callback carries the event's parameters already decoded into Qt types —
+          `const QString&`, not a `QVariantList` the author has to unpack.
+
+          It returns whether the subscription was **accepted**, which is
+          deliberately not the same question as "is it live now". A module that
+          has not finished starting is a perfectly good subscription target; it
+          just has not arrived yet.
+        file:
+          path: qt_watcher_module/src/qt_watcher_module_impl.cpp
+          language: cpp
+          content: |
+            #include "qt_watcher_module_impl.h"
+
+            #include <QDebug>
+
+            void QtWatcherModuleImpl::onInit(LogosAPI* api)
+            {
+                delete m_logos;
+                m_logos = new LogosModules(api);
+
+                // Subscribe HERE, at init, not from a method a test calls later.
+                // notifier_module's host process has been spawned but has almost
+                // certainly not called listen() yet, so this is the unreachable
+                // window. The generated accessor takes the subscription now and
+                // arms it when the module appears.
+                m_accepted = m_logos->notifier_module.onGreeted(
+                    [this](const QString& greeting) {
+                        m_lastGreeted = greeting;
+                        ++m_greetedCount;
+                        qDebug() << "QtWatcherModuleImpl: greeted ->" << greeting;
+                    });
+
+                qDebug() << "QtWatcherModuleImpl: subscription accepted =" << m_accepted;
+            }
+
+            QString QtWatcherModuleImpl::greetThrough(const QString& name)
+            {
+                if (!m_logos) return QString();
+                return m_logos->notifier_module.greet(name);
+            }
+
+            bool QtWatcherModuleImpl::subscriptionAccepted()
+            {
+                return m_accepted;
+            }
+
+            QString QtWatcherModuleImpl::lastGreeted()
+            {
+                return m_lastGreeted;
+            }
+
+            int QtWatcherModuleImpl::greetedCount()
+            {
+                return m_greetedCount;
+            }
+
+  - title: "Build both modules against this SDK"
+    step: true
+    text: |
+      Nix flakes only see files tracked by git, so initialise a repo in each
+      module first. Then build each `.lgx`, overriding `logos-cpp-sdk` to the
+      commit under test so the generated wrappers, the plugin glue, and the IPC
+      layer all come from this SDK.
+
+      > Each override URL carries a `{release}` placeholder the doc-test runner
+      > expands to a concrete ref: locally that is this `logos-cpp-sdk`
+      > checkout's `HEAD` (see `run.sh`); in CI it is the commit being tested.
+      > With no pin it falls back to latest `master`.
+    steps:
+      - title: "Initialise git repos"
+        run: |
+          (cd notifier_module && git init -q && git add -A)
+          (cd qt_watcher_module && git init -q && git add -A)
+        check_file: "notifier_module/.git/HEAD"
+
+      - title: "Build the notifier's .lgx against this SDK"
+        run: |
+          nix build 'path:./notifier_module#lgx' \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            -o notifier-lgx
+        code_block: |
+          nix build 'path:./notifier_module#lgx' \
+            --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            -o notifier-lgx
+        post_text: "The notifier package is under `./notifier-lgx/`:"
+        extra_run:
+          run: "ls notifier-lgx/*.lgx"
+
+      - title: "Build the watcher's .lgx against this SDK"
+        text: |
+          The watcher pulls in `notifier_module` as a dependency, so we lock that
+          input to the local notifier checkout **and** override `logos-cpp-sdk`
+          in both builders — so the Qt-typed dependency wrapper the generator
+          emits, and both plugins, come from one consistent SDK.
+        run: |
+          nix build 'path:./qt_watcher_module#lgx' \
+            --override-input notifier_module 'path:./notifier_module' \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input notifier_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input notifier_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            -o qt-watcher-lgx
+        code_block: |
+          nix build 'path:./qt_watcher_module#lgx' \
+            --override-input notifier_module 'path:./notifier_module' \
+            --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input notifier_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input notifier_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            -o qt-watcher-lgx
+        post_text: |
+          The watcher package is under `./qt-watcher-lgx/`. Reaching this line is
+          already a result: it means the Qt-typed `notifier_module_api.{h,cpp}`
+          was generated **and compiled**, which is a different body of emitted
+          code from the one every other spec in this directory exercises.
+        extra_run:
+          run: "ls qt-watcher-lgx/*.lgx"
+
+  - title: "Build the runtime and install both modules"
+    step: true
+    text: |
+      Build `logoscore` (against this SDK) and `lgpm`, then install both modules
+      into a `./modules` directory the daemon can scan.
+    steps:
+      - title: "Build logoscore against this SDK"
+        run: |
+          nix build 'github:logos-co/logos-logoscore-cli{release}' \
+            --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --out-link ./logos
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli' \
+            --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --out-link ./logos
+        check_file: "logos/bin/logoscore"
+
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+      - title: "Seed the modules directory with the capability module"
+        text: |
+          Loading a module goes through the host's capability layer, so the
+          modules directory needs the `capability_module` that ships with
+          `logoscore` (rebuilt against this SDK). Copy it across first.
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+
+      - title: "Install the notifier"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file notifier-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+
+      - title: "Install the watcher"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file qt-watcher-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+
+      - title: "Confirm both modules are installed"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        expect_contains:
+          - "notifier_module"
+          - "qt_watcher_module"
+        check_file: "modules/qt_watcher_module/manifest.json"
+
+  - title: "Load both modules and prove the event arrives"
+    step: true
+    text: |
+      Start `logoscore` in daemon mode (`-D`) so each module's process stays
+      alive between `call` commands — the subscription registered during the
+      watcher's `onInit()` has to still be there when a later call makes the
+      notifier fire.
+    steps:
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+
+      - run: "sleep 3"
+
+      - title: "Load the notifier (the dependency first)"
+        run: "./logos/bin/logoscore load-module notifier_module"
+        code_block: "logoscore load-module notifier_module"
+        expect_contains:
+          - "notifier_module"
+
+      - title: "Load the watcher"
+        text: |
+          Loading it runs its `onInit()`, which is where the subscription is
+          made. Nothing here waits for the notifier to be reachable.
+        run: "./logos/bin/logoscore load-module qt_watcher_module"
+        code_block: "logoscore load-module qt_watcher_module"
+        expect_contains:
+          - "qt_watcher_module"
+
+      - title: "Confirm both report loaded"
+        run: "./logos/bin/logoscore status"
+        code_block: "logoscore status"
+        expect_contains:
+          - "notifier_module"
+          - "qt_watcher_module"
+          - '"status":"loaded"'
+
+      - title: "The subscription made at init was accepted"
+        text: |
+          `true` means the generated wrapper took the subscription instead of
+          refusing it. A wrapper that probes the dependency for reachability
+          before subscribing answers `false` here, permanently, because at
+          `onInit()` time the honest answer to that probe is *no*.
+        run: "./logos/bin/logoscore call qt_watcher_module subscriptionAccepted"
+        code_block: "logoscore call qt_watcher_module subscriptionAccepted"
+        expect_contains:
+          - '"result":true'
+
+      - title: "A Qt-typed sync call through the same wrapper"
+        text: |
+          `greetThrough` reaches `notifier_module.greet` through
+          `m_logos->notifier_module`, with `QString` on both ends. It confirms
+          the wrapper is wired up at all, so a silent event later cannot be
+          mistaken for a dead dependency.
+        run: "./logos/bin/logoscore call qt_watcher_module greetThrough Sync"
+        code_block: "logoscore call qt_watcher_module greetThrough Sync"
+        expect_contains:
+          - '"result":"Hello, Sync!"'
+
+      - title: "Nothing has been received yet"
+        text: "The notifier has not fired, so the watcher's state is still empty. This is the control: it makes the next step's result mean something."
+        run: "./logos/bin/logoscore call qt_watcher_module greetedCount"
+        code_block: "logoscore call qt_watcher_module greetedCount"
+        expect_contains:
+          - '"result":0'
+
+      - title: "Make the notifier fire"
+        text: "Called directly on the notifier — the watcher is not involved in triggering its own event."
+        run: "./logos/bin/logoscore call notifier_module greetNotify Qt"
+        code_block: "logoscore call notifier_module greetNotify Qt"
+
+      - run: "sleep 1"
+
+      - title: "The event crossed the boundary into the Qt-typed subscriber"
+        text: |
+          This is the assertion the whole spec exists for: a subscription made
+          before the dependency was reachable, through the Qt-typed generated
+          accessor, delivering a decoded `QString` to the callback.
+        run: "./logos/bin/logoscore call qt_watcher_module lastGreeted"
+        code_block: "logoscore call qt_watcher_module lastGreeted"
+        expect_contains:
+          - '"result":"Hello, Qt!"'
+
+      - title: "Exactly once"
+        text: "One emit, one delivery — a re-arming subscription that fired twice would be as wrong as one that never fired."
+        run: "./logos/bin/logoscore call qt_watcher_module greetedCount"
+        code_block: "logoscore call qt_watcher_module greetedCount"
+        expect_contains:
+          - '"result":1'
+
+      - title: "Stop the daemon"
+        run: "./logos/bin/logoscore stop"
+        code_block: "logoscore stop"
+
+      - run: "sleep 2"
+
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        code_block: "logoscore status"
+        expect_contains:
+          - '"status":"not_running"'
+
+  - title: "Recap"
+    text: |
+      | What was proven | Where |
+      | --------------- | ----- |
+      | The Qt-typed wrapper is **emitted and compiles** | the watcher's `.lgx` built at all |
+      | A subscription made when the dependency is unreachable is **accepted** | `subscriptionAccepted` → `true` |
+      | The Qt-typed **sync** path works | `greetThrough Sync` → `"Hello, Sync!"` |
+      | Nothing arrives before the notifier fires | `greetedCount` → `0` |
+      | The event **arrives, decoded into a `QString`** | `lastGreeted` → `"Hello, Qt!"` |
+      | It arrives **exactly once** | `greetedCount` → `1` |
+
+      A green run here means something no other spec in this directory can mean.
+      The Qt-typed dependency wrapper is a **separately generated body of code**
+      from the `lp` one; the other five specs are all `interface: universal`, so
+      an emission bug on this path is invisible to every one of them. Here it was
+      generated, compiled, and executed.
+
+      The `onInit()` placement is what gives the event row teeth. That is the
+      shape real C++ consumers have — `wallet-ui`'s backend and the tutorial's
+      C++ UI backend both subscribe from a constructor or context hook, against a
+      dependency whose host process has been spawned and has not yet called
+      `listen()`. A wrapper that asked *"is this module reachable?"* before
+      subscribing would return `false` at that instant and never retry: the
+      subscription is lost silently, while method calls to the same module keep
+      working, because calls reach the replica by a path that never asks. Both
+      the `subscriptionAccepted` row and the `lastGreeted` row are needed to tell
+      that apart from a module that is simply quiet.
