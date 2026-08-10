@@ -156,7 +156,9 @@ TEST(LidlGenClient, SourceHasEventBoilerplate)
     auto m = makeTestModule();
     QString s = lidlMakeSource(m);
     EXPECT_TRUE(s.contains("WalletModule::on(const QString& eventName"));
-    EXPECT_TRUE(s.contains("ensureReplica()"));
+    // Deferred, not a synchronous acquire -- see MakeSourceTest.
+    EXPECT_TRUE(s.contains("onEventWhenAvailable(m_moduleName, eventName, callback)"));
+    EXPECT_FALSE(s.contains("ensureReplica"));
 }
 
 TEST(LidlGenClient, SourceHasReturnConversion)

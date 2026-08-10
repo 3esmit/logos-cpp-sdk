@@ -118,7 +118,11 @@ TEST(MakeHeaderTest, ContainsPrivateMembers)
     EXPECT_TRUE(h.contains("m_api"));
     EXPECT_TRUE(h.contains("m_client"));
     EXPECT_TRUE(h.contains("m_moduleName"));
-    EXPECT_TRUE(h.contains("ensureReplica"));
+    // ensureReplica()/m_eventReplica are gone: the deferred subscription
+    // channel owns the acquire, and a per-wrapper replica would bring back both
+    // the blocking acquire and the permanent failure it caused.
+    EXPECT_FALSE(h.contains("ensureReplica"));
+    EXPECT_FALSE(h.contains("m_eventReplica"));
 }
 
 TEST(MakeHeaderTest, ConstRefForStringParams)
