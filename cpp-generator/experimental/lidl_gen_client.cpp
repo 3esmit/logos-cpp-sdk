@@ -324,7 +324,6 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     }
 
     s << "\nprivate:\n";
-    s << "    LogosObject* ensureReplica();\n";
     s << "    template<typename... Args>\n";
     s << "    static QVariantList packVariantList(Args&&... args) {\n";
     s << "        QVariantList list;\n";
@@ -336,7 +335,6 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "    LogosAPI* m_api;\n";
     s << "    LogosAPIClient* m_client;\n";
     s << "    QString m_moduleName;\n";
-    s << "    LogosObject* m_eventReplica = nullptr;\n";
     s << "};\n";
 
     return h;
@@ -400,24 +398,13 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         s << className << "::" << className << "(LogosAPI* api) : m_api(api), m_client(api->getClient(\""
           << module.name << "\")), m_moduleName(QStringLiteral(\"" << module.name << "\")) {}\n\n";
 
-    s << "LogosObject* " << className << "::ensureReplica() {\n";
-    s << "    if (!m_eventReplica) {\n";
-    s << "        LogosObject* replica = m_client->requestObject(m_moduleName);\n";
-    s << "        if (!replica) {\n";
-    s << "            qWarning() << \"" << className << ": failed to acquire remote object for events on\" << m_moduleName;\n";
-    s << "            return nullptr;\n";
-    s << "        }\n";
-    s << "        m_eventReplica = replica;\n";
-    s << "    }\n";
-    s << "    return m_eventReplica;\n";
-    s << "}\n\n";
-
     s << "bool " << className << "::on(const QString& eventName, RawEventCallback callback) {\n";
     s << "    if (!callback) { qWarning() << \"" << className << ": ignoring empty event callback for\" << eventName; return false; }\n";
-    s << "    LogosObject* origin = ensureReplica();\n";
-    s << "    if (!origin) return false;\n";
-    s << "    m_client->onEvent(origin, eventName, callback);\n";
-    s << "    return true;\n";
+    // Deferred: the module is usually NOT reachable at the moment a consumer
+    // subscribes (init(), onContextReady()), and acquiring a replica there used
+    // to block and then fail permanently. onEventWhenAvailable arms it when the
+    // module appears. The return is ACCEPTED, not live.
+    s << "    return m_client->onEventWhenAvailable(m_moduleName, eventName, callback) != 0;\n";
     s << "}\n\n";
 
     s << "bool " << className << "::on(const QString& eventName, EventCallback callback) {\n";

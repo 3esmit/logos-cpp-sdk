@@ -3,6 +3,10 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "${common.pname}-generator";
+  # qtbase\'s setup hook errors in qtPreHook unless a wrapper hook ran or
+  # this is set; the wrapper hooks are absent on Windows (they cannot even
+  # evaluate for a mingw host) and would skip a PE anyway.
+  dontWrapQtApps = true;
   version = common.version;
 
   inherit src;
@@ -30,11 +34,25 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     
-    # Install generator binary
+    # Install generator binary.
+    #
+    # Probe both names and FAIL if neither is there. The unsuffixed-only test
+    # this replaces had no else-branch, so a mingw build (which produces
+    # logos-cpp-generator.exe) copied nothing, succeeded, and shipped an EMPTY
+    # $out/bin -- the failure then surfaced in whichever consumer tried to run
+    # the generator, nowhere near the cause.
     mkdir -p $out/bin
-    if [ -f build-generator/bin/logos-cpp-generator ]; then
-      cp build-generator/bin/logos-cpp-generator $out/bin/
+    _gen=""
+    for _cand in build-generator/bin/logos-cpp-generator build-generator/bin/logos-cpp-generator.exe; do
+      if [ -f "$_cand" ]; then _gen="$_cand"; break; fi
+    done
+    if [ -z "$_gen" ]; then
+      echo "Error: logos-cpp-generator was not produced by the build" >&2
+      echo "Contents of build-generator/bin:" >&2
+      ls -la build-generator/bin 2>&1 >&2 || echo "  (no such directory)" >&2
+      exit 1
     fi
+    cp "$_gen" $out/bin/
 
     # Shared C++/Qt codegen backend helpers for logos-qt-sdk's
     # logos-qt-generator: the Qt type-name mapping (lidl_emit_common), the

@@ -715,10 +715,6 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
           << ", Timeout timeout = Timeout());\n";
     }
     s << "\nprivate:\n";
-    // ensureReplica() is needed whenever the wrapper subscribes to events,
-    // which on the Qt surface is always: the generic `on(...)` channel is
-    // exposed even when the contract declares no typed events.
-    s << "    LogosObject* ensureReplica();\n";
     s << "    template<typename... Args>\n";
     s << "    static QVariantList packVariantList(Args&&... args) {\n";
     s << "        QVariantList list;\n";
@@ -730,7 +726,6 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     s << "    LogosAPI* m_api;\n";
     s << "    LogosAPIClient* m_client;\n";
     s << "    QString m_moduleName;\n";
-    s << "    LogosObject* m_eventReplica = nullptr;\n";
     s << "};\n";
     return h;
 }
@@ -832,28 +827,28 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
         s << className << "::" << className << "(LogosAPI* api) : m_api(api), m_client(api->getClient(\"" << moduleName << "\")), m_moduleName(QStringLiteral(\"" << moduleName << "\")) {}\n\n";
     }
 
-    s << "LogosObject* " << className << "::ensureReplica() {\n";
-    s << "    if (!m_eventReplica) {\n";
-    s << "        LogosObject* replica = m_client->requestObject(m_moduleName);\n";
-    s << "        if (!replica) {\n";
-    s << "            qWarning() << \"" << className << ": failed to acquire remote object for events on\" << m_moduleName;\n";
-    s << "            return nullptr;\n";
-    s << "        }\n";
-    s << "        m_eventReplica = replica;\n";
-    s << "    }\n";
-    s << "    return m_eventReplica;\n";
-    s << "}\n\n";
+    // ensureReplica() is gone: every subscription now goes through
+    // LogosAPIClient::onEventWhenAvailable, which owns the acquire. Keeping a
+    // per-wrapper replica would re-introduce both halves of what it caused —
+    // a blocking requestObject on the subscriber's thread, and a permanent
+    // failure when the module simply had not started yet.
     s << "bool " << className << "::on(const QString& eventName, RawEventCallback callback) {\n";
     s << "    if (!callback) {\n";
     s << "        qWarning() << \"" << className << ": ignoring empty event callback for\" << eventName;\n";
     s << "        return false;\n";
     s << "    }\n";
-    s << "    LogosObject* origin = ensureReplica();\n";
-    s << "    if (!origin) {\n";
-    s << "        return false;\n";
-    s << "    }\n";
-    s << "    m_client->onEvent(origin, eventName, callback);\n";
-    s << "    return true;\n";
+    s << "    // Deferred on purpose. This used to acquire a replica synchronously\n";
+    s << "    // and return false forever if the module was not reachable -- and the\n";
+    s << "    // moment a consumer subscribes (init(), onContextReady(), a view's\n";
+    s << "    // constructor) is exactly the moment it is not, because the\n";
+    s << "    // dependency's host has been spawned but has not called listen() yet.\n";
+    s << "    // onEventWhenAvailable holds the subscription and arms it when the\n";
+    s << "    // module appears, including one installed mid-session, and never\n";
+    s << "    // blocks the calling thread.\n";
+    s << "    //\n";
+    s << "    // The return is therefore ACCEPTED, not live: false only for errors no\n";
+    s << "    // retry can fix (a null callback, an empty module or event name).\n";
+    s << "    return m_client->onEventWhenAvailable(m_moduleName, eventName, callback) != 0;\n";
     s << "}\n\n";
     s << "bool " << className << "::on(const QString& eventName, EventCallback callback) {\n";
     s << "    if (!callback) {\n";
@@ -868,8 +863,10 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
     // Typed event adapters — one per declared event. The callback type
     // uses the apiStyle's type surface; the body unmarshals from the
     // wire's QVariantList into typed args and invokes the user's
-    // callback. Subscription uses the same `m_client->onEvent` channel
-    // the generic `on(...)` uses.
+    // callback. Subscription uses the same deferred
+    // `m_client->onEventWhenAvailable` channel the generic `on(...)` uses —
+    // `m_client->onEvent` is no longer emitted anywhere, because it requires a
+    // handle the subscriber had to acquire (and block for) itself.
     for (const QJsonValue& ev : events) {
         const QJsonObject eo = ev.toObject();
         const QString evName = eo.value("name").toString();
@@ -903,9 +900,8 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
           << "<< QStringLiteral(\"" << evName << "\");\n";
         s << "        return false;\n";
         s << "    }\n";
-        s << "    LogosObject* origin = ensureReplica();\n";
-        s << "    if (!origin) return false;\n";
-        s << "    m_client->onEvent(origin, QStringLiteral(\"" << evName << "\"), "
+        s << "    return m_client->onEventWhenAvailable(m_moduleName, QStringLiteral(\""
+          << evName << "\"), "
           << "[callback](const QString&, const QVariantList& _args) {\n";
         s << "        if (_args.size() < " << evParams.size() << ") return;\n";
         s << "        callback(";
@@ -918,8 +914,7 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
             if (i + 1 < evParams.size()) s << ", ";
         }
         s << ");\n";
-        s << "    });\n";
-        s << "    return true;\n";
+        s << "    }) != 0;\n";
         s << "}\n\n";
     }
 

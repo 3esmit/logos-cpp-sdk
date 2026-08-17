@@ -10,8 +10,8 @@
     pkgs.cmake 
     pkgs.ninja 
     pkgs.pkg-config
-    pkgs.qt6.wrapQtAppsNoGuiHook
-  ];
+  ]
+  ++ pkgs.lib.optional (!pkgs.stdenv.hostPlatform.isWindows) pkgs.qt6.wrapQtAppsNoGuiHook;
   
   # Common runtime dependencies
   buildInputs = [
@@ -41,12 +41,16 @@
   ];
   
   # Common CMake flags
-  cmakeFlags = [ "-GNinja" ];
+  cmakeFlags = [ "-GNinja" ]
+    # Qt's host TOOLS (repc, moc, qmltyperegistrar) live in separate packages
+    # that must RUN on the build machine; logos-nix's Windows overlay exposes
+    # the flags pointing Qt at them. Absent -- so empty -- on native builds.
+    ++ (pkgs.logosQtCrossCmakeFlags or [ ]);
   
   # Metadata
   meta = with pkgs.lib; {
     description = "Logos C++ SDK Library and Code Generator";
-    platforms = platforms.unix;
+    platforms = platforms.unix ++ platforms.windows;
   };
 }
 

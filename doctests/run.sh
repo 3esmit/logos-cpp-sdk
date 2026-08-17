@@ -7,6 +7,8 @@
 #                                           run through logoscore against this SDK
 #   - cpp-sdk-module-composition.test.yaml  two modules built against this SDK,
 #                                           one calling the other over IPC
+#   - cpp-sdk-qt-api-events.test.yaml       a Qt-typed consumer subscribing to a
+#                                           dependency's event from onInit()
 #
 # The runner is the shared `doctest` CLI
 # (https://github.com/logos-co/logos-doctest), invoked directly via its flake.
@@ -31,6 +33,7 @@ SPECS=(
   "cpp-sdk-worker-thread-http.test.yaml"
   "cpp-sdk-concurrent-dispatch.test.yaml"
   "cpp-sdk-generator-roundtrip.test.yaml"
+  "cpp-sdk-qt-api-events.test.yaml"
 )
 
 # Build the doc-tests against THIS repo's current commit rather than the latest
