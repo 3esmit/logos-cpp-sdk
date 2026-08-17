@@ -33,10 +33,18 @@ TEST(MakeSourceTest, ConstructorInitializesClient)
     EXPECT_TRUE(src.contains("api->getClient(\"my_mod\")"));
 }
 
-TEST(MakeSourceTest, EnsureReplicaMethod)
+// Subscriptions must be DEFERRED, not acquired synchronously. The generated
+// wrapper used to call requestObject() and return false forever when the module
+// was not reachable -- which is the normal state at the moment a consumer
+// subscribes, so "calls work, events never arrive" was the result. Pinning the
+// emitted call site because a regression here is silent: the wrapper still
+// compiles, still returns a bool, and simply never delivers.
+TEST(MakeSourceTest, SubscribesViaDeferredChannel)
 {
     QString src = makeSource("mod", "Mod", "mod.h", QJsonArray());
-    EXPECT_TRUE(src.contains("LogosObject* Mod::ensureReplica()"));
+    EXPECT_TRUE(src.contains("m_client->onEventWhenAvailable(m_moduleName, eventName, callback)"));
+    EXPECT_FALSE(src.contains("ensureReplica"));
+    EXPECT_FALSE(src.contains("requestObject"));
 }
 
 TEST(MakeSourceTest, ZeroParams)
