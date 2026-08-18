@@ -6,7 +6,7 @@
   # The protocol layer (transports, token exchange, lp_* C ABI). Follows our
   # logos-nix so both repos resolve the identical nixpkgs/Qt pin — the QRO
   # wire is Qt-version-sensitive.
-  inputs.logos-protocol.url = "github:3esmit/logos-protocol?rev=e9f2b7ccbcdd60a6561589310d0a76909be51e72";
+  inputs.logos-protocol.url = "github:3esmit/logos-protocol?rev=bfad73941f5179d14b5ad0a42dbb0a558797d53f";
   inputs.logos-protocol.inputs.logos-nix.follows = "logos-nix";
   # The canonical, language-neutral LIDL frontend (lexer/parser/AST/serializer/
   # validator) the code generator links. Follows our logos-nix so it resolves
