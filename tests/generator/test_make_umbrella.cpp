@@ -127,3 +127,120 @@ TEST(MakeUmbrellaTest, NoDependenciesStillEmitsTheAggregate)
     EXPECT_TRUE(qt.contains("struct LogosModules {")) << qt.toStdString();
     EXPECT_TRUE(qt.contains("LogosAPI* api;")) << qt.toStdString();
 }
+
+// ── The origin-bound Qt umbrella (UmbrellaBinding::ExplicitOrigin) ───────────
+//
+// The Qt umbrella used to have exactly one shape: `LogosModules(LogosAPI* api)`,
+// with every member built as `<dep>(api)`. That single line is what kept the Qt
+// type surface out of reach for a module with no LogosAPI — a cdylib, whose
+// provider surface is the std `logos_module_impl.h` C ABI and whose generated
+// glue emits an unconditional `new LogosModules()`. This flavour is that
+// umbrella with the identity object removed and the module's OWN NAME baked in
+// instead, matching the shape the Lp flavour has always had.
+//
+// The wrappers it aggregates are logos-qt-generator's
+// (`--backend consumer --binding origin`); the two tools have to agree on a
+// constructor signature, and these tests pin this side of it. The other side is
+// pinned in logos-qt-sdk, which compiles both halves together
+// (tests/qt-generator/fixtures/origin_umbrella_tu.cpp).
+
+TEST(MakeUmbrellaTest, QtExplicitOriginIsDefaultConstructibleAndHoldsNoLogosApi)
+{
+    const QString h = makeUmbrellaHeaderFromDeps(depsMixedForms(), {}, ApiStyle::Qt,
+                                                 "sample_module",
+                                                 UmbrellaBinding::ExplicitOrigin);
+
+    // Default-constructible: what `new LogosModules()` in the cdylib glue needs.
+    EXPECT_TRUE(h.contains("LogosModules() : dep_a(QStringLiteral(\"sample_module\"))"))
+        << h.toStdString();
+    EXPECT_FALSE(h.contains("LogosAPI")) << h.toStdString();
+    EXPECT_FALSE(h.contains("logos_api.h")) << h.toStdString();
+    EXPECT_FALSE(h.contains("logos_api_client.h")) << h.toStdString();
+
+    // Still the Qt type surface — same members, same PascalCase wrapper types,
+    // same includes. Only the binding moved.
+    EXPECT_TRUE(h.contains("DepA dep_a;")) << h.toStdString();
+    EXPECT_TRUE(h.contains("DepB dep_b;")) << h.toStdString();
+    EXPECT_TRUE(h.contains("DepC dep_c;")) << h.toStdString();
+    EXPECT_TRUE(h.contains("#include \"dep_a_api.h\"")) << h.toStdString();
+}
+
+// THE assertion of the whole change: every origin the umbrella writes is the
+// CONSUMING module's own name, stated as a literal. Not derived from an api
+// object, not defaulted, not inherited from whoever constructed the umbrella.
+//
+// The trap this guards is specific and has been measured: `LpBridge::forTarget`
+// reads the origin off `api->moduleName()`, so a wrapper built on a LogosAPI
+// belonging to some OTHER module makes its calls under that module's identity
+// and with its capabilities. A `bind_<iface>(...)` factory is where that would
+// hide — it takes a name at runtime, and taking the WRONG one (the target's
+// name reused as the origin, or a borrowed api) type-checks perfectly.
+TEST(MakeUmbrellaTest, QtExplicitOriginStatesTheConsumersOwnNameEverywhere)
+{
+    const QString h = makeUmbrellaHeaderFromDeps(depsMixedForms(), {"some_iface"},
+                                                 ApiStyle::Qt, "sample_module",
+                                                 UmbrellaBinding::ExplicitOrigin);
+
+    // Members: origin first, target baked into the wrapper itself.
+    EXPECT_TRUE(h.contains("dep_b(QStringLiteral(\"sample_module\"))")) << h.toStdString();
+    EXPECT_TRUE(h.contains("dep_c(QStringLiteral(\"sample_module\"))")) << h.toStdString();
+
+    // Bind factories: origin is the CONSUMER (a literal), target is the
+    // runtime argument. Both overloads, and in that order — swapping them would
+    // make every bound call originate from the provider being bound to.
+    EXPECT_TRUE(h.contains(
+        "return SomeIface(QStringLiteral(\"sample_module\"), moduleName);"))
+        << h.toStdString();
+    EXPECT_TRUE(h.contains(
+        "return SomeIface(QStringLiteral(\"sample_module\"), QString::fromStdString(moduleName));"))
+        << h.toStdString();
+
+    // Nothing anywhere passes an api, and nothing derives a name.
+    EXPECT_FALSE(h.contains("(api")) << h.toStdString();
+    EXPECT_FALSE(h.contains("moduleName()")) << h.toStdString();
+}
+
+// A module that cannot state its own name must not compile. Every origin would
+// otherwise be the empty string, which is not "no identity" to the transport —
+// it is a client authenticating as nobody, failing far from here and looking
+// like a capability bug. The one thing the generator must never do is fill the
+// gap by borrowing a name from somewhere.
+TEST(MakeUmbrellaTest, QtExplicitOriginRefusesToGuessAnOrigin)
+{
+    const QString h = makeUmbrellaHeaderFromDeps(depsMixedForms(), {}, ApiStyle::Qt,
+                                                 QString(), UmbrellaBinding::ExplicitOrigin);
+    EXPECT_TRUE(h.contains("#error")) << h.toStdString();
+    EXPECT_TRUE(h.contains("never derived or borrowed")) << h.toStdString();
+}
+
+// Additive, and asserted as such rather than assumed: the default binding IS
+// the LogosAPI-threading umbrella, byte for byte. Every module in the tree
+// compiles against that output today.
+TEST(MakeUmbrellaTest, TheDefaultBindingIsTheLogosApiUmbrellaUnchanged)
+{
+    const QStringList ifaces{"some_iface"};
+    const QString defaulted =
+        makeUmbrellaHeaderFromDeps(depsMixedForms(), ifaces, ApiStyle::Qt, "sample_module");
+    const QString explicitly =
+        makeUmbrellaHeaderFromDeps(depsMixedForms(), ifaces, ApiStyle::Qt, "sample_module",
+                                   UmbrellaBinding::FromApi);
+    EXPECT_EQ(defaulted, explicitly);
+    EXPECT_TRUE(defaulted.contains("explicit LogosModules(LogosAPI* api)")) << defaulted.toStdString();
+    EXPECT_TRUE(defaulted.contains("return SomeIface(api, moduleName);")) << defaulted.toStdString();
+}
+
+// The Qt-free umbrella is origin-bound by construction, so the flag has nothing
+// to say about it. Asserted rather than left implicit: an Lp branch that started
+// reading `binding` would be a silent behaviour change for every universal and
+// cdylib module in the tree.
+TEST(MakeUmbrellaTest, LpIgnoresTheBindingFlag)
+{
+    const QString a = makeUmbrellaHeaderFromDeps(depsMixedForms(), {"some_iface"},
+                                                 ApiStyle::Lp, "sample_module",
+                                                 UmbrellaBinding::FromApi);
+    const QString b = makeUmbrellaHeaderFromDeps(depsMixedForms(), {"some_iface"},
+                                                 ApiStyle::Lp, "sample_module",
+                                                 UmbrellaBinding::ExplicitOrigin);
+    EXPECT_EQ(a, b);
+    EXPECT_TRUE(a.contains("dep_a(\"sample_module\")")) << a.toStdString();
+}

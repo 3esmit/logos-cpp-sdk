@@ -19,7 +19,7 @@
 #include <QString>
 #include <QTextStream>
 
-#include "../experimental/lidl_compat.h"
+#include "experimental/lidl_compat.h"
 
 // A TypeExpr -> the Qt type NAME the emitter keys off. One Qt type mapper:
 // this delegates to `lidlTypeToQt` (experimental/lidl_emit_common.cpp) rather

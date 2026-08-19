@@ -8,6 +8,75 @@
 #include <QSet>
 #include <QStringList>
 
+bool parseApiStyleFlag(const QStringList& args, ApiStyle& outStyle, QTextStream& err)
+{
+    QString apiVal;
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& a = args.at(i);
+        if (a == "--api-style") {
+            if (i + 1 < args.size()) apiVal = args.at(i + 1);
+            break;
+        }
+        if (a.startsWith("--api-style=")) {
+            apiVal = a.section('=', 1);
+            break;
+        }
+    }
+    if (apiVal == "std") {
+        err << "--api-style=std was retired: the Std surface (std types over a "
+            << "QVariant/LogosAPIClient body) no longer exists.\n"
+            << "Use 'lp' for the Qt-free std-typed surface, or 'qt' for the "
+            << "Qt-typed one.\n";
+        return false;
+    }
+    if (apiVal == "lp") {
+        outStyle = ApiStyle::Lp;
+        return true;
+    }
+    if (!apiVal.isEmpty() && apiVal != "qt") {
+        err << "Unknown --api-style value: " << apiVal
+            << " (expected 'qt' or 'lp')\n";
+        return false;
+    }
+    outStyle = ApiStyle::Qt;
+    return true;
+}
+
+// `--binding api|origin` (both spellings, as above). Absent means FromApi, so
+// every current invocation is unchanged. Lives here, next to UmbrellaBinding,
+// for the same reason parseApiStyleFlag does: one table, no second copy to
+// drift.
+//
+// An unrecognised value is REFUSED rather than defaulted. Defaulting a misspelt
+// `--binding orgin` back to the LogosAPI umbrella would emit `LogosModules(
+// LogosAPI*)` into a module that has no LogosAPI, and the diagnostic would
+// arrive as a constructor mismatch in generated code rather than as a typo.
+bool parseUmbrellaBindingFlag(const QStringList& args, UmbrellaBinding& outBinding, QTextStream& err)
+{
+    QString val;
+    for (int i = 0; i < args.size(); ++i) {
+        const QString& a = args.at(i);
+        if (a == "--binding") {
+            if (i + 1 < args.size()) val = args.at(i + 1);
+            break;
+        }
+        if (a.startsWith("--binding=")) {
+            val = a.section('=', 1);
+            break;
+        }
+    }
+    if (val == "origin") {
+        outBinding = UmbrellaBinding::ExplicitOrigin;
+        return true;
+    }
+    if (!val.isEmpty() && val != "api") {
+        err << "Unknown --binding value: " << val << " (expected 'api' or 'origin')\n";
+        return false;
+    }
+    outBinding = UmbrellaBinding::FromApi;
+    return true;
+}
+
 QString toPascalCase(const QString& name)
 {
     QString out;
@@ -1140,116 +1209,6 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
     return c;
 }
 
-// Join accumulated doc-comment lines into a description, preserving the
-// original line breaks. Leading/trailing blank lines are dropped; interior
-// blank lines (paragraph breaks) are kept.
-static QString joinDocLines(QStringList lines)
-{
-    while (!lines.isEmpty() && lines.first().trimmed().isEmpty()) lines.removeFirst();
-    while (!lines.isEmpty() && lines.last().trimmed().isEmpty()) lines.removeLast();
-    return lines.join('\n');
-}
-
-QVector<ParsedMethod> parseProviderHeader(const QString& headerPath, QTextStream& err)
-{
-    QVector<ParsedMethod> methods;
-
-    QFile file(headerPath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        err << "Cannot open header file: " << headerPath << "\n";
-        return methods;
-    }
-
-    QTextStream in(&file);
-    QRegularExpression re(
-        R"(^\s*LOGOS_METHOD\s+(.+?)\s+(\w+)\s*\(([^)]*)\)\s*;)"
-    );
-
-    // Accumulate comment lines immediately preceding a LOGOS_METHOD so the
-    // doc comment becomes the method's description. Reset on any blank or
-    // non-comment line, so only comments *adjacent* to the declaration count.
-    QStringList pendingDoc;
-    bool inBlockComment = false;
-
-    while (!in.atEnd()) {
-        QString rawLine = in.readLine();
-        QString line = rawLine.trimmed();
-
-        // Inside a multi-line /* ... */ block comment.
-        if (inBlockComment) {
-            QString text = line;
-            int end = text.indexOf("*/");
-            if (end >= 0) {
-                text = text.left(end);
-                inBlockComment = false;
-            }
-            text.remove(QRegularExpression(R"(^\*+\s?)")); // strip leading '*'
-            text = text.trimmed();
-            pendingDoc.append(text);
-            continue;
-        }
-
-        auto match = re.match(rawLine);
-        if (!match.hasMatch()) {
-            // Only doc comments (/// or /** ... */ / /*! ... */) become the
-            // description. Plain // and /* comments are ignored but leave any
-            // pending doc intact; blank / code lines reset it so only comments
-            // *adjacent* to the declaration attach.
-            if (line.startsWith("///")) {
-                QString text = line.mid(3);
-                if (text.startsWith('<')) text = text.mid(1); // ///< trailing form
-                text = text.trimmed();
-                pendingDoc.append(text);
-            } else if (line.startsWith("/**") || line.startsWith("/*!")) {
-                QString text = line.mid(3);
-                int end = text.indexOf("*/");
-                if (end >= 0) text = text.left(end);
-                else inBlockComment = true;
-                text.remove(QRegularExpression(R"(^\*+\s?)"));
-                text = text.trimmed();
-                pendingDoc.append(text);
-            } else if (line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) {
-                // Non-doc comment: ignore, keep any pending doc comment.
-            } else {
-                pendingDoc.clear();
-            }
-            continue;
-        }
-
-        ParsedMethod m;
-        m.returnType = normalizeType(match.captured(1));
-        m.name = match.captured(2);
-        m.description = joinDocLines(pendingDoc);
-        pendingDoc.clear();
-
-        QString paramStr = match.captured(3).trimmed();
-        if (!paramStr.isEmpty()) {
-            QStringList paramParts = paramStr.split(',');
-            for (const QString& part : paramParts) {
-                QString trimmed = part.trimmed();
-                int eqIdx = trimmed.indexOf('=');
-                if (eqIdx > 0) trimmed = trimmed.left(eqIdx).trimmed();
-                int lastSpace = trimmed.lastIndexOf(' ');
-                int lastAmp = trimmed.lastIndexOf('&');
-                int splitAt = qMax(lastSpace, lastAmp);
-                if (splitAt > 0) {
-                    QString type = normalizeType(trimmed.left(splitAt + 1));
-                    QString pname = trimmed.mid(splitAt + 1).trimmed();
-                    m.params.append({type, pname});
-                } else {
-                    m.params.append({normalizeType(trimmed), QString("arg%1").arg(m.params.size())});
-                }
-            }
-        }
-
-        methods.append(m);
-    }
-
-    file.close();
-    return methods;
-}
-
-
 // ─── ApiStyle::Lp (Qt-free) wrapper emission ─────────────────────────────
 //
 // A std-typed surface (the mapParamTypeStd / mapReturnTypeStd table above)
@@ -1569,12 +1528,81 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
 
 // ── Umbrella (logos_sdk.h / logos_sdk.cpp) over a module's dependencies ──────
 
-QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle, const QString& originName)
+QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle, const QString& originName, UmbrellaBinding binding)
 {
     const QStringList depNames = dependencyNames(deps);
 
     QString content;
     QTextStream s(&content);
+
+    // Qt types, explicit origin: the umbrella a module with NO LogosAPI — a
+    // cdylib, whose provider surface is the std `logos_module_impl.h` C ABI —
+    // aggregates its Qt-typed dependency wrappers into. Structurally the Lp
+    // branch below with Qt spellings: default-constructible, so the generated
+    // glue's unconditional `new LogosModules()` compiles, and no LogosAPI
+    // member, so nothing in the module has to hold one.
+    //
+    // The per-dep wrappers are logos-qt-generator's
+    // (`--backend consumer --binding origin`); this emitter has no Qt-typed
+    // wrapper flavour to match it, and adding one would put two emitters back
+    // on the one artifact they currently agree on.
+    if (apiStyle == ApiStyle::Qt && binding == UmbrellaBinding::ExplicitOrigin) {
+        s << "#pragma once\n";
+        s << "#include <QString>\n";
+        // Only for the std::string bind_<iface> overloads, matching the FromApi
+        // branch's rule.
+        if (!interfaceNames.isEmpty()) s << "#include <string>\n";
+        // Deliberately NO logos_api.h / logos_api_client.h: this umbrella names
+        // neither type, and a translation unit that includes it must be able to
+        // compile with no LogosAPI in scope at all.
+        for (const QString& depName : depNames)
+            s << "#include \"" << depName << "_api.h\"\n";
+        for (const QString& ifaceName : interfaceNames)
+            s << "#include \"" << ifaceName << "_api.h\"\n";
+        s << "\n";
+
+        // A module that does not know its own name must not compile. Every
+        // origin below would otherwise be the empty string, and an empty origin
+        // is not "no identity" to the transport — it is a client that
+        // authenticates as nobody, which fails far from here and looks like a
+        // capability bug. The one thing it must NEVER do is borrow a name.
+        if (originName.isEmpty()) {
+            s << "#error \"logos_sdk.h: the origin-bound umbrella needs the consuming "
+                 "module's own name (metadata.json#name); none was given, and an origin "
+                 "is asserted here, never derived or borrowed\"\n\n";
+        }
+
+        const QString origin = "QStringLiteral(\"" + originName + "\")";
+
+        s << "struct LogosModules {\n";
+        s << "    LogosModules()";
+        bool first = true;
+        for (const QString& depName : depNames) {
+            s << (first ? " : " : ",\n        ");
+            first = false;
+            s << depName << "(" << origin << ")";
+        }
+        s << " {}\n";
+        for (const QString& depName : depNames)
+            s << "    " << toPascalCase(depName) << " " << depName << ";\n";
+        // Bind factories. Unlike the Lp branch there is no umbrella-owned
+        // State: the Qt consumer wrapper is already a thin handle over a
+        // process-lifetime LpBridge keyed by (origin, target), so a
+        // `bind_x(...)` temporary's subscriptions outlive it exactly as they do
+        // on the LogosAPI-taking path. Same two overloads, same reason.
+        for (const QString& ifaceName : interfaceNames) {
+            const QString className = toPascalCase(ifaceName);
+            s << "    " << className << " bind_" << ifaceName << "(const QString& moduleName) {\n";
+            s << "        return " << className << "(" << origin << ", moduleName);\n";
+            s << "    }\n";
+            s << "    " << className << " bind_" << ifaceName << "(const std::string& moduleName) {\n";
+            s << "        return " << className << "(" << origin
+              << ", QString::fromStdString(moduleName));\n";
+            s << "    }\n";
+        }
+        s << "};\n";
+        return content;
+    }
 
     // Lp (Qt-free) umbrella: no LogosAPI. Each dep wrapper self-creates its
     // lp_client on behalf of `originName` (this module), so the struct is
@@ -1582,10 +1610,21 @@ QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& in
     if (apiStyle == ApiStyle::Lp) {
         s << "#pragma once\n";
         s << "#include <string>\n";
-        if (!interfaceNames.isEmpty()) {
-            s << "#include <map>\n";
-            s << "#include <memory>\n";
-        }
+        // <map>, <memory> and logos_lp_client.h are UNCONDITIONAL because
+        // dynamic() below is: it caches a logos::LpClient per target in a
+        // std::map of unique_ptr, whatever the dependency list looks like.
+        //
+        // They were conditional on interfaceNames when the only user was the
+        // bind_<iface> state map, and a module WITH dependencies still compiled
+        // by accident — <dep>_api.h drags logos_lp_client.h in transitively. A
+        // module with NO dependencies and NO interfaces includes nothing else,
+        // so it got an umbrella naming logos::LpClient with the type undeclared
+        // ("no type named 'LpClient' in namespace 'logos'"). test_fullapi_cpp is
+        // exactly that shape, which is why the SDK's own #default and checks
+        // stayed green while a real dependency-free module could not build.
+        s << "#include <map>\n";
+        s << "#include <memory>\n";
+        s << "#include \"logos_lp_client.h\"\n";
         for (const QString& depName : depNames)
             s << "#include \"" << depName << "_api.h\"\n";
         for (const QString& ifaceName : interfaceNames)
@@ -1621,6 +1660,31 @@ QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& in
             s << "    std::map<std::string, std::unique_ptr<" << className << "::State>> m_"
               << ifaceName << "_bound;\n";
         }
+
+        // Untyped, BY-NAME access to a module this umbrella does not wrap.
+        //
+        // The typed members above cover `metadata.json#dependencies`, which is
+        // the right default and stays the ordinary way to call another module.
+        // But the by-name path already exists at every layer beneath this one
+        // (lp_client_create / lp_invoke, logos::LpClient), so a consumer that
+        // genuinely needs it — a proxy, a router, anything whose target is a
+        // runtime value — has been reaching around the umbrella to get it.
+        // Exposing it here is what makes that a supported surface rather than
+        // an accident.
+        //
+        // The origin is baked in, exactly as the typed members' is: an origin
+        // is asserted, never borrowed, and a wrong one authenticates as nobody
+        // and fails far from the call. Clients are cached per target, mirroring
+        // the bind_ state map above, because LpClient owns a connection.
+        //
+        // Pair it with LpClient::getMethods() — invoke without introspect is
+        // guessing.
+        s << "    logos::LpClient& dynamic(const std::string& target) {\n";
+        s << "        auto& _c = m_dynamic[target];\n";
+        s << "        if (!_c) _c = std::make_unique<logos::LpClient>(target, \"" << originName << "\");\n";
+        s << "        return *_c;\n";
+        s << "    }\n";
+        s << "    std::map<std::string, std::unique_ptr<logos::LpClient>> m_dynamic;\n";
         s << "};\n";
         return content;
     }

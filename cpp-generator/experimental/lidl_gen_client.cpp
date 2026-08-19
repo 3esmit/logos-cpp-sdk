@@ -293,7 +293,7 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
         // followed by an optional Timeout. Both trailing and defaulted, so
         // existing call sites (including ones passing `&err` positionally)
         // compile unchanged. Mirrors the legacy emitter in
-        // legacy/generator_lib.cpp; the two must agree, since a consumer can
+        // generator_lib.cpp; the two must agree, since a consumer can
         // reach either (this one from a published `.lidl`, that one through the
         // module builder) for the same contract.
         if (!md.params.empty()) s << ", ";
