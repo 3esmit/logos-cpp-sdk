@@ -213,8 +213,8 @@ The provider side. From the contract, `--backend cdylib` emits the C-ABI
 `logos_module_*` symbols the host drives — `logos_module_dispatch`,
 `logos_module_get_methods`, `logos_module_set_context`, and the event
 emitters. It is Qt-free; the uniform Qt-plugin glue is layered on separately
-by `logos-qt-generator`. The author writes only the impl class above; this
-glue is generated.
+by `logos-qt-host-generator --backend cdylib` (logos-plugin-qt). The author
+writes only the impl class above; this glue is generated.
 
 ### 4.1 Generate the provider glue
 

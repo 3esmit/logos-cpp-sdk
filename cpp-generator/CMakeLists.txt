@@ -20,9 +20,9 @@ find_package(logos-lidl REQUIRED)
 
 add_executable(logos-cpp-generator
     main.cpp
-    legacy/main.cpp
-    legacy/generator_lib.cpp
-    legacy/lidl_to_json.cpp
+    generator_lib.cpp
+    lidl_to_json.cpp
+    plugin_introspect.cpp
     experimental/lidl_emit_common.cpp
     experimental/lidl_gen_client.cpp
     experimental/lidl_gen_cdylib.cpp
@@ -31,13 +31,15 @@ add_executable(logos-cpp-generator
 
 target_link_libraries(logos-cpp-generator PRIVATE Qt${QT_VERSION_MAJOR}::Core logos-lidl::logos_lidl)
 
-# nlohmann_json: pulled in transitively by logos_provider_object.h →
-# logos_provider_interface.h / logos_json_convert.h (header-only use).
+# nlohmann_json: pulled in transitively by logos_provider_interface.h /
+# logos_json_convert.h (header-only use). It used to arrive via
+# ../cpp/logos_provider_object.h; that header moved out with the Qt split and
+# plugin_introspect.cpp now includes logos_provider_interface.h directly.
 find_package(nlohmann_json REQUIRED)
 target_link_libraries(logos-cpp-generator PRIVATE nlohmann_json::nlohmann_json)
 
 # logos-protocol headers (logos_provider_interface.h, logos_json_convert.h —
-# included transitively via ../cpp/logos_provider_object.h). Header-only:
+# included directly by plugin_introspect.cpp). Header-only:
 # the generator does not link the protocol library. Resolution mirrors
 # cpp/CMakeLists.txt: -DLOGOS_PROTOCOL_ROOT / env / sibling checkout.
 if(NOT DEFINED LOGOS_PROTOCOL_ROOT)
@@ -58,7 +60,6 @@ endif()
 
 target_include_directories(logos-cpp-generator PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/legacy
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental
     ${CMAKE_CURRENT_SOURCE_DIR}/../cpp
     ${LP_INCLUDE}

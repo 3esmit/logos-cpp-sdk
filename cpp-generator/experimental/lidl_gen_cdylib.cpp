@@ -140,8 +140,23 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& pat
         if (te.name == "any")  return expr;
     }
     const QString cpp = lidlTypeToStdCdylib(te, recs);
-    if (cpp == "LogosMap" || cpp == "LogosList")
-        return expr;  // untyped JSON passes through, as it always has
+    // `[any]` / `{tstr:any}`. The ELEMENT type is unconstrained, so there is
+    // nothing to decode — but the SHAPE is declared, and it used to pass through
+    // unchecked ("as it always has"). That let a scalar reach a LogosList
+    // parameter, and a proxy forwarding it through a Qt-typed consumer turned
+    // "notalist" into ["n","o","t","a","l","i","s","t"] — qvariant_cast reads a
+    // QString as a sequential container. The downstream provider then saw a
+    // well-formed array and had nothing to refuse.
+    //
+    // Checked here rather than deeper: LogosList and LogosMap are both aliases
+    // of nlohmann::json, so no codec specialization can tell them apart. The
+    // value is still handed on unchanged, and the throw lands in the dispatch's
+    // existing catch as {"code":"dispatch_failed"} — the same answer, with the
+    // same message, that every non-Qt surface already gives.
+    if (cpp == "LogosList")
+        return "logos::jsonRequireArray(" + expr + ", \"" + path + "\")";
+    if (cpp == "LogosMap")
+        return "logos::jsonRequireObject(" + expr + ", \"" + path + "\")";
     // A TYPED map does not NAME its C++ type — it hands the compiler a proxy and
     // lets the author's own declaration pick it.
     //
@@ -716,6 +731,9 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     // modules() was already wired by lidlEnsureModulesWired() above (before this
     // context-gated early return), so onContextReady can safely call
     // modules().<dep>... / subscribe to dependency events from the hook.
+    // The module's own registry name, which the generator knows statically.
+    // Set BEFORE the context so moduleName() is live inside onContextReady().
+    s << "    _logos_codegen_::maybeSetModuleName(lidlImpl(), \"" << module.name << "\");\n";
     s << "    _logos_codegen_::maybeSetContext(lidlImpl(), path, id, persist);\n";
     s << "}\n\n";
 
@@ -844,6 +862,43 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    // per-target token on the first cross-module call. lp_token_save\n";
     s << "    // writes the same TokenManager::instance() the lp_client reads.\n";
     s << "    return lp_token_save(module_name, token);\n}\n\n";
+
+    // Guarded on the protocol MINOR that introduced the trust-root surface
+    // (0.3). The emitted module must still COMPILE against an older
+    // logos-protocol, which has neither lp_grant_host_services nor the
+    // logos_module_impl.h declaration — a module built against 0.2 simply has
+    // no grant entry point, which is the same fail-closed state as never being
+    // granted. Without this an older protocol is a hard compile error in
+    // generated code the author never sees.
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && LOGOS_PROTOCOL_VERSION_MINOR >= 3\n";
+    s << "int logos_module_grant_host_services(const char* services_json)\n{\n";
+    s << "    // Route the host's grant into THIS image's gate state.\n";
+    s << "    //\n";
+    s << "    // The grant has to travel over the C ABI rather than being\n";
+    s << "    // recorded once by the host, and that is the whole reason this\n";
+    s << "    // export exists: the host binary and this cdylib each link their\n";
+    s << "    // own copy of logos-protocol, so each has its own process-global\n";
+    s << "    // grant state, exactly as each has its own TokenManager. A grant\n";
+    s << "    // the host records for itself is invisible to the gate a\n";
+    s << "    // lp_token_keys() call checks HERE, so a gate 'simplified' into\n";
+    s << "    // the host would silently never fire.\n";
+    s << "    //\n";
+    s << "    // Emitted unconditionally, for every module, rather than behind a\n";
+    s << "    // codegen flag: which modules are privileged is the HOST's\n";
+    s << "    // decision (it chooses what to push, and pushes nothing to an\n";
+    s << "    // ordinary module), and lp_grant_host_services itself validates\n";
+    s << "    // the names and fails closed. A per-module flag would only add a\n";
+    s << "    // second place for the two to disagree.\n";
+    s << "    //\n";
+    s << "    // NOTE this is a declaration-and-audit boundary, NOT a defence\n";
+    s << "    // against a hostile module: this cdylib links logos-protocol, so\n";
+    s << "    // its own code can call lp_grant_host_services() directly and\n";
+    s << "    // self-grant. What the gate buys is that the privilege is\n";
+    s << "    // explicit, greppable and off by default, so no module acquires\n";
+    s << "    // it by accident. Isolation between modules rests on process\n";
+    s << "    // separation, the auth token and the target's allowedCallers.\n";
+    s << "    return lp_grant_host_services(services_json);\n}\n";
+    s << "#endif\n\n";
 
     s << "const char* logos_module_get_protocol_version(void)\n{\n";
     s << "    return LOGOS_PROTOCOL_VERSION_STRING;\n}\n\n";

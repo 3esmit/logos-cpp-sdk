@@ -3,10 +3,9 @@
 
   inputs.logos-nix.url = "github:logos-co/logos-nix";
   inputs.nixpkgs.follows = "logos-nix/nixpkgs";
-  # The protocol layer (transports, token exchange, lp_* C ABI). Follows our
-  # logos-nix so both repos resolve the identical nixpkgs/Qt pin — the QRO
-  # wire is Qt-version-sensitive.
-  inputs.logos-protocol.url = "github:3esmit/logos-protocol?rev=bfad73941f5179d14b5ad0a42dbb0a558797d53f";
+  # Keep protocol inputs on the maintained fork so downstream fork builds do
+  # not silently switch back to the upstream repository.
+  inputs.logos-protocol.url = "github:3esmit/logos-protocol?rev=f090940772eb74f6cfac0febdecd521f05a264c7";
   inputs.logos-protocol.inputs.logos-nix.follows = "logos-nix";
   # The canonical, language-neutral LIDL frontend (lexer/parser/AST/serializer/
   # validator) the code generator links. Follows our logos-nix so it resolves
@@ -73,9 +72,15 @@
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
           tests = import ./nix/tests.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
+          generator = import ./nix/bin.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
         in
         {
           inherit tests;
+          # Runs the BINARY. The gtest suite links the generator's internals and
+          # never executes it, so a retired CLI flag can only be asserted here.
+          generator-cli = import ./nix/tests-generator-cli.nix {
+            inherit pkgs common generator;
+          };
         }
       );
 

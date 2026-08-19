@@ -3,16 +3,10 @@
 
 #include <QString>
 #include <QJsonArray>
+#include <QStringList>
 #include <QTextStream>
 #include <QVector>
 #include <QPair>
-
-struct ParsedMethod {
-    QString returnType;
-    QString name;
-    QVector<QPair<QString, QString>> params; // (type, name)
-    QString description; // doc comment adjacent to the LOGOS_METHOD declaration
-};
 
 // Which type surface to expose on the generated per-module wrapper.
 // Each module's build picks ONE — there's no composite output. Default
@@ -33,6 +27,21 @@ struct ParsedMethod {
 // retired; `--api-style=std` is now a hard error rather than a silent alias.
 enum class ApiStyle { Qt, Lp };
 
+// Parse the `--api-style` flag out of a raw argument list. Both spellings are
+// accepted (`--api-style lp` and `--api-style=lp`); absent means Qt. Returns
+// false — having written a diagnostic to `err` — for a value the generator
+// refuses, in which case `outStyle` is untouched and the caller must exit 1.
+//
+// Lives here, next to the enum, because BOTH CLI entry points need it: the
+// umbrella mode in main.cpp and the plugin-introspection path. Two copies of this
+// table is exactly how the surfaces drift apart.
+//
+// `std` was a third surface (std types over a QVariant/LogosAPIClient body).
+// It is retired, and rejected LOUDLY rather than aliased to qt: a stale caller
+// that still passes it wants std signatures, and silently handing it the Qt
+// surface would only fail later, further from the cause.
+bool parseApiStyleFlag(const QStringList& args, ApiStyle& outStyle, QTextStream& err);
+
 // Whether the generated wrapper targets ONE fixed module (the historical
 // behaviour) or binds to a module name chosen at runtime.
 //   Static — the module name is baked into the ctor + every remote call,
@@ -45,6 +54,39 @@ enum class ApiStyle { Qt, Lp };
 // Default is Static so existing callers and their generated output are
 // byte-for-byte unchanged.
 enum class BindMode { Static, Bound };
+
+// How the UMBRELLA binds its wrappers to a transport — the call ORIGIN, where
+// BindMode above decides the call TARGET.
+//   FromApi        — `explicit LogosModules(LogosAPI* api)`, each member built
+//                    as `<dep>(api)` and each factory as `<Iface>(api, name)`.
+//                    The origin is derived, inside the wrapper, from
+//                    `api->moduleName()`. The historical shape, and the default.
+//   ExplicitOrigin — `LogosModules()`, default-constructible, NO LogosAPI
+//                    member and no `logos_api.h` include: each member is built
+//                    as `<dep>(QStringLiteral("<this module>"))` and each
+//                    factory as `<Iface>(QStringLiteral("<this module>"), name)`.
+//
+// Deliberately a parameter and NOT a third ApiStyle value. ApiStyle names the
+// TYPE SURFACE, and is switched on by makeHeader / makeSource / returnTypeFor /
+// paramTypeFor / toWireFor / fromWireFor; a "Qt types, explicit origin" enum
+// value would oblige every one of those to answer a question about transport
+// binding that has no bearing on the types they map — and the honest answer in
+// each would be "same as Qt". The axis being added here is orthogonal to the
+// type surface, so it gets its own name.
+//
+// ApiStyle::Lp IGNORES this: the Qt-free umbrella has only one binding (it is
+// origin-bound by construction, which is what this brings to the Qt surface).
+//
+// The origin is the CONSUMING module's own name, from `metadata.json#name`. An
+// empty one is not defaulted or inferred — the emitted header carries an
+// `#error` instead, because a wrapper that cannot state its own identity would
+// otherwise open a connection under a blank one.
+enum class UmbrellaBinding { FromApi, ExplicitOrigin };
+
+// Parse `--binding api|origin` out of a raw argument list (both `--binding
+// origin` and `--binding=origin`). Absent means FromApi. Returns false — having
+// written a diagnostic to `err` — for a value the generator refuses.
+bool parseUmbrellaBindingFlag(const QStringList& args, UmbrellaBinding& outBinding, QTextStream& err);
 
 QString toPascalCase(const QString& name);
 QString normalizeType(QString t);
@@ -100,7 +142,6 @@ QString makeSource(const QString& moduleName, const QString& className, const QS
 // makeHeader/makeSource dispatch here when apiStyle == ApiStyle::Lp.
 QString makeHeaderLp(const QString& moduleName, const QString& className, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
 QString makeSourceLp(const QString& moduleName, const QString& className, const QString& headerBaseName, const QJsonArray& methods, const QJsonArray& events = {}, BindMode bindMode = BindMode::Static, const QJsonArray& records = {});
-QVector<ParsedMethod> parseProviderHeader(const QString& headerPath, QTextStream& err);
 
 // The umbrella (`logos_sdk.h` / `logos_sdk.cpp`) over a module's declared
 // `metadata.json#dependencies` + interface dependencies: one `#include` and one
@@ -113,7 +154,12 @@ QVector<ParsedMethod> parseProviderHeader(const QString& headerPath, QTextStream
 // self-creates its lp_client on behalf of `originName` (the module being
 // generated for), so the struct is default-constructible. Qt emits the
 // LogosAPI-threading form, where `originName` is unused.
-QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle = ApiStyle::Qt, const QString& originName = QString());
+// `binding` is trailing and defaulted so every current caller keeps the
+// LogosAPI-threading umbrella, unchanged. With ExplicitOrigin the Qt umbrella
+// becomes default-constructible and drops its LogosAPI — matching the shape the
+// Lp flavour already has, and pairing with the wrappers logos-qt-generator
+// emits under `--backend consumer --binding origin`.
+QString makeUmbrellaHeaderFromDeps(const QJsonArray& deps, const QStringList& interfaceNames, ApiStyle apiStyle = ApiStyle::Qt, const QString& originName = QString(), UmbrellaBinding binding = UmbrellaBinding::FromApi);
 QString makeUmbrellaSourceFromDeps(const QJsonArray& deps, const QStringList& interfaceNames);
 
 #endif // GENERATOR_LIB_H
