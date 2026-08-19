@@ -164,6 +164,20 @@ public:
             &LpClient::resultTrampoline, box);
     }
 
+    // The target's method list, as the JSON the host reports. Empty on
+    // failure. Invoke-without-introspect is what makes a by-name call an
+    // escape hatch rather than an API: a caller that cannot ask what exists
+    // can only guess, and a wrong guess fails at runtime like a typo.
+    nlohmann::json getMethods() {
+        lp_client* c = ensure();
+        if (!c) return nlohmann::json();
+        char* out = lp_get_methods(c);
+        if (!out) return nlohmann::json();
+        auto parsed = nlohmann::json::parse(out, nullptr, /*allow_exceptions=*/false);
+        lp_string_free(out);
+        return parsed.is_discarded() ? nlohmann::json() : parsed;
+    }
+
     // Subscribe to `event`. The payload is delivered as a JSON array. The
     // returned handle owns the subscription — keep it alive (the generated
     // wrapper stores it) for as long as you want the callback to fire.

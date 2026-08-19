@@ -3,7 +3,7 @@
 #include <QJsonObject>
 #include <QStringList>
 
-#include "../experimental/lidl_emit_common.h"   // lidlTypeToQt — the one Qt type mapper
+#include "experimental/lidl_emit_common.h"   // lidlTypeToQt — the one Qt type mapper
 
 // Convert a TypeExpr → Qt-typed string name (same surface the
 // metaobject-introspection path produces for methods, so generator_lib

@@ -24,8 +24,9 @@
 // (It lives in logos-cpp-sdk rather than in logos-protocol's
 // logos_call_error.h only because that is where the generator that emits it
 // lives; ${LOGOS_CPP_SDK_ROOT}/include is on the include path of every module
-// build — see logos-plugin-qt/cmake/LogosModule.cmake and its module-builder
-// twin, which add it unconditionally.)
+// build — see logos-module-builder/cmake/LogosModule.cmake, which adds it
+// unconditionally. That file used to have a twin in logos-plugin-qt; it does
+// not any more.)
 
 #include "logos_call_error.h"
 

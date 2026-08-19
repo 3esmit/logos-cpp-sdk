@@ -6,6 +6,13 @@
   # The protocol layer (transports, token exchange, lp_* C ABI). Follows our
   # logos-nix so both repos resolve the identical nixpkgs/Qt pin — the QRO
   # wire is Qt-version-sensitive.
+  #
+  # Master-tracking. This was rev-pinned to feat/per-client-token-store while
+  # logos_host_services.h's trust-root surface (lp_token_keys,
+  # lp_inform_module_token_to, lp_grant_host_services) lived only on that
+  # branch, with protocol master still at LOGOS_PROTOCOL_VERSION_MINOR 2 —
+  # the `tests` check could not compile against it. That branch has merged
+  # (logos-protocol#59): master is 0.4.0 and carries all three.
   inputs.logos-protocol.url = "github:logos-co/logos-protocol";
   inputs.logos-protocol.inputs.logos-nix.follows = "logos-nix";
   # The canonical, language-neutral LIDL frontend (lexer/parser/AST/serializer/
@@ -73,9 +80,15 @@
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
           tests = import ./nix/tests.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
+          generator = import ./nix/bin.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
         in
         {
           inherit tests;
+          # Runs the BINARY. The gtest suite links the generator's internals and
+          # never executes it, so a retired CLI flag can only be asserted here.
+          generator-cli = import ./nix/tests-generator-cli.nix {
+            inherit pkgs common generator;
+          };
         }
       );
 

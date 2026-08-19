@@ -489,7 +489,7 @@ TEST(LidlGenClient, BytesTagCollisionIsRefusedThroughAnOptional)
 // ---------------------------------------------------------------------------
 // Sync timeout + result-carrying async
 //
-// This emitter and legacy/generator_lib.cpp produce the SAME consumer surface
+// This emitter and cpp-generator/generator_lib.cpp produce the SAME consumer surface
 // for the same contract — one is reached from a published `.lidl`, the other
 // through the module builder — so the two must agree. tests/generator/
 // test_async_result.cpp holds the legacy twin of these assertions.

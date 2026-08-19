@@ -646,3 +646,51 @@ TEST(LidlGenCdylib, NonMapSlotsStillNameTheirType)
         << src.toStdString();
     EXPECT_FALSE(src.contains("logos::JsonArg")) << src.toStdString();
 }
+
+// ── The host-services grant export ───────────────────────────────────────────
+//
+// The grant must cross the module-impl C ABI, because the host binary and this
+// cdylib each link their own logos-protocol and so have SEPARATE process-global
+// grant state. A grant the host records for itself leaves the cdylib's gates
+// shut forever, and the failure is silent: lp_token_keys() simply keeps
+// returning null, which is indistinguishable from an empty token store.
+
+TEST(LidlGenCdylib, EmitsTheHostServicesGrantExport)
+{
+    ModuleDecl m;
+    m.name = "any_module";
+
+    const QString src = lidlMakeModuleImplExports(m, "AnyImpl", "any_impl.h");
+
+    EXPECT_TRUE(src.contains("int logos_module_grant_host_services(const char* services_json)"))
+        << src.toStdString();
+}
+
+TEST(LidlGenCdylib, GrantExportForwardsIntoThisImageRatherThanFakingSuccess)
+{
+    ModuleDecl m;
+    m.name = "any_module";
+
+    const QString src = lidlMakeModuleImplExports(m, "AnyImpl", "any_impl.h");
+
+    // The body must actually call lp_grant_host_services. A stub that returned
+    // 0 would make every host push look successful while leaving both gates
+    // shut — exactly the silent failure the ABI exists to avoid.
+    EXPECT_TRUE(src.contains("return lp_grant_host_services(services_json);"))
+        << src.toStdString();
+}
+
+TEST(LidlGenCdylib, GrantExportIsEmittedForEveryModuleNotJustPrivilegedOnes)
+{
+    // Which modules are privileged is the HOST's decision — it pushes nothing
+    // to an ordinary module — so the export is unconditional. Were it emitted
+    // only for modules that declare host_services, the declaration and the
+    // runtime capability would be two places that could disagree.
+    ModuleDecl plain;
+    plain.name = "plain_module";
+    plain.methods.push_back(method("noop", prim("void"), {}));
+
+    const QString src = lidlMakeModuleImplExports(plain, "PlainImpl", "plain_impl.h");
+
+    EXPECT_TRUE(src.contains("logos_module_grant_host_services")) << src.toStdString();
+}

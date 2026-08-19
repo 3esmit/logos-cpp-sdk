@@ -1,3 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SKIPPED — not run by .github/workflows/doctests.yml.
+#
+# The watcher fixture below is `interface: "provider"`. That path was removed
+# from this SDK along with `logos-cpp-generator --provider-header`, so the
+# fixture no longer builds: logos-module-builder reaches "generating provider
+# dispatch (qt_watcher_module)" and the generator refuses. Every later step of
+# this spec cascades from that one failure.
+#
+# It is kept, not deleted, because what it covers is not covered anywhere else:
+# the Qt-TYPED dependency-wrapper emission (a bug in that path cannot be caught
+# by the lp-path specs, which are separately generated code) and a subscription
+# made from onInit(), before the dependency is reachable.
+#
+# TO RESTORE (B4): logos-module-builder master does not yet carry
+# `codegen.consumer_api_style`, and this spec pins the builder to master. Once
+# it does, rewrite the watcher as `"interface": "universal"` +
+# `"codegen": {"consumer_api_style": "qt"}` — which keeps the Qt-typed wrappers
+# without the retired provider dispatch — drop the LOGOS_PROVIDER/LOGOS_METHOD
+# markers and the PROVIDER_HEADER prose, and re-add this file to both spec
+# lists in .github/workflows/doctests.yml.
+# ─────────────────────────────────────────────────────────────────────────────
+
 name: "A Qt-typed Consumer Subscribing to Another Module's Event"
 output: cpp-sdk-qt-api-events.md
 release: ""

@@ -8,31 +8,77 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # logos-cpp-sdk — the Qt-FREE base C++ SDK.
 #
 # After the protocol extraction (logos-protocol) and the Qt split
-# (logos-qt-sdk), what lives here is the standard-C++ developer surface for
-# universal module implementations plus the code generator (built from
-# ../cpp-generator as a separate tool):
+# (logos-qt-sdk), what lives here is the standard-C++ developer surface, split
+# by CAPABILITY. A program is some combination of three distinct things, and
+# each gets its own target so a consumer takes only what it is:
 #
-#   logos_module_context.h  - LogosModuleContext (module identity/context,
-#                             typed modules() accessor, onContextReady)
-#   logos_result.h          - StdLogosResult (std/nlohmann result type)
-#   logos_json.h            - LogosMap/LogosList aliases for impl classes
+#   ::common    logos_json.h, logos_result.h
+#               The shared value types. Everything below links this.
 #
-# Everything is header-only; the exported target is an INTERFACE library.
-# Qt-typed wrappers, the legacy QObject provider path and the Qt plugin
-# glue live in logos-qt-sdk. Transports, the consumer core and the lp_* C
-# ABI live in logos-protocol.
+#   ::consumer  logos_lp_client.h, logos_async_result.h
+#               CALLING other modules. Also the compile-time home of the
+#               generated <dep>_api.{h,cpp} wrappers and their logos_sdk.h
+#               umbrella, which the module builder emits per build.
+#
+#   ::provider  logos_module_context.h, logos_host_services.h
+#               IMPLEMENTING a module. LogosModuleContext is the seam the
+#               generated provider injects into; logos_host_services.h is the
+#               veneer a module uses for services the HOST granted it. (It is
+#               module-side despite the `host_services` name, which is what
+#               motivated this split; a rename to logos_privileged_services.h
+#               has NOT happened — the file installed below is still
+#               logos_host_services.h.)
+#
+#   ::host      logos_host_core.h
+#               STANDING UP a core and loading modules into it. Used by
+#               logos-basecamp, logos-logoscore-cli, logos-standalone-app,
+#               logos-module-viewer. A module never needs this.
+#
+# `logos_headers` remains as an UMBRELLA over all four, so the ~70 existing
+# consumers keep working unchanged; migrate to the narrow targets when touching
+# a repo. Additive first, removal second.
+#
+# Everything is header-only, so every target is an INTERFACE library.
+# Qt-typed wrappers live in logos-qt-sdk, which mirrors this same three-way
+# split. Transports, the consumer core and the lp_* C ABI live in
+# logos-protocol.
 # ---------------------------------------------------------------------------
 
 find_package(nlohmann_json REQUIRED)
 
-add_library(logos_headers INTERFACE)
-target_link_libraries(logos_headers INTERFACE nlohmann_json::nlohmann_json)
-target_include_directories(logos_headers INTERFACE
+# The include dir and nlohmann are common to every capability; each target
+# below adds only its link interface, since the headers themselves are found
+# through the same include path.
+add_library(logos_common INTERFACE)
+target_link_libraries(logos_common INTERFACE nlohmann_json::nlohmann_json)
+target_include_directories(logos_common INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
 )
 
-install(TARGETS logos_headers
+add_library(logos_consumer INTERFACE)
+target_link_libraries(logos_consumer INTERFACE logos_common)
+
+add_library(logos_provider INTERFACE)
+target_link_libraries(logos_provider INTERFACE logos_common)
+
+# NOTE: ::host deliberately does NOT link liblogos. logos-liblogos depends on
+# logos-cpp-sdk, so this repo cannot see its headers or its library without
+# inverting the graph; logos_host_core.h declares the logos_core_* ABI itself
+# and the host program provides it at link time.
+add_library(logos_host INTERFACE)
+target_link_libraries(logos_host INTERFACE logos_common)
+
+# Umbrella. Pre-split consumers link this and get everything, as before.
+add_library(logos_headers INTERFACE)
+target_link_libraries(logos_headers INTERFACE
+    logos_common
+    logos_consumer
+    logos_provider
+    logos_host
+)
+
+install(TARGETS logos_headers logos_common logos_consumer logos_provider logos_host
     EXPORT logos-cpp-sdkTargets
     INCLUDES DESTINATION include
 )
@@ -66,5 +112,7 @@ install(FILES
     logos_result.h
     logos_lp_client.h
     logos_async_result.h
+    logos_host_services.h
+    logos_host_core.h
     DESTINATION include
 )
