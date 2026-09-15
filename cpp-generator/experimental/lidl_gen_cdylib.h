@@ -42,7 +42,8 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module);
 
 QString lidlMakeModuleImplExports(const ModuleDecl& module,
                                   const QString& implClass,
-                                  const QString& implHeader);
+                                  const QString& implHeader,
+                                  const QString& lidlDocument = QString());
 
 QString lidlMakeEventsSourceCdylib(const ModuleDecl& module,
                                    const QString& implClass,

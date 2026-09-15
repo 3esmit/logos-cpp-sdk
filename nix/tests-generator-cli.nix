@@ -244,6 +244,54 @@ pkgs.runCommand "${common.pname}-generator-cli-tests"
            fail "the umbrella still took its members from metadata.json"; }
     echo "OK: the --dep flags decide the umbrella when there are any"
 
+    # ── authored contracts normalize to the canonical serializer form ───
+    cat > authored.lidl <<'EOF'
+    ; formatting and comments are author concerns, not published bytes
+    module   canonical_probe{
+      version "3.2.1"
+      depends[dep_one,dep_two]
+      method ping( value:tstr)->tstr
+    }
+    EOF
+    cat > expected.lidl <<'EOF'
+    module canonical_probe {
+      version "3.2.1"
+      depends [dep_one, dep_two]
+
+      method ping(value: tstr) -> tstr
+    }
+    EOF
+
+    logos-cpp-generator --normalize-lidl authored.lidl -o normalized.lidl \
+      >/dev/null 2>normalize.err \
+      || { cat normalize.err >&2; fail "--normalize-lidl refused a valid authored contract"; }
+    cmp expected.lidl normalized.lidl \
+      || { diff -u expected.lidl normalized.lidl >&2
+           fail "--normalize-lidl did not use the canonical serializer"; }
+
+    logos-cpp-generator --normalize-lidl normalized.lidl -o normalized-again.lidl \
+      >/dev/null 2>normalize-again.err \
+      || { cat normalize-again.err >&2; fail "normalizing canonical LIDL failed"; }
+    cmp normalized.lidl normalized-again.lidl \
+      || fail "LIDL normalization is not byte-idempotent"
+    echo "OK: authored LIDL normalizes canonically and idempotently"
+
+    cat > authored-lidl-method.lidl <<'EOF'
+    module canonical_probe {
+      depends []
+      method lidl() -> tstr
+    }
+    EOF
+    set +e
+    logos-cpp-generator --normalize-lidl authored-lidl-method.lidl \
+      >reserved.out 2>reserved.err
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || fail "an authored lidl() method was accepted"
+    grep -q 'generator-owned' reserved.err \
+      || { cat reserved.err >&2; fail "authored lidl() failed without the ownership diagnostic"; }
+    echo "OK: lidl() is reserved for the canonical built-in"
+
     mkdir -p "$out"
     echo "logos-cpp-generator CLI argument-surface tests passed" > "$out/result.txt"
   ''

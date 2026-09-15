@@ -13,6 +13,25 @@ bool lidlIsStdConvertible(const TypeExpr& te);
 
 namespace {
 
+// Keep the generated literal on one physical source line. The ABI checks run
+// unifdef over this file; that tool does not understand multiline raw strings.
+QString cppStringLiteral(const QString& value)
+{
+    QString escaped;
+    escaped.reserve(value.size() + 2);
+    escaped += QLatin1Char('"');
+    for (const QChar ch : value) {
+        if (ch == QLatin1Char('\\')) escaped += QStringLiteral("\\\\");
+        else if (ch == QLatin1Char('"')) escaped += QStringLiteral("\\\"");
+        else if (ch == QLatin1Char('\n')) escaped += QStringLiteral("\\n");
+        else if (ch == QLatin1Char('\r')) escaped += QStringLiteral("\\r");
+        else if (ch == QLatin1Char('\t')) escaped += QStringLiteral("\\t");
+        else escaped += ch;
+    }
+    escaped += QLatin1Char('"');
+    return escaped;
+}
+
 // The cdylib-supported subset: std-convertible LIDL types only — the same
 // Qt-free set the std apiStyle handled, so any universal module that built
 // under std also builds as a header-first cdylib.
@@ -621,7 +640,8 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
 
 QString lidlMakeModuleImplExports(const ModuleDecl& module,
                                   const QString& implClass,
-                                  const QString& implHeader)
+                                  const QString& implHeader,
+                                  const QString& lidlDocument)
 {
     const std::set<std::string> recs = recordNames(module);
     QString c;
@@ -846,14 +866,21 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
         s << "                return lidlStrdup(err.dump());\n";
         s << "            }\n";
         // A derived method (lidl/identity.hpp) has no member on the impl class
-        // to call — the generator owns its body. name()/version() answer from
-        // the module declaration, which the builder derives from metadata.json,
-        // so the reported value cannot drift from the built one.
+        // to call — the generator owns its body. name()/version()/lidl() answer from
+        // the module declaration; lidl() answers the canonical LIDL document
+        // consumed by this provider. None can drift from the built artifact.
         if (md.derived && lidl::isIdentityMethod(md.name)) {
-            const QString literal = md.name == lidl::kIdentityName
-                ? qs(module.name)
-                : (module.version.empty() ? QStringLiteral("1.0.0") : qs(module.version));
-            s << "            auto result = std::string(\"" << literal << "\");\n";
+            if (md.name == lidl::kLidl) {
+                const QString document = lidlDocument.isEmpty()
+                    ? lidlSerialize(module) : lidlDocument;
+                s << "            auto result = std::string("
+                  << cppStringLiteral(document) << ");\n";
+            } else {
+                const QString literal = md.name == lidl::kIdentityName
+                    ? qs(module.name)
+                    : (module.version.empty() ? QStringLiteral("1.0.0") : qs(module.version));
+                s << "            auto result = std::string(\"" << literal << "\");\n";
+            }
             s << "            return lidlStrdup(" << stdReturnToJson(md, "result", recs)
               << ".dump());\n";
             s << "        }\n";

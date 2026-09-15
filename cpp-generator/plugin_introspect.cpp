@@ -86,11 +86,10 @@ static bool loadContractFromLidl(const QString& lidlPath, QTextStream& err,
         }
     }
     {
-        // Consumers see name()/version() on every dependency. Added here, not
-        // read from the artifact: the published .lidl carries only what the
-        // author wrote, and the provider adds the same two methods from the
-        // same function (main.cpp's --backend cdylib path), so the two sides
-        // cannot disagree about them.
+        // Consumers see name()/version()/lidl() on every dependency. Added
+        // after parsing: the published .lidl is the canonical authored API,
+        // while the provider derives the same built-ins from the same frontend
+        // (main.cpp's --backend cdylib path).
         QString idErr;
         if (!lidlInjectIdentity(mod, &idErr)) {
             err << lidlPath << ": " << idErr << "\n";

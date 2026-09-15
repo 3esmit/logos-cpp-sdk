@@ -743,7 +743,7 @@ TEST(LidlGenCdylib, GrantExportIsEmittedForEveryModuleNotJustPrivilegedOnes)
 
 // --- Module identity ---------------------------------------------------------
 //
-// name()/version() are injected into the contract by the frontend
+// name()/version()/lidl() are injected into the contract by the frontend
 // (lidl/identity.hpp) and marked `derived`. The dispatch must answer them from
 // the module DECLARATION -- the impl class has no such member, so delegating
 // would not compile, and reading anything else would let the reported value
@@ -778,10 +778,29 @@ TEST(LidlGenCdylib, IdentityMethodsAnswerFromTheModuleDeclaration)
     EXPECT_TRUE(src.contains("std::string(\"weather_module\")")) << src.toStdString();
     EXPECT_TRUE(src.contains("if (m == \"version\")")) << src.toStdString();
     EXPECT_TRUE(src.contains("std::string(\"2.4.1\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (m == \"lidl\")")) << src.toStdString();
 
     // ...and never through the impl class, which has no such member.
     EXPECT_FALSE(src.contains("lidlImpl().name(")) << src.toStdString();
     EXPECT_FALSE(src.contains("lidlImpl().version(")) << src.toStdString();
+    EXPECT_FALSE(src.contains("lidlImpl().lidl(")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, LidlMethodAnswersTheCanonicalDocument)
+{
+    ModuleDecl m = moduleWithIdentity("weather_module", "2.4.1");
+    const QString document = QStringLiteral(
+        "module weather_module {\n"
+        "  version \"2.4.1\"\n"
+        "  depends []\n"
+        "}\n");
+    const QString src = lidlMakeModuleImplExports(
+        m, "SomeImpl", "some_impl.h", document);
+
+    EXPECT_TRUE(src.contains("if (m == \"lidl\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("module weather_module {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("version \\\"2.4.1\\\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("depends []")) << src.toStdString();
 }
 
 TEST(LidlGenCdylib, IdentityMethodsAreListedForIntrospection)
@@ -791,6 +810,7 @@ TEST(LidlGenCdylib, IdentityMethodsAreListedForIntrospection)
     const QString src = implExportsFor(moduleWithIdentity("weather_module", "2.4.1"));
     EXPECT_TRUE(src.contains("obj[\"name\"] = \"name\"")) << src.toStdString();
     EXPECT_TRUE(src.contains("obj[\"name\"] = \"version\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"name\"] = \"lidl\"")) << src.toStdString();
     EXPECT_TRUE(src.contains("obj[\"signature\"] = \"name()\"")) << src.toStdString();
 }
 
