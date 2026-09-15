@@ -295,7 +295,6 @@ TEST(LidlGenClient, VoidReturnMethod)
     m.name = "test";
     MethodDecl md;
     md.name = "doStuff";
-    md.returnType = { TypeExpr::Primitive, "void", {} };
     m.methods.push_back(md);
 
     QString h = lidlMakeHeader(m);

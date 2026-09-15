@@ -107,7 +107,6 @@ Built-in primitive types:
 | `bool`    | Boolean                                 | `bool`        | `bool`                 |
 | `result`  | Structured result (success/value/error) | `LogosResult` | `LogosResult`          |
 | `any`     | Untyped value                           | `QVariant`    | `QVariant`             |
-| `void`    | No return value                         | `void`        | `void`                 |
 
 
 Composite types:
@@ -131,7 +130,7 @@ The `--from-header` mode parses a C++implementation header to extract public met
 | `int64_t`                            | `int`                                                              |
 | `uint64_t`                           | `uint`                                                             |
 | `double`                             | `float64`                                                          |
-| `void`                               | `void`                                                             |
+| `void`                               | no return clause                                                    |
 | `std::vector<std::string>`           | `[tstr]`                                                           |
 | `std::vector<uint8_t>`               | `bstr`                                                             |
 | `std::vector<int64_t>`               | `[int]`                                                            |
@@ -381,7 +380,7 @@ of the embedded copy that was deleted.
 
 1. **Lexer** — tokenizes source into keywords, identifiers, string literals, symbols (internal to `lidl::parse`)
 2. **Parser** (`lidlParse` → `lidl::parse`) — recursive descent parser producing a `ModuleDecl` AST
-3. **Validator** (`lidlValidate` → `lidl::validate`) — checks for duplicate names, unknown type references, builtin shadowing, duplicate parameters
+3. **Validator** (`lidlValidate` → `lidl::validate`) — checks for duplicate names, unknown type references, builtin shadowing, and duplicate parameters; no-return is represented by an absent return clause rather than a type
 4. **Serializer** (`lidlSerialize` → `lidl::serialize`) — emits the canonical LIDL document. `--normalize-lidl` exposes this full pipeline for authored files; serialization is byte-idempotent
 
 ### Impl Header Pipeline

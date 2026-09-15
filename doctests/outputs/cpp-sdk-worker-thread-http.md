@@ -408,6 +408,8 @@ under test.
 ```bash
 nix build 'path:./sensor_module#lgx' \
   --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   -o sensor-lgx
 ```
 
@@ -427,7 +429,11 @@ against one consistent SDK.
 nix build 'path:./http_module#lgx' \
   --override-input sensor_module 'path:./sensor_module' \
   --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --override-input sensor_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input sensor_module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input sensor_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   -o http-lgx
 ```
 
@@ -450,7 +456,13 @@ with the capability module, and install both modules.
 nix build 'github:logos-co/logos-logoscore-cli' \
   --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
   --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --out-link ./logos
 ```
 

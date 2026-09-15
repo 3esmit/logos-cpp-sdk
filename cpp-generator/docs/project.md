@@ -41,7 +41,7 @@ The lexer, parser, AST, serializer, and validator are **no longer embedded here*
 - `lidl::parse(std::string) → ParseResult` (`ModuleDecl` + error/line/column)
 - `lidl::serialize(ModuleDecl) → std::string`
 - `lidl::validate(ModuleDecl) → ValidationResult`
-- the **AST**: `TypeExpr` (`Kind`: Primitive/Array/Map/Optional/Named, `name`, `elements`), `ParamDecl`, `FieldDecl`, `MethodDecl` (name, params, returnType, `description`, `jsonReturn`, `resultReturn`), `EventDecl` (name, params, `description`), `TypeDecl`, `ModuleDecl`. (logos-lidl also exposes an AST↔JSON bridge and a C ABI that the Rust SDK consumes over FFI — not used by this generator.)
+- the **AST**: `TypeExpr` (`Kind`: Primitive/Array/Map/Optional/Named, `name`, `elements`), `ParamDecl`, `FieldDecl`, `MethodDecl` (name, params, optional returnType, `description`, `jsonReturn`, `resultReturn`), `EventDecl` (name, params, `description`), `TypeDecl`, `ModuleDecl`. An absent method returnType means no returned value. (logos-lidl also exposes an AST↔JSON bridge and a C ABI that the Rust SDK consumes over FFI — not used by this generator.)
 
 The `.lidl` grammar (defined in logos-lidl):
 
@@ -52,7 +52,7 @@ metadata   = "version" STRING | "description" STRING | "category" STRING
            | "depends" "[" (IDENT ("," IDENT)*)? "]"
 type_def   = "type" IDENT "{" field* "}"
 field      = "?"? IDENT ":" type_expr
-method_def = "method" IDENT "(" params ")" "->" type_expr ("description" STRING)?
+method_def = "method" IDENT "(" params ")" ("->" type_expr)? ("description" STRING)?
 event_def  = "event" IDENT "(" params ")" ("description" STRING)?
 params     = (IDENT ":" type_expr ("," IDENT ":" type_expr)*)?
 type_expr  = IDENT | "[" type_expr "]" | "{" type_expr ":" type_expr "}"

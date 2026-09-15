@@ -770,7 +770,7 @@ static std::set<std::string> keepOnlyReferencedRecords(ModuleDecl& module)
 
     std::set<std::string> referenced;
     for (const MethodDecl& md : module.methods) {
-        mention(md.returnType, referenced);
+        if (md.returnType) mention(*md.returnType, referenced);
         for (const ParamDecl& pd : md.params) mention(pd.type, referenced);
     }
     for (const EventDecl& ed : module.events)
@@ -857,9 +857,13 @@ static bool parseMethodLine(const QString& line, MethodDecl& out,
         return false;
     out.name = methodName.toStdString();
     QString retTypeStr = stripDeclarationSpecifiers(prefix.left(nameStart).trimmed());
-    out.returnType = cppTypeToLidl(
-        retTypeStr, QString("%1 '%2': return type").arg(kind, methodName), retTypeStr,
-        QString(), /*nameEmitted=*/kind == "event");
+    if (retTypeStr == "void") {
+        out.returnType.reset();
+    } else {
+        out.returnType = cppTypeToLidl(
+            retTypeStr, QString("%1 '%2': return type").arg(kind, methodName), retTypeStr,
+            QString(), /*nameEmitted=*/kind == "event");
+    }
     // Flag methods whose impl returns LogosMap / LogosList so the generator
     // can emit nlohmann→Qt conversion code in the glue layer.
     out.jsonReturn = (retTypeStr == "LogosMap" || retTypeStr == "LogosList");

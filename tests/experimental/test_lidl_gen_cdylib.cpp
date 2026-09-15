@@ -280,8 +280,8 @@ TEST(LidlGenCdylib, NonStringMapKeyIsRejected)
 }
 
 // A record the contract declares is admitted and spelled as its struct; an
-// UNDECLARED Named type is not. `void` is the reason that distinction has to
-// exist — it is not a LIDL builtin, so `-> void` arrives as Named("void").
+// UNDECLARED Named type is not. No-return is structural and never reaches this
+// record-name path.
 TEST(LidlGenCdylib, OnlyDeclaredRecordsAreRecords)
 {
     ModuleDecl m;

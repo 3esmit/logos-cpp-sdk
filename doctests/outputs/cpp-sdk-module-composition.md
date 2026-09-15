@@ -10,11 +10,12 @@ under test — by building *both* sides from scratch against it.
 It is fully self-contained — no pre-existing module, no `requires:` chain:
 
 1. Create `greeter_module`, a small **callee** with a couple of methods
-   (`greet`, `addInts`, `greetCount`) and a `greeted` event.
+   (`greet`, `addInts`, `greetCount`) and two events — `greeted`, carrying a
+   string, and `blobReady`, carrying raw bytes.
 2. Create `orchestrator_module`, a **caller** that declares `greeter_module`
    as a dependency and composes it through the generated
    `modules().greeter_module` wrapper — synchronously, asynchronously, and by
-   subscribing to its event.
+   subscribing to both of its events.
 3. Build **both** modules' `.lgx` packages **against the C++ SDK commit under
    test**, so the generated wrappers, the plugin glue, and the IPC layer all
    come from this SDK.
@@ -36,6 +37,7 @@ promise — working.
 - How to build a module — and its module dependency — against a specific `logos-cpp-sdk` commit
 - How to load two modules in `logoscore` and chain calls so the caller drives the callee
 - How async replies and event subscriptions survive between `call` commands under the daemon
+- How a **binary** (`bstr`) event payload crosses the boundary intact, encoded and decoded by generated code on both sides
 
 ## Prerequisites
 
@@ -174,9 +176,20 @@ public:
     /// Greets the name and also emits a `greeted` event carrying it.
     void greetNotify(const std::string& name);
 
+    /// Builds a blob of `size` bytes and emits it on `blobReady`.
+    /// Returns the number of bytes emitted.
+    int64_t emitBlob(int64_t size);
+
 logos_events:
     /// Emitted by greetNotify() with the produced greeting string.
     void greeted(const std::string& greeting);
+
+    /// Emitted by emitBlob() carrying raw bytes. `bstr` payloads take
+    /// the canonical tagged form on the wire; the generated code on
+    /// both sides encodes and decodes them, so the author on either
+    /// end only ever sees a `std::vector<uint8_t>`.
+    void blobReady(const std::string& label,
+                   const std::vector<uint8_t>& payload);
 
 private:
     int64_t m_greetCount = 0;
@@ -212,6 +225,20 @@ void GreeterModuleImpl::greetNotify(const std::string& name)
     // this reaches every subscriber; constructed outside a host it is a
     // safe no-op.
     greeted("Hello, " + name + "!");
+}
+
+int64_t GreeterModuleImpl::emitBlob(int64_t size)
+{
+    // A deterministic blob the subscriber can check byte-for-byte.
+    // It deliberately contains 0x00 and bytes >= 0x80 — the values a
+    // text encoding would mangle.
+    std::vector<uint8_t> payload;
+    payload.reserve(static_cast<size_t>(size));
+    for (int64_t i = 0; i < size; ++i)
+        payload.push_back(static_cast<uint8_t>((i * 7 + 11) & 0xff));
+
+    blobReady("blob", payload);
+    return static_cast<int64_t>(payload.size());
 }
 ```
 
@@ -317,6 +344,7 @@ Three composition paths, all through `modules().greeter_module`:
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <logos_json.h>            // LogosMap
 #include <logos_module_context.h>  // LogosModuleContext base + modules()
@@ -353,10 +381,25 @@ public:
     /// empty until the event fires.
     std::string lastGreetedEvent() const;
 
+    /// Subscribes to greeter_module's `blobReady` event — the binary
+    /// one. Returns "ok" once registered.
+    std::string subscribeBlob();
+
+    /// How many bytes the `blobReady` subscription actually received,
+    /// or -1 until the event fires.
+    int64_t lastBlobSize() const;
+
+    /// A checksum over those bytes — proves the payload arrived
+    /// intact, not merely with the right length.
+    int64_t lastBlobChecksum() const;
+
 private:
     std::string m_asyncGreeting;
     std::string m_lastGreetedEvent;
     bool        m_subscribed = false;
+    bool        m_blobSubscribed = false;
+    int64_t     m_lastBlobSize = -1;
+    int64_t     m_lastBlobChecksum = -1;
 };
 ```
 
@@ -427,6 +470,37 @@ std::string OrchestratorModuleImpl::lastGreetedEvent() const
 {
     return m_lastGreetedEvent;
 }
+
+std::string OrchestratorModuleImpl::subscribeBlob()
+{
+    if (m_blobSubscribed) return "ok";
+    // The binary event. The callback takes real bytes: the tagged
+    // wire form is encoded by the greeter's generated event body and
+    // decoded by this generated subscriber, so neither author writes
+    // any base64.
+    m_blobSubscribed = modules().greeter_module.onBlobReady(
+        [this](const std::string& label,
+               const std::vector<uint8_t>& payload) {
+            (void)label;
+            m_lastBlobSize = static_cast<int64_t>(payload.size());
+            int64_t sum = 0;
+            for (size_t i = 0; i < payload.size(); ++i)
+                sum += static_cast<int64_t>(payload[i])
+                     * static_cast<int64_t>(i % 31 + 1);
+            m_lastBlobChecksum = sum;
+        });
+    return m_blobSubscribed ? "ok" : "failed";
+}
+
+int64_t OrchestratorModuleImpl::lastBlobSize() const
+{
+    return m_lastBlobSize;
+}
+
+int64_t OrchestratorModuleImpl::lastBlobChecksum() const
+{
+    return m_lastBlobChecksum;
+}
 ```
 
 ---
@@ -455,14 +529,21 @@ The greeter is a dependency of the orchestrator, so both must be tracked.
 
 ### 3.2 Build the greeter's .lgx against this SDK
 
-The greeter has no module dependency, so only its builder's
-`logos-cpp-sdk` needs overriding.
+The greeter has no module dependency. Its builder's `logos-cpp-sdk`,
+Qt SDK, and both Qt plugin-backend aliases still move together: the
+Qt-side generators parse the interface emitted by the SDK under test.
 
 ```bash
 # From inside the greeter clone this is simply:
 #   nix build '.#lgx' --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
 nix build 'path:./greeter_module#lgx' \
   --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-module-builder/logos-plugin-qt 'github:logos-co/logos-plugin-qt' \
+  --override-input logos-module-builder/logos-plugin-qt/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-module-builder/logos-plugin-core 'github:logos-co/logos-plugin-qt' \
+  --override-input logos-module-builder/logos-plugin-core/logos-lidl 'github:logos-co/logos-lidl' \
   -o greeter-lgx
 ```
 
@@ -476,15 +557,27 @@ ls greeter-lgx/*.lgx
 
 The orchestrator pulls in `greeter_module` as a dependency, so we lock
 that input to the local greeter checkout **and** override
-`logos-cpp-sdk` in both the orchestrator's builder and the greeter's
-builder — so the dependency wrapper the generator emits, and both
-plugins, are built against one consistent SDK.
+the SDK and Qt-side generator inputs in both the orchestrator's builder
+and the greeter's builder — so the dependency wrapper the generator
+emits, and both plugins, use one consistent LIDL grammar.
 
 ```bash
 nix build 'path:./orchestrator_module#lgx' \
   --override-input greeter_module 'path:./greeter_module' \
   --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-module-builder/logos-plugin-qt 'github:logos-co/logos-plugin-qt' \
+  --override-input logos-module-builder/logos-plugin-qt/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-module-builder/logos-plugin-core 'github:logos-co/logos-plugin-qt' \
+  --override-input logos-module-builder/logos-plugin-core/logos-lidl 'github:logos-co/logos-lidl' \
   --override-input greeter_module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input greeter_module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input greeter_module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input greeter_module/logos-module-builder/logos-plugin-qt 'github:logos-co/logos-plugin-qt' \
+  --override-input greeter_module/logos-module-builder/logos-plugin-qt/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input greeter_module/logos-module-builder/logos-plugin-core 'github:logos-co/logos-plugin-qt' \
+  --override-input greeter_module/logos-module-builder/logos-plugin-core/logos-lidl 'github:logos-co/logos-lidl' \
   -o orchestrator-lgx
 ```
 
@@ -508,7 +601,13 @@ daemon can scan.
 nix build 'github:logos-co/logos-logoscore-cli' \
   --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
   --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --out-link ./logos
 ```
 
@@ -656,7 +755,54 @@ sleep 1
 logoscore call orchestrator_module lastGreetedEvent
 ```
 
-### 5.12 Stop the daemon
+### 5.12 Subscribe to the greeter's binary event
+
+The same flow, but the event carries a **byte string** (`bstr`) rather
+than text. Binary payloads cannot ride in a JSON string — a NUL would
+truncate them and any byte above 0x7f would be mangled — so they travel
+in the canonical tagged form `{"_bytes": "<base64url>"}`. Both halves of
+that are generated: the greeter's event body encodes, this subscriber
+decodes, and neither author writes a line of base64.
+
+```bash
+logoscore call orchestrator_module subscribeBlob
+```
+
+### 5.13 Emit 4096 bytes from the greeter
+
+The greeter reports how many bytes it put on the wire.
+
+```bash
+logoscore call greeter_module emitBlob 4096
+```
+
+```bash
+sleep 1
+```
+
+### 5.14 The subscriber received every byte
+
+`lastBlobSize` is the length the subscription actually saw. This is the
+assertion that pins [#99](https://github.com/logos-co/logos-cpp-sdk/issues/99),
+where the generator dropped `bstr` event arguments: the greeter emitted
+a full payload and the subscriber received `0` bytes.
+
+```bash
+logoscore call orchestrator_module lastBlobSize
+```
+
+### 5.15 ...and the bytes are the right bytes
+
+Length alone would not catch a corrupted payload — a wrong base64
+alphabet or a botched tail group round-trips to the same size. The
+checksum is computed over the received bytes and must match the blob the
+greeter built.
+
+```bash
+logoscore call orchestrator_module lastBlobChecksum
+```
+
+### 5.16 Stop the daemon
 
 ```bash
 logoscore stop
@@ -666,7 +812,7 @@ logoscore stop
 sleep 2
 ```
 
-### 5.13 Confirm the daemon has stopped
+### 5.17 Confirm the daemon has stopped
 
 ```bash
 logoscore status
@@ -682,9 +828,19 @@ logoscore status
 | Composed sync calls | `greetReport()` → `greet` + `addInts` + `greetCount` | one map of three results |
 | Typed **async** call | `startAsyncGreet()` → `greetAsync(..., cb)` | `queued`, then `"Hello, Async!"` |
 | Typed **event** subscription | `subscribeGreeted()` → `onGreeted(cb)` | captured `"Hello, Events!"` |
+| **Binary** event payload | `subscribeBlob()` → `onBlobReady(cb)` | all 4096 bytes, checksum intact |
 
 Every path went through `modules().greeter_module`, the wrapper the SDK's
 code generator emitted from the `greeter_module` dependency — and both
 modules, the wrapper, and the runtime were built against the SDK commit
 under test. A green run means inter-module composition still works on this
 SDK, end to end.
+
+The binary row is the one with teeth. Bytes are the only payload that
+cannot ride in a JSON string, so they are the only one that needs an
+encoder on the emitting side and a decoder on the receiving side — two
+pieces of generated code that must agree exactly. When they did not
+([#99](https://github.com/logos-co/logos-cpp-sdk/issues/99)), everything
+above still passed: the module emitted a full payload, the transport
+carried it, and the subscriber received zero bytes. Asserting on the
+*length and the contents* of what actually arrived is what catches that.

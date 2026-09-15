@@ -36,9 +36,8 @@ QString cppStringLiteral(const QString& value)
 // Qt-free set the std apiStyle handled, so any universal module that built
 // under std also builds as a header-first cdylib.
 // The records a contract DECLARES. A `Named` type is a record only if it is in
-// here: `void` is not a LIDL builtin, so `-> void` arrives as Named("void") and
-// treating every Named as a record is how the Rust generator once emitted
-// `-> Void`. Same trap, same guard.
+// here. No-return methods have no TypeExpr at all; this set therefore contains
+// only names that can genuinely denote values.
 std::set<std::string> recordNames(const ModuleDecl& module)
 {
     std::set<std::string> out;
@@ -200,7 +199,7 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& pat
 QString stdReturnToJson(const MethodDecl& md, const QString& var,
                         const std::set<std::string>& recs)
 {
-    const TypeExpr& te = md.returnType;
+    const TypeExpr& te = *md.returnType;
     if (md.resultReturn) {
         // StdLogosResult -> the canonical {success, value, error} object
         // (same shape logos_json_convert emits for Qt LogosResult).
@@ -317,7 +316,7 @@ bool moduleUsesOptional(const ModuleDecl& module)
         for (const FieldDecl& f : t.fields)
             if (fieldIsOptional(f) || mentions(f.type)) return true;
     for (const MethodDecl& md : module.methods) {
-        if (mentions(md.returnType)) return true;
+        if (md.returnType && mentions(*md.returnType)) return true;
         for (const ParamDecl& pd : md.params)
             if (mentions(pd.type)) return true;
     }
@@ -512,7 +511,9 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         }
         sig += ")";
         s << "        obj[\"signature\"] = \"" << sig << "\";\n";
-        s << "        obj[\"returnType\"] = \"" << lidlTypeToPublishedName(md.returnType) << "\";\n";
+        s << "        obj[\"returnType\"] = \""
+          << (md.returnType ? lidlTypeToPublishedName(*md.returnType) : QStringLiteral("void"))
+          << "\";\n";
         s << "        obj[\"isInvokable\"] = true;\n";
         if (!md.params.empty()) {
             s << "        nlohmann::json params = nlohmann::json::array();\n";
@@ -568,14 +569,8 @@ bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
                 return false;
             }
         }
-        // `void` is not a lidlBuiltinType, so the .lidl parser yields it as a
-        // Named type "void" (the impl-header parser writes "-> void"); an empty
-        // name is the in-memory void from the header path. Treat both as void.
-        const bool voidReturn =
-            md.returnType.name == "void"
-            || (md.returnType.kind == TypeExpr::Primitive && md.returnType.name.empty());
-        if (!voidReturn && !md.jsonReturn && !md.resultReturn
-            && !typeSupported(md.returnType, /*isReturn=*/true, recs)) {
+        if (md.returnType && !md.jsonReturn && !md.resultReturn
+            && !typeSupported(*md.returnType, /*isReturn=*/true, recs)) {
             if (error)
                 *error = QString("method '%1': return type outside the cdylib-supported "
                                  "(Qt-free) subset").arg(qs(md.name));
@@ -896,13 +891,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
             if (i + 1 < md.params.size()) call += ", ";
         }
         call += ")";
-        // `void` parses as a Named type "void" from a .lidl (it isn't a
-        // lidlBuiltinType); empty name is the header path's in-memory void.
-        const bool voidReturn =
-            md.returnType.name == "void"
-            || (md.returnType.kind == TypeExpr::Primitive && md.returnType.name.empty())
-            || lidlTypeToQt(md.returnType) == "void";
-        if (voidReturn) {
+        if (!md.returnType) {
             s << "            " << call << ";\n";
             s << "            return lidlStrdup(\"true\");\n";
         } else {

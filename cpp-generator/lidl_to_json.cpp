@@ -9,16 +9,8 @@
 // metaobject-introspection path produces for methods, so generator_lib
 // can consume both via one code path).
 //
-// ONE Qt type mapper. This used to be a near-duplicate of `lidlTypeToQt`
-// (experimental/lidl_emit_common.cpp) and the two disagreed: this copy had no
-// `void` case, so a `-> void` method reaching it as Primitive("void") from the
-// impl-header parser fell through to QVariant and generated
-// `QVariant doVoid(...)`. (The .lidl parser spells the same thing
-// Named("void"), which survived only by accident — mapReturnType's
-// `base == "void"` early-out.) The lp/std tables are DERIVED from this name, so
-// the same bug produced `LogosMap doVoid(...)` on the Qt-free surface: not a
-// Qt-only defect, a front-end one. It is now a delegation, so there is one
-// table to disagree with.
+// ONE Qt type mapper. No-return is handled at the MethodDecl level before this
+// function is called; a TypeExpr always denotes an actual value type.
 QString lidlTypeExprToQtTypeName(const TypeExpr& te)
 {
     return lidlTypeToQt(te);
@@ -48,7 +40,7 @@ void noteOptionalPositionalSlots(const ModuleDecl& mod, const QString& where,
         for (const ParamDecl& pd : md.params)
             if (paramIsOptional(pd))
                 optSlots << (qs(md.name) + "(" + qs(pd.name) + ")");
-        if (typeIsOptional(md.returnType))
+        if (md.returnType && typeIsOptional(*md.returnType))
             optSlots << (qs(md.name) + "() return");
     }
     for (const EventDecl& ed : mod.events)
@@ -75,7 +67,9 @@ QJsonArray moduleMethodsToJson(const ModuleDecl& mod)
     for (const MethodDecl& m : mod.methods) {
         QJsonObject o;
         o["name"] = qs(m.name);
-        o["returnType"] = lidlTypeExprToQtTypeName(m.returnType);
+        o["returnType"] = m.returnType
+            ? lidlTypeExprToQtTypeName(*m.returnType)
+            : QStringLiteral("void");
         o["isInvokable"] = true;
         QJsonArray params;
         for (const ParamDecl& p : m.params) {

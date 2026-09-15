@@ -102,7 +102,7 @@ static bool moduleUsesStdOptional(const ModuleDecl& m)
             if (typeUsesStdOptional(eff)) return true;
         }
     for (const MethodDecl& md : m.methods) {
-        if (typeUsesStdOptional(md.returnType)) return true;
+        if (md.returnType && typeUsesStdOptional(*md.returnType)) return true;
         for (const ParamDecl& p : md.params) if (typeUsesStdOptional(p.type)) return true;
     }
     for (const EventDecl& ed : m.events)
@@ -405,7 +405,7 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "    bool on(const QString& eventName, EventCallback callback);\n";
 
     for (const MethodDecl& md : module.methods) {
-        QString ret = lidlTypeToQt(md.returnType);
+        QString ret = md.returnType ? lidlTypeToQt(*md.returnType) : QStringLiteral("void");
         s << "    " << ret << " " << md.name << "(";
         for (int i = 0; i < md.params.size(); ++i) {
             emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
@@ -505,7 +505,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
 
 
     for (const MethodDecl& md : module.methods) {
-        QString ret = lidlTypeToQt(md.returnType);
+        QString ret = md.returnType ? lidlTypeToQt(*md.returnType) : QStringLiteral("void");
         int nParams = md.params.size();
 
         s << ret << " " << className << "::" << md.name << "(";
@@ -542,7 +542,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
 
         if (ret != "void")
-            s << "    " << returnConversionFor(md.returnType, ret) << "\n";
+            s << "    " << returnConversionFor(*md.returnType, ret) << "\n";
         s << "}\n\n";
 
         // Shared between the two async entry points so they cannot drift in how
@@ -568,7 +568,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         auto asyncDecodeExpr = [&](const QString& var) -> QString {
             if (ret == "void") return QString();
             if (ret == "QVariant") return var;
-            return var + ".isValid() ? " + asyncReturnConversionFor(md.returnType, ret)
+            return var + ".isValid() ? " + asyncReturnConversionFor(*md.returnType, ret)
                  + " : " + asyncDefaultVal(ret);
         };
 
