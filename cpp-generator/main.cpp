@@ -1,5 +1,6 @@
 #include "plugin_introspect.h"
 #include "generator_lib.h"
+#include "metadata_dependencies.h"
 #include "lidl_to_json.h"
 #include "experimental/lidl_gen_client.h"
 #include "experimental/lidl_gen_cdylib.h"
@@ -22,9 +23,9 @@
 // ─── Umbrella mode (`--umbrella`, alias `--general-only`) ────────────────────
 //
 // Emits the umbrella — `logos_sdk.h` / `logos_sdk.cpp`, i.e. `struct
-// LogosModules` — over a module's declared `metadata.json#dependencies` plus
-// its interface dependencies, and the per-dependency / per-interface wrappers
-// those aggregate.
+// LogosModules` — over a module's concrete dependencies
+// (`metadata.json#dependencies` + `optional_dependencies`) plus its interface
+// dependencies, and the per-dependency / per-interface wrappers those aggregate.
 //
 // This is NOT a legacy mode, despite having lived in `plugin_introspect.cpp` until
 // now: `LogosModuleContext::modules()` returns `LogosModules&`, so every
@@ -168,6 +169,18 @@ static bool generateInterfaceWrappers(const QVector<InterfaceSpec>& ifaces,
             }
         }
 
+        {
+            // Consumers see name()/version()/lidl() on every dependency and
+            // bound interface. Added after parsing: the canonical artifact
+            // carries only the authored API, while providers and consumers
+            // derive the same built-ins from the shared frontend.
+            QString idErr;
+            if (!lidlInjectIdentity(mod, &idErr)) {
+                err << spec.path << ": " << idErr << "\n";
+                return false;
+            }
+        }
+
         noteOptionalPositionalSlots(mod, spec.path, err);
 
         const QString className = toPascalCase(spec.name);
@@ -274,11 +287,12 @@ static int runUmbrellaMode(const QStringList& args, const QString& progName,
         return 4;
     }
     const QJsonObject obj = doc.object();
-    const QJsonArray deps = obj.value("dependencies").toArray();
 
-    // `LogosModules` exposes ONLY the modules listed in
-    // `metadata.json#dependencies` — apps that need to manage the core use
-    // liblogos' C API directly.
+    // `LogosModules` exposes ONLY the modules this one declares as a concrete
+    // dependency — `dependencies` plus `optional_dependencies`, which differ in
+    // lifetime and not in call shape. Apps that need to manage the core use
+    // liblogos' C API directly. The list itself comes from the `--dep` flags
+    // where there are any; see umbrellaDependencyEntries below.
     const QString genDirPath = outputDir.isEmpty()
         ? QDir::current().filePath("logos-cpp-sdk/cpp/generated")
         : outputDir;
@@ -347,11 +361,11 @@ static int runUmbrellaMode(const QStringList& args, const QString& progName,
 
     // Concrete dependencies generated from their published LIDL
     // (`--dep <name>=<lidl>`). Same backend as interfaces but BindMode::Static
-    // — the module name is baked in and the dep is exposed as a `<dep>` MEMBER
-    // (the umbrella already emits it from `dependencies`, so no umbrella
-    // change). nix passes `--dep` only for deps that publish a `lidl` output;
-    // deps without one fall back to the header-copy path and are NOT passed
-    // here. Dedup vs each other and vs interface names.
+    // — the module name is baked in and the dep is exposed as a `<dep>` MEMBER,
+    // which the umbrella then emits from these same names. Every concrete
+    // dependency arrives here: one publishing no `lidl` is refused by name in
+    // logos-module-builder before this runs. Dedup vs each other and vs
+    // interface names.
     QVector<InterfaceSpec> depSpecs;
     QSet<QString> haveDep;
     for (const InterfaceSpec& sp : parseSpecFlags(args, "--dep")) {
@@ -382,6 +396,10 @@ static int runUmbrellaMode(const QStringList& args, const QString& progName,
 
     QStringList interfaceNames;
     for (const InterfaceSpec& sp : ifaceSpecs) interfaceNames.append(sp.name);
+
+    QStringList depFlagNames;
+    for (const InterfaceSpec& sp : depSpecs) depFlagNames.append(sp.name);
+    const QJsonArray deps = umbrellaDependencyEntries(depFlagNames, obj);
 
     // The umbrella itself. Emission lives in generator_lib next to the
     // per-module wrapper emitters, so the aggregate can be asserted on without
@@ -427,11 +445,12 @@ static int runUmbrellaMode(const QStringList& args, const QString& progName,
 
 int main(int argc, char* argv[])
 {
-    // Check for --lidl / --from-header / --header-to-lidl mode before
+    // Check for LIDL/header frontend modes before
     // initializing QCoreApplication, since runPluginIntrospectMode creates its own.
     bool hasLidl = false;
     bool hasFromHeader = false;
     bool hasHeaderToLidl = false;
+    bool hasNormalizeLidl = false;
     bool hasUmbrella = false;
     bool hasGeneralOnly = false;
     bool hasMetadata = false;
@@ -440,6 +459,7 @@ int main(int argc, char* argv[])
         if (arg == "--lidl") hasLidl = true;
         if (arg == "--from-header") hasFromHeader = true;
         if (arg == "--header-to-lidl") hasHeaderToLidl = true;
+        if (arg == "--normalize-lidl") hasNormalizeLidl = true;
         if (arg == "--umbrella") hasUmbrella = true;
         if (arg == "--general-only") hasGeneralOnly = true;
         if (arg == "--metadata") hasMetadata = true;
@@ -458,6 +478,77 @@ int main(int argc, char* argv[])
         return runUmbrellaMode(app.arguments(),
                                QFileInfo(app.applicationFilePath()).fileName(),
                                out, err);
+    }
+
+    // Canonicalize a hand-authored contract through the shared logos-lidl
+    // parser/validator/serializer. This is the one normalization path used by
+    // published `#lidl` outputs and packaged dependency contracts, so authored
+    // and header-derived documents are indistinguishable downstream.
+    if (hasNormalizeLidl) {
+        QCoreApplication app(argc, argv);
+        QTextStream err(stderr);
+        QTextStream out(stdout);
+        const QStringList args = app.arguments();
+        const int idx = args.indexOf("--normalize-lidl");
+        if (idx + 1 >= args.size()) {
+            err << "Error: --normalize-lidl requires a .lidl path\n";
+            return 1;
+        }
+
+        QString inputPath = args.at(idx + 1);
+        if (inputPath.startsWith('@')) inputPath.remove(0, 1);
+        QFile input(inputPath);
+        if (!input.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            err << "Error: cannot read " << inputPath << "\n";
+            return 1;
+        }
+        const LidlParseResult parsed = lidlParse(QString::fromUtf8(input.readAll()));
+        if (parsed.hasError()) {
+            err << inputPath << ":" << parsed.errorLine << ":" << parsed.errorColumn
+                << ": " << parsed.error << "\n";
+            return 4;
+        }
+        const LidlValidationResult validation = lidlValidate(parsed.module);
+        if (validation.hasErrors()) {
+            for (const std::string& message : validation.errors)
+                err << inputPath << ": " << message << "\n";
+            return 4;
+        }
+
+        // Validate the reserved built-in surface too, without serializing it.
+        // In particular, lidl() is generator-owned so its returned bytes can
+        // never drift from this canonical document.
+        ModuleDecl builtinsCheck = parsed.module;
+        QString builtinsError;
+        if (!lidlInjectIdentity(builtinsCheck, &builtinsError)) {
+            err << inputPath << ": " << builtinsError << "\n";
+            return 4;
+        }
+        const QString canonical = lidlSerialize(parsed.module);
+
+        QString outputPath;
+        const int shortOut = args.indexOf("-o");
+        const int longOut = args.indexOf("--output");
+        if (shortOut != -1 && shortOut + 1 < args.size())
+            outputPath = args.at(shortOut + 1);
+        else if (longOut != -1 && longOut + 1 < args.size())
+            outputPath = args.at(longOut + 1);
+        if (outputPath.startsWith('@')) outputPath.remove(0, 1);
+
+        if (outputPath.isEmpty()) {
+            out << canonical;
+        } else {
+            QFile output(outputPath);
+            if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+                err << "Failed to write LIDL: " << outputPath << "\n";
+                return 5;
+            }
+            output.write(canonical.toUtf8());
+            output.close();
+            out << "Normalized LIDL: " << outputPath << "\n";
+        }
+        out.flush();
+        return 0;
     }
 
     // --header-to-lidl: the C++ frontend of the source -> LIDL -> bindings
@@ -591,7 +682,18 @@ int main(int argc, char* argv[])
                 return 4;
             }
 
-            const ModuleDecl& mod = pr.module;
+            ModuleDecl mod = pr.module;
+            // Capture the published document BEFORE built-ins are injected.
+            // serialize() omits derived methods, but taking it here also makes
+            // the invariant explicit: lidl() returns this canonical sidecar.
+            const QString lidlDocument = lidlSerialize(mod);
+            {
+                QString idErr;
+                if (!lidlInjectIdentity(mod, &idErr)) {
+                    err << headerPath << ": " << idErr << "\n";
+                    return 4;
+                }
+            }
             QString genDirPath = outputDir.isEmpty()
                 ? QDir::current().filePath("generated")
                 : outputDir;
@@ -613,11 +715,15 @@ int main(int argc, char* argv[])
                 // no `type` decls still has containers to encode.
                 outs.append({qs(mod.name) + "_types.h", lidlMakeTypesHeaderCdylib(mod)});
                 outs.append({qs(mod.name) + "_module_impl.cpp",
-                             lidlMakeModuleImplExports(mod, implClass, implHeader)});
+                             lidlMakeModuleImplExports(mod, implClass, implHeader,
+                                                       lidlDocument)});
                 if (!mod.events.empty())
                     outs.append({qs(mod.name) + "_events_cdylib.cpp",
                                  lidlMakeEventsSourceCdylib(mod, implClass, implHeader)});
-                outs.append({qs(mod.name) + ".lidl", lidlSerialize(mod)});
+                // Identity methods are `derived`, and lidlSerialize omits
+                // those — so this stays byte-identical to what
+                // --header-to-lidl writes for the same header.
+                outs.append({qs(mod.name) + ".lidl", lidlDocument});
                 for (const Out& o : outs) {
                     const QString abs = QDir(genDirPath).filePath(o.file);
                     QFile f(abs);
@@ -686,13 +792,25 @@ int main(int argc, char* argv[])
                     err << "Error: cannot read " << lidlPath << "\n";
                     return 1;
                 }
-                LidlParseResult pr = lidlParse(QString::fromUtf8(f.readAll()));
+                const QString sourceDocument = QString::fromUtf8(f.readAll());
+                LidlParseResult pr = lidlParse(sourceDocument);
                 if (pr.hasError()) {
                     err << "Error parsing " << lidlPath << ": " << pr.error
                         << " (line " << pr.errorLine << ")\n";
                     return 4;
                 }
-                const ModuleDecl& mod = pr.module;
+                const QString lidlDocument = lidlSerialize(pr.module);
+                ModuleDecl mod = pr.module;
+                {
+                    // Contract-first: the committed .lidl is untouched; the
+                    // provider's dispatch and method listing gain the identity
+                    // methods the same way every consumer does.
+                    QString idErr;
+                    if (!lidlInjectIdentity(mod, &idErr)) {
+                        err << lidlPath << ": " << idErr << "\n";
+                        return 4;
+                    }
+                }
                 QString cdErr;
                 if (!lidlCdylibSupported(mod, &cdErr)) {
                     err << "Error: module not cdylib-eligible: " << cdErr << "\n";
@@ -717,7 +835,8 @@ int main(int argc, char* argv[])
                         implHeader = qs(mod.name) + "_impl.h";
                     outs.append({qs(mod.name) + "_types.h", lidlMakeTypesHeaderCdylib(mod)});
                     outs.append({qs(mod.name) + "_module_impl.cpp",
-                                 lidlMakeModuleImplExports(mod, implClass, implHeader)});
+                                 lidlMakeModuleImplExports(mod, implClass, implHeader,
+                                                           lidlDocument)});
                     if (!mod.events.empty())
                         outs.append({qs(mod.name) + "_events_cdylib.cpp",
                                      lidlMakeEventsSourceCdylib(mod, implClass, implHeader)});

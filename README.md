@@ -227,6 +227,22 @@ so the two run the same single implementation.
 **Plugin path (`logos-cpp-generator /path/to/plugin.dylib`), with or without `--module-only`:**
 - `<module>_api.h` and `<module>_api.cpp` — the wrapper for that one plugin, and
   nothing else
+- **`--events-from <path/to/<name>.lidl>`** names the module's CONTRACT (the
+  sidecar `buildPlugin.nix` installs at `$out/share/logos/<name>.lidl`). The
+  flag keeps its historical name, but the wrapper's typed methods, record
+  structs and typed `on<EventName>(callback)` accessors all come out of that
+  one file. The plugin is still loaded — that is the dlopen check — but its
+  published `getMethods()` is a human-facing DESCRIPTION, not a type source:
+  this emitter is keyed on flat type names with a `QVariant` fallback, so a
+  metadata vocabulary it does not recognise silently produced an untyped
+  wrapper. A named-but-missing sidecar is refused rather than fallen back from
+- Without `--events-from`, the wrapper comes from the plugin's `QMetaObject`.
+  That is the handcrafted-Qt-module path, where no contract exists — but if the
+  plugin's listing is spelled in the **LIDL** vocabulary (`tstr`, `[uint]`,
+  `? tstr`, a record's declared name), the generator **refuses** (exit 7) and
+  names the contract to pass, rather than emitting a wrapper of `QVariant` /
+  `LogosMap`. Nix builds pass the flag for you; a hand-run invocation has to
+  say it
 
 **With `--umbrella` / `--general-only`:**
 - `logos_sdk.h` and `logos_sdk.cpp` — the umbrella that aggregates the wrappers
@@ -295,11 +311,38 @@ overloads differing only in `std::function<void(T)>` vs
 `std::function<void(AsyncResult<T>)>` are ambiguous for a generic lambda
 (`[](auto v){…}`), which would break existing call sites.
 
-**Qt-free (`--api-style lp`) wrappers** spell the deadline `int timeout_ms = 0`
-(`<= 0` selects the protocol default) because `Timeout` lives in a Qt header,
-and they do **not** yet get `fooAsyncResult` — logos-protocol's
-`lp_invoke_async` does not report the call error to its callback, so an
-`AsyncResult` there would report success on a failed call.
+**Qt-free (`--api-style lp`) wrappers** get all three entry points, spelling the
+deadline `int timeout_ms = 0` (`<= 0` selects the protocol default) because
+`Timeout` lives in a Qt header:
+
+```cpp
+void fooAsyncResult(params…, std::function<void(logos::AsyncResult<T>)> cb,
+                    int timeout_ms = 0);
+```
+
+One asymmetry, deliberate: `fooAsync` on this surface takes no deadline. It has
+existing callers and adding a parameter to it buys nothing that (3) does not
+already give.
+
+`fooAsyncResult` was withheld here for a long time, and the reason is worth
+knowing if you find a comment that still claims it: `lp_invoke_async` used to
+hard-code `ok = 1`, so an `AsyncResult` over it would have reported success for
+a call to a module that was not even loaded — an error channel that lies is
+worse than none. logos-protocol#40 fixed that, and
+`logos::LpClient::invokeAsyncResult` surfaces the failure in C++, so the twin is
+honest.
+
+Both `foo(…, &err)` and `fooAsyncResult` on this surface also fold a provider
+**rejection** into the error, matching the Qt path: a provider that ran and
+refused answers `{"code": …, "message": …, "origin": …}` as its *result*, which
+the return decode would otherwise erase into a default value. `fooAsync` still
+cannot report it — its callback has nowhere to put it.
+
+`code` is matched against a closed set — `dispatch_failed`, `invalid_args`,
+`unknown_method` — held in one place (`kRejectionCodes`, `generator_lib.cpp`)
+so the Qt and Qt-free emitters cannot drift. Anything else stays a value: a
+method may legitimately return a three-string map, and matching the shape alone
+would let user data impersonate a refusal.
 
 ### Universal modules: LogosModuleContext
 

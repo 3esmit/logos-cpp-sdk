@@ -304,11 +304,18 @@ TEST(MakeSourceTest, NonInvokableSkipped)
 // ─── The provider REJECTION envelope on the return path ─────────────────────
 //
 // A provider that refuses a call answers the canonical
-// {"code":"dispatch_failed", "message":…, "origin":…} object as its RESULT. The
-// Qt return table converts it like any other value, which ERASES it — a rejected
-// `[uint]` call answered `[]`, indistinguishable from "the provider returned
-// nothing". These pin the consumer folding it into the CallError out-channel the
-// wrapper already uses for a failed call.
+// {"code":…, "message":…, "origin":…} object as its RESULT. The Qt return table
+// converts it like any other value, which ERASES it — a rejected `[uint]` call
+// answered `[]`, indistinguishable from "the provider returned nothing". These
+// pin the consumer folding it into the CallError out-channel the wrapper already
+// uses for a failed call.
+//
+// `code` is matched against a CLOSED SET (kRejectionCodes in generator_lib.cpp),
+// not against the single literal "dispatch_failed" it once was. Providers have
+// emitted "invalid_args" for an arity error all along and no detector matched
+// it, so a missing argument reached a typed consumer as a successful call
+// returning a map. "unknown_method" is in the set before anything emits it: a
+// detector can be widened compatibly on its own, a provider code cannot.
 
 TEST(MakeSourceTest, QtEmitsRejectionDetector)
 {
@@ -316,10 +323,39 @@ TEST(MakeSourceTest, QtEmitsRejectionDetector)
     methods.append(makeMethod("fn", "QVariantList", 1));
     QString src = makeSource("mod", "Mod", "mod.h", methods);
     EXPECT_TRUE(src.contains("bool logosDispatchRejection(const QVariant& v, logos::CallError& out)"));
-    // Exact match only: an `any` / map return carrying user data must not
-    // false-match (same discipline as logos_rpc_status.h's sentinel).
+    // The guards that keep the widened match NARROW. Without them the set
+    // becomes an open shape match and any `any` / map return carrying user data
+    // false-matches (same discipline as logos_rpc_status.h's sentinel).
     EXPECT_TRUE(src.contains("if (m.size() != 3) return false;"));
-    EXPECT_TRUE(src.contains("if (code.toString() != QStringLiteral(\"dispatch_failed\")) return false;"));
+    EXPECT_TRUE(src.contains("if (code.userType() != QMetaType::QString"));
+    // The closed set, in full, as ONE chain of != — so an unrecognised code
+    // falls through to `return false` and stays DATA.
+    EXPECT_TRUE(src.contains(
+        "    if (_code != QStringLiteral(\"dispatch_failed\")\n"
+        "        && _code != QStringLiteral(\"invalid_args\")\n"
+        "        && _code != QStringLiteral(\"unknown_method\")) return false;\n"))
+        << src.toStdString();
+}
+
+TEST(MakeSourceTest, QtRejectionDetectorMatchesNoOtherCode)
+{
+    // The negative that stops this becoming an open match by accident. The
+    // emitted body must compare `_code` against the three literals and nothing
+    // else — no `contains`, no prefix test, no "has a code key" shortcut.
+    QJsonArray methods;
+    methods.append(makeMethod("fn", "QVariantList", 1));
+    const QString src = makeSource("mod", "Mod", "mod.h", methods);
+    const int begin = src.indexOf("bool logosDispatchRejection(const QVariant&");
+    ASSERT_NE(begin, -1);
+    const QString body = src.mid(begin, src.indexOf("} // namespace", begin) - begin);
+    EXPECT_EQ(body.count("_code != QStringLiteral("), 3) << body.toStdString();
+    // Exactly the three codes appear, and `return true` is reached only after
+    // every guard.
+    EXPECT_EQ(body.count("\"dispatch_failed\""), 1);
+    EXPECT_EQ(body.count("\"invalid_args\""), 1);
+    EXPECT_EQ(body.count("\"unknown_method\""), 1);
+    EXPECT_LT(body.indexOf("_code != QStringLiteral(\"unknown_method\")"),
+              body.indexOf("return true;"));
 }
 
 TEST(MakeSourceTest, QtSyncFoldsRejectionIntoCallError)
@@ -379,14 +415,23 @@ TEST(MakeSourceTest, QtNoInvokableMethodsEmitsNoDetector)
     EXPECT_FALSE(src.contains("logosDispatchRejection"));
 }
 
-TEST(MakeSourceTest, LpSurfaceIsUntouched)
+TEST(MakeSourceTest, LpSurfaceUsesItsOwnJsonDetectorNotTheQtOne)
 {
-    // The fix is Qt-consumer-only; the lp wrapper must generate exactly as
-    // before (byte-identical output is the negative control for the change).
+    // The Qt-consumer fix stays Qt-only: a QVariant-typed detector must never
+    // reach a translation unit whose whole purpose is not to see Qt. The lp
+    // surface folds the SAME wire object through its own nlohmann::json twin,
+    // on both the sync path and `<name>AsyncResult` (see test_async_result.cpp).
+    //
+    // This test used to assert the lp wrapper contained no detector at all —
+    // the negative control for a fix that was Qt-only at the time. What it was
+    // really protecting is the Qt-freeness, which is what it asserts now.
     QJsonArray methods;
     methods.append(makeMethod("fn", "QVariantList", 1));
     QString src = makeSource("mod", "Mod", "mod.h", methods, ApiStyle::Lp);
-    EXPECT_FALSE(src.contains("logosDispatchRejection"));
+    EXPECT_FALSE(src.contains("logosDispatchRejection(const QVariant&"));
+    EXPECT_TRUE(src.contains("bool logosDispatchRejectionJson(const nlohmann::json& v, logos::CallError& out)"));
+    // Its own guard macro, so the two detectors can coexist in one TU.
+    EXPECT_TRUE(src.contains("#ifndef LOGOS_GENERATED_DISPATCH_REJECTION_JSON"));
 }
 
 TEST(MakeSourceTest, QtRejectionDetectorIsPreprocessorGuarded)

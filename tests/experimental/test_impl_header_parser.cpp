@@ -83,6 +83,40 @@ TEST_F(ImplHeaderParserTest, ReadsDependenciesDeclaredInObjectForm)
     EXPECT_EQ(r.module.depends[2], "dep_c");
 }
 
+// `optional_dependencies` reaches the contract as its OWN list. The two differ
+// in lifetime — nothing loads an optional dependency and its absence is not an
+// error — and a contract that merged them would hand the other side back a
+// dependency the loader then treats as required.
+TEST_F(ImplHeaderParserTest, ReadsOptionalDependenciesAsTheirOwnList)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/sample_impl.h",
+        "SampleModuleImpl",
+        fixturesDir() + "/optional_deps_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    ASSERT_EQ(r.module.depends.size(), 2);
+    EXPECT_EQ(r.module.depends[0], "hard_dep");
+    EXPECT_EQ(r.module.depends[1], "hard_obj_dep");
+
+    ASSERT_EQ(r.module.optional_depends.size(), 2);
+    EXPECT_EQ(r.module.optional_depends[0], "soft_dep");
+    EXPECT_EQ(r.module.optional_depends[1], "soft_obj_dep");
+}
+
+// A module with none stays exactly as it was, so nothing regenerates.
+TEST_F(ImplHeaderParserTest, NoOptionalDependenciesLeavesTheListEmpty)
+{
+    auto r = parseImplHeader(
+        fixturesDir() + "/sample_impl.h",
+        "SampleModuleImpl",
+        fixturesDir() + "/object_deps_metadata.json",
+        err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+    EXPECT_TRUE(r.module.optional_depends.empty());
+}
+
 TEST_F(ImplHeaderParserTest, MethodTypes)
 {
     auto r = parseImplHeader(
@@ -102,7 +136,7 @@ TEST_F(ImplHeaderParserTest, MethodTypes)
     // std::string greet(const std::string& name) → tstr
     auto greet = findMethod("greet");
     ASSERT_NE(greet, nullptr);
-    EXPECT_EQ(greet->returnType.name, "tstr");
+    EXPECT_EQ(greet->returnType->name, "tstr");
     ASSERT_EQ(greet->params.size(), 1);
     EXPECT_EQ(greet->params[0].name, "name");
     EXPECT_EQ(greet->params[0].type.name, "tstr");
@@ -110,50 +144,64 @@ TEST_F(ImplHeaderParserTest, MethodTypes)
     // bool isValid(const std::string& input) → bool
     auto isValid = findMethod("isValid");
     ASSERT_NE(isValid, nullptr);
-    EXPECT_EQ(isValid->returnType.name, "bool");
+    EXPECT_EQ(isValid->returnType->name, "bool");
 
     // int64_t getCount() → int
     auto getCount = findMethod("getCount");
     ASSERT_NE(getCount, nullptr);
-    EXPECT_EQ(getCount->returnType.name, "int");
+    EXPECT_EQ(getCount->returnType->name, "int");
     EXPECT_TRUE(getCount->params.empty());
 
     // uint64_t getSize() → uint
     auto getSize = findMethod("getSize");
     ASSERT_NE(getSize, nullptr);
-    EXPECT_EQ(getSize->returnType.name, "uint");
+    EXPECT_EQ(getSize->returnType->name, "uint");
 
     // double getScore() → float64
     auto getScore = findMethod("getScore");
     ASSERT_NE(getScore, nullptr);
-    EXPECT_EQ(getScore->returnType.name, "float64");
+    EXPECT_EQ(getScore->returnType->name, "float64");
 
-    // void doNothing() → void
+    // void doNothing() → no return clause
     auto doNothing = findMethod("doNothing");
     ASSERT_NE(doNothing, nullptr);
-    EXPECT_EQ(doNothing->returnType.name, "void");
+    EXPECT_FALSE(doNothing->returnType);
+
+    // The header-derived form must survive the same canonicalization pass as
+    // an authored contract. This is the producer half of dependency bundling:
+    // consumers normalize the resulting sidecar again before packaging it.
+    const QString canonical = lidlSerialize(r.module);
+    EXPECT_TRUE(canonical.contains("method doNothing()\n")) << canonical.toStdString();
+    EXPECT_FALSE(canonical.contains("method doNothing() ->")) << canonical.toStdString();
+    auto normalized = lidlParse(canonical);
+    ASSERT_FALSE(normalized.hasError()) << normalized.error;
+    const auto validation = lidlValidate(normalized.module);
+    EXPECT_FALSE(validation.hasErrors());
+    for (const auto& error : validation.errors)
+        ADD_FAILURE() << error;
+    EXPECT_EQ(lidlSerialize(normalized.module), canonical);
 
     // std::vector<std::string> getNames() → [tstr]
     auto getNames = findMethod("getNames");
     ASSERT_NE(getNames, nullptr);
-    EXPECT_EQ(getNames->returnType.kind, TypeExpr::Array);
-    EXPECT_EQ(getNames->returnType.elements[0].name, "tstr");
+    EXPECT_EQ(getNames->returnType->kind, TypeExpr::Array);
+    EXPECT_EQ(getNames->returnType->elements[0].name, "tstr");
 
     // std::vector<uint8_t> getData() → bstr
     auto getData = findMethod("getData");
     ASSERT_NE(getData, nullptr);
-    EXPECT_EQ(getData->returnType.name, "bstr");
+    EXPECT_EQ(getData->returnType->name, "bstr");
 
     // std::vector<int64_t> getIds() → [int]
     auto getIds = findMethod("getIds");
     ASSERT_NE(getIds, nullptr);
-    EXPECT_EQ(getIds->returnType.kind, TypeExpr::Array);
-    EXPECT_EQ(getIds->returnType.elements[0].name, "int");
+    EXPECT_EQ(getIds->returnType->kind, TypeExpr::Array);
+    EXPECT_EQ(getIds->returnType->elements[0].name, "int");
 
     // std::string combine(const std::string& a, const std::string& b, int64_t count)
     auto combine = findMethod("combine");
     ASSERT_NE(combine, nullptr);
-    EXPECT_EQ(combine->returnType.name, "tstr");
+    EXPECT_EQ(combine->returnType->name, "tstr");
     ASSERT_EQ(combine->params.size(), 3);
     EXPECT_EQ(combine->params[0].name, "a");
     EXPECT_EQ(combine->params[1].name, "b");
@@ -356,72 +404,72 @@ TEST_F(ImplHeaderParserTest, UniversalTypesAndMetadataEvents)
 
     auto fetchMap = findMethod("fetchMap");
     ASSERT_NE(fetchMap, nullptr);
-    EXPECT_EQ(fetchMap->returnType.kind, TypeExpr::Map);
+    EXPECT_EQ(fetchMap->returnType->kind, TypeExpr::Map);
     EXPECT_TRUE(fetchMap->jsonReturn);
 
     auto fetchList = findMethod("fetchList");
     ASSERT_NE(fetchList, nullptr);
-    EXPECT_EQ(fetchList->returnType.kind, TypeExpr::Array);
-    EXPECT_EQ(fetchList->returnType.elements[0].name, "any");
+    EXPECT_EQ(fetchList->returnType->kind, TypeExpr::Array);
+    EXPECT_EQ(fetchList->returnType->elements[0].name, "any");
     EXPECT_TRUE(fetchList->jsonReturn);
 
     auto asVariantMap = findMethod("asVariantMap");
     ASSERT_NE(asVariantMap, nullptr);
-    EXPECT_EQ(asVariantMap->returnType.kind, TypeExpr::Map);
+    EXPECT_EQ(asVariantMap->returnType->kind, TypeExpr::Map);
     EXPECT_FALSE(asVariantMap->jsonReturn);
 
     auto listNames = findMethod("listNames");
     ASSERT_NE(listNames, nullptr);
-    EXPECT_EQ(listNames->returnType.kind, TypeExpr::Array);
-    EXPECT_EQ(listNames->returnType.elements[0].name, "tstr");
+    EXPECT_EQ(listNames->returnType->kind, TypeExpr::Array);
+    EXPECT_EQ(listNames->returnType->elements[0].name, "tstr");
     EXPECT_FALSE(listNames->jsonReturn);
 
     auto anyList = findMethod("anyList");
     ASSERT_NE(anyList, nullptr);
-    EXPECT_EQ(anyList->returnType.kind, TypeExpr::Array);
-    EXPECT_EQ(anyList->returnType.elements[0].name, "any");
+    EXPECT_EQ(anyList->returnType->kind, TypeExpr::Array);
+    EXPECT_EQ(anyList->returnType->elements[0].name, "any");
     EXPECT_FALSE(anyList->jsonReturn);
 
     auto fetchResult = findMethod("fetchResult");
     ASSERT_NE(fetchResult, nullptr);
-    EXPECT_EQ(fetchResult->returnType.kind, TypeExpr::Primitive);
-    EXPECT_EQ(fetchResult->returnType.name, "result");
+    EXPECT_EQ(fetchResult->returnType->kind, TypeExpr::Primitive);
+    EXPECT_EQ(fetchResult->returnType->name, "result");
     EXPECT_FALSE(fetchResult->jsonReturn);
     EXPECT_TRUE(fetchResult->resultReturn);
 
     auto fetchResultNodiscard = findMethod("fetchResultNodiscard");
     ASSERT_NE(fetchResultNodiscard, nullptr);
-    EXPECT_EQ(fetchResultNodiscard->returnType.name, "result");
+    EXPECT_EQ(fetchResultNodiscard->returnType->name, "result");
     EXPECT_TRUE(fetchResultNodiscard->resultReturn);
 
     auto fetchResultStatic = findMethod("fetchResultStatic");
     ASSERT_NE(fetchResultStatic, nullptr);
-    EXPECT_EQ(fetchResultStatic->returnType.name, "result");
+    EXPECT_EQ(fetchResultStatic->returnType->name, "result");
     EXPECT_TRUE(fetchResultStatic->resultReturn);
 
     auto fetchResultNodiscardStatic = findMethod("fetchResultNodiscardStatic");
     ASSERT_NE(fetchResultNodiscardStatic, nullptr);
-    EXPECT_EQ(fetchResultNodiscardStatic->returnType.name, "result");
+    EXPECT_EQ(fetchResultNodiscardStatic->returnType->name, "result");
     EXPECT_TRUE(fetchResultNodiscardStatic->resultReturn);
 
     auto fetchResultStaticNodiscard = findMethod("fetchResultStaticNodiscard");
     ASSERT_NE(fetchResultStaticNodiscard, nullptr);
-    EXPECT_EQ(fetchResultStaticNodiscard->returnType.name, "result");
+    EXPECT_EQ(fetchResultStaticNodiscard->returnType->name, "result");
     EXPECT_TRUE(fetchResultStaticNodiscard->resultReturn);
 
     auto fetchResultMultiAttr = findMethod("fetchResultMultiAttr");
     ASSERT_NE(fetchResultMultiAttr, nullptr);
-    EXPECT_EQ(fetchResultMultiAttr->returnType.name, "result");
+    EXPECT_EQ(fetchResultMultiAttr->returnType->name, "result");
     EXPECT_TRUE(fetchResultMultiAttr->resultReturn);
 
     auto fetchResultInlineStatic = findMethod("fetchResultInlineStatic");
     ASSERT_NE(fetchResultInlineStatic, nullptr);
-    EXPECT_EQ(fetchResultInlineStatic->returnType.name, "result");
+    EXPECT_EQ(fetchResultInlineStatic->returnType->name, "result");
     EXPECT_TRUE(fetchResultInlineStatic->resultReturn);
 
     auto fetchResultConsteval = findMethod("fetchResultConsteval");
     ASSERT_NE(fetchResultConsteval, nullptr);
-    EXPECT_EQ(fetchResultConsteval->returnType.name, "result");
+    EXPECT_EQ(fetchResultConsteval->returnType->name, "result");
     EXPECT_TRUE(fetchResultConsteval->resultReturn);
 
     for (const auto& m : r.module.methods) {
@@ -525,7 +573,7 @@ TEST_F(ImplHeaderParserTest, SameLineSectionSpecifiers)
     const MethodDecl* greet = findMethod("greet");
     ASSERT_NE(greet, nullptr)
         << "Same-line `public:` declaration must still be parsed";
-    EXPECT_EQ(greet->returnType.name, "tstr");
+    EXPECT_EQ(greet->returnType->name, "tstr");
     ASSERT_EQ(greet->params.size(), 1);
     EXPECT_EQ(greet->params[0].name, "name");
     EXPECT_EQ(greet->params[0].type.name, "tstr");
@@ -626,7 +674,8 @@ TEST_F(ImplHeaderParserTest, StdOptionalBecomesOptional)
     ASSERT_EQ(echo->params.size(), 1u);
     EXPECT_TRUE(paramIsOptional(echo->params[0]));
     EXPECT_EQ(paramValueType(echo->params[0]).name, "tstr");
-    EXPECT_TRUE(typeIsOptional(echo->returnType));
+    ASSERT_TRUE(echo->returnType);
+    EXPECT_TRUE(typeIsOptional(*echo->returnType));
 
     const MethodDecl* lst = findMethod("echoOptionalList");
     ASSERT_NE(lst, nullptr);
@@ -639,7 +688,8 @@ TEST_F(ImplHeaderParserTest, StdOptionalBecomesOptional)
     const MethodDecl* req = findMethod("required");
     ASSERT_NE(req, nullptr);
     EXPECT_FALSE(paramIsOptional(req->params[0]));
-    EXPECT_FALSE(typeIsOptional(req->returnType));
+    ASSERT_TRUE(req->returnType);
+    EXPECT_FALSE(typeIsOptional(*req->returnType));
 
     // The event parameter, likewise.
     ASSERT_EQ(r.module.events.size(), 1u);
@@ -737,7 +787,8 @@ TEST_F(ImplHeaderParserTest, NlohmannJsonIsAnyByName)
     ASSERT_FALSE(r.hasError()) << r.error.toStdString();
 
     ASSERT_EQ(r.module.methods.size(), 2u);
-    EXPECT_EQ(r.module.methods[0].returnType.name, "any");
+    ASSERT_TRUE(r.module.methods[0].returnType);
+    EXPECT_EQ(r.module.methods[0].returnType->name, "any");
     EXPECT_EQ(r.module.methods[0].params[0].type.name, "any");
     EXPECT_EQ(r.module.methods[1].params[0].type.name, "any");
     ASSERT_EQ(r.module.events.size(), 1u);
@@ -995,8 +1046,9 @@ TEST_F(ImplHeaderParserTest, AllmanBraceStructIsARecord)
     EXPECT_EQ(r.module.types[0].name, "AllmanRecord");
     ASSERT_EQ(r.module.types[0].fields.size(), 2u);
     ASSERT_EQ(r.module.methods.size(), 1u);
-    EXPECT_EQ(r.module.methods[0].returnType.kind, TypeExpr::Named);
-    EXPECT_EQ(r.module.methods[0].returnType.name, "AllmanRecord");
+    ASSERT_TRUE(r.module.methods[0].returnType);
+    EXPECT_EQ(r.module.methods[0].returnType->kind, TypeExpr::Named);
+    EXPECT_EQ(r.module.methods[0].returnType->name, "AllmanRecord");
 }
 
 // The K&R form has to keep parsing exactly as it did — this is the form every
@@ -1318,4 +1370,43 @@ TEST_F(ImplHeaderParserTest, BraceInAStringLiteralIsNotAScope)
     ASSERT_EQ(r.module.types.size(), 1u);
     ASSERT_EQ(r.module.types[0].fields.size(), 2u);
     EXPECT_EQ(r.module.types[0].fields[1].name, "n");
+}
+
+// ---------------------------------------------------------------------------
+// Teardown hooks stay out of the contract
+// ---------------------------------------------------------------------------
+
+TEST_F(ImplHeaderParserTest, TeardownHooksAreNotPartOfTheContract)
+{
+    // aboutToUnload() and unloadFinished() are framework plumbing, exactly like
+    // onContextReady(). An impl that overrides one is talking to the host, not
+    // publishing API -- leaking either would generate a consumer wrapper for a
+    // lifecycle hook, and LogosShutdown has no LIDL type to return anyway.
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString hp = dir.filePath("thing_impl.h");
+    {
+        QFile f(hp);
+        ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Text));
+        f.write(
+            "#pragma once\n"
+            "#include <string>\n"
+            "class ThingImpl {\n"
+            "public:\n"
+            "    std::string work();\n"
+            "    void onContextReady();\n"
+            "    LogosShutdown aboutToUnload();\n"
+            "    void unloadFinished();\n"
+            "};\n");
+    }
+    auto r = parseImplHeader(hp, "ThingImpl",
+                             fixturesDir() + "/sample_metadata.json", err);
+    ASSERT_FALSE(r.hasError()) << r.error.toStdString();
+
+    QStringList names;
+    for (const auto& m : r.module.methods) names << QString::fromStdString(m.name);
+    EXPECT_TRUE(names.contains("work")) << "got: " << names.join(",").toStdString();
+    EXPECT_FALSE(names.contains("aboutToUnload")) << "got: " << names.join(",").toStdString();
+    EXPECT_FALSE(names.contains("unloadFinished")) << "got: " << names.join(",").toStdString();
+    EXPECT_FALSE(names.contains("onContextReady")) << "got: " << names.join(",").toStdString();
 }

@@ -3,6 +3,10 @@
 
   inputs.logos-nix.url = "github:logos-co/logos-nix";
   inputs.nixpkgs.follows = "logos-nix/nixpkgs";
+  # The protocol layer (transports, token exchange, lp_* C ABI). Follows our
+  # logos-nix so both repos resolve the identical nixpkgs/Qt pin — the QRO
+  # wire is Qt-version-sensitive.
+  #
   # Keep protocol inputs on the maintained fork so downstream fork builds do
   # not silently switch back to the upstream repository.
   inputs.logos-protocol.url = "github:3esmit/logos-protocol?rev=f090940772eb74f6cfac0febdecd521f05a264c7";
@@ -10,7 +14,9 @@
   # The canonical, language-neutral LIDL frontend (lexer/parser/AST/serializer/
   # validator) the code generator links. Follows our logos-nix so it resolves
   # the identical nixpkgs pin.
-  inputs.logos-lidl.url = "github:logos-co/logos-lidl";
+  # Identity methods are part of the canonical frontend consumed by the
+  # generator backends; keep this input at the revision that publishes them.
+  inputs.logos-lidl.url = "github:logos-co/logos-lidl/2043d8bf94c6bfee3781f96ad088e8c13ec36038";
   inputs.logos-lidl.inputs.logos-nix.follows = "logos-nix";
 
   outputs = { self, nixpkgs, logos-nix, logos-protocol, logos-lidl }:
@@ -73,6 +79,7 @@
           src = ./.;
           tests = import ./nix/tests.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
           generator = import ./nix/bin.nix { inherit pkgs common src logos-protocol; logos-lidl = logos-lidl.packages.${pkgs.system}.logos-lidl; };
+          moduleImplAbi = logos-protocol.packages.${pkgs.system}.module-impl-abi or null;
         in
         {
           inherit tests;
@@ -81,6 +88,21 @@
           generator-cli = import ./nix/tests-generator-cli.nix {
             inherit pkgs common generator;
           };
+          # Diffs what the cdylib backend DEFINES against the module-impl C
+          # ABI logos-protocol DECLARES. Nothing else here can catch that gap:
+          # a module with a missing export links clean and only dies at
+          # dlopen(), on Linux. See nix/tests-module-impl-abi.nix.
+          module-impl-abi =
+            if moduleImplAbi == null then
+              pkgs.runCommand "module-impl-abi-skipped" {} ''
+                mkdir -p "$out"
+                echo "skipped: logos-protocol does not publish module-impl-abi" > "$out/results.txt"
+              ''
+            else
+              import ./nix/tests-module-impl-abi.nix {
+                inherit pkgs common src generator;
+                module-impl-abi = moduleImplAbi;
+              };
         }
       );
 

@@ -101,9 +101,47 @@ QString normalizeType(QString t)
     return t;
 }
 
+// ─── The widened-Qt-spelling fold ────────────────────────────────────────
+//
+// `lidlTypeToQt` now answers `[uint]` with QList<qulonglong>, `{tstr: uint}`
+// with QMap<QString, qulonglong> and `?tstr` with std::optional<QString> — the
+// lossless spellings a Qt CONSUMER wants. This emitter cannot use them, and the
+// reason is structural rather than a matter of taste:
+//
+//   * It is keyed on a FLAT TYPE NAME, not a TypeExpr. `lidl_to_json` flattens
+//     the contract to strings before it gets here, because the same emitter
+//     also serves the metaobject-introspection path, which has only names to
+//     offer. Encoding `QList<QMap<QString, qulonglong>>` correctly needs an
+//     element loop per level, and deriving those levels here means parsing C++
+//     type names back into a tree — a second, worse frontend.
+//   * Its Qt flavour marshals whole QVariants through LogosAPIClient, and its
+//     lp flavour is derived from the same table by mapParamTypeStd below. A
+//     widened name reaching either without a loop is silent data loss:
+//     qvariantToNlohmann matches a CLOSED userType() set, so a
+//     QList<qulonglong> serialises to null, and qvariant_cast back yields an
+//     EMPTY list. Neither direction warns.
+//
+// So every widened spelling is folded back to the name this emitter already
+// produced for that contract, and BOTH surfaces it feeds — the legacy Qt
+// consumer and the Qt-free lp one — stay byte-for-byte what they were. This is
+// deliberately a freeze, not a fix: the TypeExpr-driven Qt emitters
+// (lidl_gen_client.cpp here, lidl_gen_qt_consumer.cpp in logos-qt-sdk) are
+// where the widened types are actually spent.
+//
+// Record-bearing names never reach this: paramTypeFor / returnTypeFor consult
+// recordCppType FIRST, and `QList<Point>` / `QMap<QString, Point>` are matched
+// there. What arrives here is only what recordShape declined.
+static QString legacyQtBase(const QString& t)
+{
+    if (t.startsWith("QList<"))          return QStringLiteral("QVariantList");
+    if (t.startsWith("QMap<QString,"))   return QStringLiteral("QVariantMap");
+    if (t.startsWith("std::optional<"))  return QStringLiteral("QVariant");
+    return t;
+}
+
 QString mapParamType(const QString& qtType)
 {
-    const QString base = normalizeType(qtType);
+    const QString base = legacyQtBase(normalizeType(qtType));
     static const QSet<QString> known = {
         "void","bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant"
     };
@@ -114,7 +152,7 @@ QString mapParamType(const QString& qtType)
 
 QString mapReturnType(const QString& qtType)
 {
-    const QString base = normalizeType(qtType);
+    const QString base = legacyQtBase(normalizeType(qtType));
     if (base.isEmpty() || base == "void") return QString("void");
     static const QSet<QString> known = {
         "bool","int","qlonglong","qulonglong","double","float","QString","QStringList","QByteArray","QJsonArray","QVariantList","QVariantMap","QVariant","LogosResult"
@@ -799,13 +837,91 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
     return h;
 }
 
+// ---------------------------------------------------------------------------
+// The provider REJECTION codes, as a CLOSED SET.
+//
+// This array is the single source of truth for BOTH detectors emitted below —
+// the nlohmann::json one for the lp surface and the QVariant one for the Qt
+// surface. They used to spell the literal out separately, which is exactly how
+// two detectors drift apart; the condition text is now built from here, so a
+// code added to this array reaches both emitters or neither.
+//
+// Why a closed set and not "any {code,message,origin} object": a method may
+// legitimately RETURN a three-string map, and an `any` return certainly can.
+// Matching the shape alone would let user data impersonate a refusal. The set
+// is what keeps the in-band signal narrow.
+//
+//   "dispatch_failed" — the provider ran and refused well-formed-looking
+//                       arguments (a type it could not decode).
+//   "invalid_args"    — wrong argument COUNT. Emitted today by the generated
+//                       cdylib dispatch (experimental/lidl_gen_cdylib.cpp) and
+//                       by logos-rust-sdk `args::invalid_args`, and until now
+//                       detected by nobody: `logosctl call m isPositive` with
+//                       the argument missing exited 0 with status "ok" and the
+//                       refusal object as its RESULT.
+//   "unknown_method"  — NOT emitted by any provider yet. Listed now on purpose.
+//                       logos_protocol.h records that an unknown method is
+//                       currently answered with a bare null, indistinguishable
+//                       from a legitimate null return, and that closing it
+//                       needs a provider-contract change across the SDKs. The
+//                       detector has to be widened FIRST: widening is
+//                       backwards-compatible on its own (nothing emits the code,
+//                       so nothing changes), whereas a new provider code shipped
+//                       against old detectors would arrive at consumers as DATA
+//                       — the same silent-success bug, freshly minted.
+//
+// WHY THIS IS A PER-REPO CONSTANT AND NOT A SHARED ONE. There are five copies of
+// this detector: the two emitted below, logos-qt-sdk's byte-identical
+// lidl_gen_qt_consumer.cpp, logos-rust-sdk's args::as_dispatch_rejection, and
+// logos-logoscore-cli's core_service/call_envelope.cpp. Two candidate shared
+// homes were considered and both rejected FOR NOW:
+//
+//   * a shared EMITTER in share/lidl-frontend (which already ships
+//     lidl_emit_common to logos-qt-generator, so the channel exists). It would
+//     collapse 2 of the 5 — not the QVariant twin, not Rust, not core_service —
+//     and it would make logos-qt-sdk's commit depend on this one plus a pin
+//     bump, turning four independently landable fixes into an ordered stack for
+//     no behavioural gain.
+//   * a runtime predicate in logos-protocol that the generated code CALLS. This
+//     is the principled end state, and it is how the analogous CONVERSION
+//     duplication was actually solved (logos_json_convert, reached through
+//     logos_qt_lp_bridge.h) rather than by sharing an emitter. It is a separate
+//     change because it converts a TEXT-level duplication into a BUILD-level
+//     version coupling: the emitted body is self-contained today, so a wrapper
+//     generated by any generator compiles against any logos-protocol a module
+//     happens to pin. Calling a protocol symbol ends that.
+//
+// So: copies stay, and each repo holds the vocabulary in ONE named place so a
+// drift between them is visible rather than silent. Here that place is this
+// array, and BOTH emitters below build their condition from it.
+// ---------------------------------------------------------------------------
+static const char* const kRejectionCodes[] = {
+    "dispatch_failed", "invalid_args", "unknown_method",
+};
+
+// `c != "a" && c != "b" && ...` over kRejectionCodes, with each literal passed
+// through `wrap` (identity for std::string, QStringLiteral for QString).
+static QString rejectionCodeMismatch(const QString& var,
+                                     QString (*wrap)(const char*),
+                                     const QString& joinIndent)
+{
+    QStringList terms;
+    for (const char* code : kRejectionCodes)
+        terms << var + " != " + wrap(code);
+    return terms.join("\n" + joinIndent + "&& ");
+}
+
+static QString plainLiteral(const char* c) { return QString("\"") + c + "\""; }
+static QString qtLiteral(const char* c) { return QString("QStringLiteral(\"") + c + "\")"; }
+
 // The Qt consumer's rejection detector, emitted once per generated wrapper.
 //
 // A provider that REJECTS a call answers the canonical
-// {"code":"dispatch_failed", "message":..., "origin":...} object as its RESULT,
-// not as a transport error. Every provider flavour produces the same object
-// (logos-qt-sdk `dispatchFailedVariant`, the generated cdylib dispatch, the Rust
-// provider's `args::dispatch_failed`), and the Qt return table converts it like
+// {"code":..., "message":..., "origin":...} object as its RESULT, with `code`
+// drawn from kRejectionCodes above, not as a transport error. Every provider
+// flavour produces the same object (logos-qt-sdk `dispatchFailedVariant`, the
+// generated cdylib dispatch, logos-rust-sdk's `args::dispatch_failed` and
+// `args::invalid_args`), and the Qt return table converts it like
 // any other value — which ERASES it: `_result.toList()` on a map is `[]`,
 // `.toString()` is "", `.toLongLong()` is 0. A caller then cannot tell "you sent
 // me the wrong thing" from "the provider returned nothing".
@@ -818,6 +934,43 @@ QString makeHeader(const QString& moduleName, const QString& className, const QJ
 // generated `<dep>_api.cpp`, so a module with more than one dependency puts
 // several of these in ONE translation unit. Internal linkage handles the
 // separate-TU case; only the preprocessor handles this one.
+// The Qt-free twin of emitDispatchRejectionDetector, for the lp surface, whose
+// results arrive as nlohmann::json rather than QVariant. Same match on the same
+// three string fields against the same closed code set, for the same reason: an
+// `any` or map return carrying user data must never false-match.
+//
+// Guarded identically — the umbrella (`logos_sdk.cpp`) textually #includes every
+// generated `<dep>_api.cpp`, so a module with more than one dependency puts
+// several of these in ONE translation unit.
+//
+// The name matches logos-qt-sdk's plain-consumer backend
+// (lidl_gen_qt_consumer.cpp), which emits a byte-identical helper: the two
+// surfaces decode the same wire object, and one spelling means a TU that
+// somehow sees both still compiles.
+static void emitDispatchRejectionDetectorJson(QTextStream& s)
+{
+    s << "#ifndef LOGOS_GENERATED_DISPATCH_REJECTION_JSON\n";
+    s << "#define LOGOS_GENERATED_DISPATCH_REJECTION_JSON\n\n";
+    s << "namespace {\n\n";
+    s << "// True when `v` is the canonical provider REJECTION object rather than a\n";
+    s << "// value; fills `out` with its {code, message, origin} on a match.\n";
+    s << "bool logosDispatchRejectionJson(const nlohmann::json& v, logos::CallError& out)\n";
+    s << "{\n";
+    s << "    if (!v.is_object() || v.size() != 3) return false;\n";
+    s << "    auto code = v.find(\"code\"), message = v.find(\"message\"), origin = v.find(\"origin\");\n";
+    s << "    if (code == v.end() || message == v.end() || origin == v.end()) return false;\n";
+    s << "    if (!code->is_string() || !message->is_string() || !origin->is_string()) return false;\n";
+    s << "    const std::string _code = code->get<std::string>();\n";
+    s << "    if (" << rejectionCodeMismatch("_code", plainLiteral, "        ") << ") return false;\n";
+    s << "    out.code = _code;\n";
+    s << "    out.message = message->get<std::string>();\n";
+    s << "    out.origin = origin->get<std::string>();\n";
+    s << "    return true;\n";
+    s << "}\n\n";
+    s << "} // namespace\n\n";
+    s << "#endif  // LOGOS_GENERATED_DISPATCH_REJECTION_JSON\n\n";
+}
+
 static void emitDispatchRejectionDetector(QTextStream& s)
 {
     s << "#ifndef LOGOS_GENERATED_DISPATCH_REJECTION\n";
@@ -826,9 +979,10 @@ static void emitDispatchRejectionDetector(QTextStream& s)
     s << "// True when `v` is the canonical provider REJECTION object rather than a\n";
     s << "// value; fills `out` with its {code, message, origin} on a match.\n";
     s << "//\n";
-    s << "// The match is exact — those three fields, all strings, and that code — for the\n";
-    s << "// same reason logos_rpc_status.h's isUnauthorizedSentinel is exact: an `any` or\n";
-    s << "// map return carrying user data must never false-match.\n";
+    s << "// The match is narrow — those three fields, all strings, and a code from the\n";
+    s << "// CLOSED SET above — for the same reason logos_rpc_status.h's\n";
+    s << "// isUnauthorizedSentinel is exact: an `any` or map return carrying user data\n";
+    s << "// must never false-match. Any other code stays DATA.\n";
     s << "bool logosDispatchRejection(const QVariant& v, logos::CallError& out)\n";
     s << "{\n";
     s << "    QVariantMap m;\n";
@@ -845,8 +999,9 @@ static void emitDispatchRejectionDetector(QTextStream& s)
     s << "    if (code.userType() != QMetaType::QString\n";
     s << "        || message.userType() != QMetaType::QString\n";
     s << "        || origin.userType() != QMetaType::QString) return false;\n";
-    s << "    if (code.toString() != QStringLiteral(\"dispatch_failed\")) return false;\n";
-    s << "    out.code = code.toString().toStdString();\n";
+    s << "    const QString _code = code.toString();\n";
+    s << "    if (" << rejectionCodeMismatch("_code", qtLiteral, "        ") << ") return false;\n";
+    s << "    out.code = _code.toStdString();\n";
     s << "    out.message = message.toString().toStdString();\n";
     s << "    out.origin = origin.toString().toStdString();\n";
     s << "    return true;\n";
@@ -1304,6 +1459,7 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     s << "#include \"logos_json.h\"\n";
     s << "#include \"logos_result.h\"\n";
     s << "#include \"logos_call_error.h\"\n";
+    s << "#include \"logos_async_result.h\"\n";
     s << "#include \"logos_lp_client.h\"\n";
     // Record maps are std::map on the Qt-free surface.
     if (!rs.isEmpty()) s << "#include <map>\n";
@@ -1336,10 +1492,29 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         const QJsonObject eo = ev.toObject();
         const QString evName = eo.value("name").toString();
         if (evName.isEmpty()) continue;
-        s << "    bool " << lpEventAccessorName(evName)
-          << "(std::function<void(" << lpEventCbParams(eo.value("params").toArray(), rs) << ")> callback);\n";
+        s << "    logos::SubHandle " << lpEventAccessorName(evName)
+          << "(std::function<void(" << lpEventCbParams(eo.value("params").toArray(), rs)
+          << ")> callback);\n";
     }
-    if (!events.isEmpty()) s << "\n";
+    // The target's subscription state, forwarded from the LpClient. Per MODULE
+    // rather than per event, because that is the granularity the runtime has:
+    // every subscription here shares one handle on the provider, so they arm
+    // and are lost together. Emitted only when the dep HAS events -- a module
+    // with none has no subscriptions whose state could be asked about.
+    if (!events.isEmpty()) {
+        s << "\n";
+        s << "    // Watch this module's subscription transitions: Armed / Lost /\n";
+        s << "    // Held / Abandoned, with the establishment number. Lost followed by\n";
+        s << "    // Armed at a higher generation is the unrecoverable-gap marker.\n";
+        s << "    void onSubscriptionStatus(std::function<void(logos::SubStatus, std::uint64_t)> cb);\n";
+        s << "    // 0 = never armed, 1 = the first, N+1 after each re-establishment.\n";
+        s << "    std::uint64_t subscriptionGeneration();\n";
+        s << "    // Manual means \"do not RE-arm after a loss\", never \"do not arm\".\n";
+        s << "    void setRestartPolicy(logos::RestartPolicy policy);\n";
+        s << "    // Revive held subscriptions. Safe from inside the status callback.\n";
+        s << "    bool rearmSubscriptions();\n";
+        s << "\n";
+    }
 
     // Methods: sync (with optional CallError out-param + timeout) + async
     // overload.
@@ -1351,20 +1526,24 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
     // deadlines `int timeout_ms` with the C ABI's rule (`<= 0` selects the
     // protocol default), and this matches it.
     //
-    // NO `<name>AsyncResult` HERE — deliberately, for now. The Qt surface gets
-    // one because its transport reports the error
-    // (LogosAPIClient::AsyncResultErrorCallback). This surface's transport does
-    // NOT: logos-protocol's lp_invoke_async (cpp/logos_protocol.cpp) subscribes
-    // with the VALUE-ONLY invokeRemoteMethodAsync overload and unconditionally
-    // calls back `cb(1, json, ...)` — ok is hard-coded to 1 — even though
-    // lp_result_cb is documented as "ok == 0 → `json` is the canonical error
-    // object", and even though its own sync twin lp_invoke does return
-    // LP_ERR_UNAVAILABLE + makeErrorJson. So an AsyncResult emitted here would
-    // report ok() on a failed call to a module that is not loaded: an error
-    // channel that lies is worse than no error channel. (Measured, not assumed:
-    // a wrapper wired to it fires its callback with the default value and an
-    // EMPTY error code.) Once lp_invoke_async reports the error, emitting the
-    // AsyncResult twin here is the same few lines as above.
+    // `<name>AsyncResult` IS emitted here, matching the Qt surface.
+    //
+    // It was withheld for a long time, and the reason is worth recording because
+    // it was a property of the transport, not of this emitter: lp_invoke_async
+    // used to subscribe with the VALUE-ONLY invokeRemoteMethodAsync overload and
+    // hard-code `cb(1, json, ...)`, so a call to a module that is not loaded
+    // reached the callback as a SUCCESS carrying a default value. An AsyncResult
+    // built on that would have reported ok() for a failed call — an error
+    // channel that lies is worse than no error channel. logos-protocol#40 fixed
+    // it (logos_protocol.cpp now calls `cb(0, makeErrorJson(...))`), and
+    // logos::LpClient::invokeAsyncResult surfaces that in C++, so the twin is
+    // honest and the reason to withhold it is gone.
+    //
+    // The timeout is spelled the way the sync wrapper spells it (`int
+    // timeout_ms`, `<= 0` = protocol default) and is NEW rather than a
+    // regression of `<name>Async`, which has never taken one: this method has no
+    // existing callers to keep compatible, and a fresh surface should not be
+    // born unable to state a deadline the client below already accepts.
     for (const QJsonValue& v : methods) {
         const QJsonObject o = v.toObject();
         if (!o.value("isInvokable").toBool()) continue;
@@ -1396,6 +1575,16 @@ QString makeHeaderLp(const QString& moduleName, const QString& className, const 
         s << "    void " << name << "Async(";
         emitDeclParams();
         s << asyncCb << " callback);\n";
+
+        // Result-carrying async entry point. A DISTINCT NAME, not an overload
+        // of `<name>Async`, for the same reason the Qt surface uses one: a
+        // generic lambda is convertible to BOTH std::function<void(T)> and
+        // std::function<void(AsyncResult<T>)>, so two overloads would be
+        // ambiguous at the call sites most likely to want the error.
+        s << "    void " << name << "AsyncResult(";
+        emitDeclParams();
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback, "
+          << "int timeout_ms = 0);\n";
     }
 
     s << "\nprivate:\n";
@@ -1416,6 +1605,15 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
     QTextStream s(&c);
     s << "#include \"" << headerBaseName << "\"\n";
     s << "#include <nlohmann/json.hpp>\n\n";
+    // Only reachable from a method body, so a contract with no invokable method
+    // must not emit it: an unused function in an anonymous namespace is a
+    // -Wunused-function warning, and such a wrapper stays byte-identical to
+    // what it generated before.
+    bool anyInvokable = false;
+    for (const QJsonValue& mv : methods) {
+        if (mv.toObject().value("isInvokable").toBool()) { anyInvokable = true; break; }
+    }
+    if (anyInvokable) emitDispatchRejectionDetectorJson(s);
     emitRecordConversions(s, rs, ApiStyle::Lp, className);
 
     // How the wrapper reaches its persistent LpClient + subscription store.
@@ -1434,15 +1632,28 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
 
     // Typed event adapters: subscribe via lp_subscribe (JSON array payload),
     // decode into typed args, keep the RAII subscription alive in m_subs.
+    //
+    // The OWNING handle still goes into m_subs — the RAII lifetime stays the
+    // wrapper's, so an author cannot end their subscription by dropping a
+    // return value. What comes back is a non-owning logos::SubHandle, which
+    // exists so that unsubscribing is reachable at all: before it, the handle
+    // went into a private vector and the author had no way to name their own
+    // subscription again.
+    //
+    // It converts to bool implicitly, so every `if (dep.onFoo(cb))` and
+    // `bool ok = dep.onFoo(cb);` written against the old `bool` return keeps
+    // compiling and keeps meaning what it did.
     for (const QJsonValue& ev : events) {
         const QJsonObject eo = ev.toObject();
         const QString evName = eo.value("name").toString();
         if (evName.isEmpty()) continue;
         const QJsonArray evParams = eo.value("params").toArray();
-        s << "bool " << className << "::" << lpEventAccessorName(evName)
-          << "(std::function<void(" << lpEventCbParams(evParams, rs) << ")> callback) {\n";
-        s << "    if (!callback) return false;\n";
-        s << "    auto _sub = " << clientExpr << ".subscribe(\"" << evName << "\", [callback](nlohmann::json _a) {\n";
+        s << "logos::SubHandle " << className << "::" << lpEventAccessorName(evName)
+          << "(std::function<void(" << lpEventCbParams(evParams, rs)
+          << ")> callback) {\n";
+        s << "    if (!callback) return {};\n";
+        s << "    auto _sub = " << clientExpr << ".subscribe(\"" << evName
+          << "\", [callback](nlohmann::json _a) {\n";
         s << "        if (!_a.is_array() || _a.size() < " << evParams.size() << ") return;\n";
         s << "        callback(";
         for (int i = 0; i < evParams.size(); ++i) {
@@ -1453,9 +1664,27 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         }
         s << ");\n";
         s << "    });\n";
-        s << "    if (!_sub.valid()) return false;\n";
+        s << "    if (!_sub.valid()) return {};\n";
+        s << "    logos::SubHandle _h = _sub.handle();\n";
         s << "    " << subsExpr << ".push_back(std::move(_sub));\n";
-        s << "    return true;\n";
+        s << "    return _h;\n";
+        s << "}\n\n";
+    }
+
+    // The per-target state forwarders, emitted only when the dep has events.
+    if (!events.isEmpty()) {
+        s << "void " << className << "::onSubscriptionStatus("
+          << "std::function<void(logos::SubStatus, std::uint64_t)> cb) {\n";
+        s << "    " << clientExpr << ".onSubscriptionStatus(std::move(cb));\n";
+        s << "}\n\n";
+        s << "std::uint64_t " << className << "::subscriptionGeneration() {\n";
+        s << "    return " << clientExpr << ".subscriptionGeneration();\n";
+        s << "}\n\n";
+        s << "void " << className << "::setRestartPolicy(logos::RestartPolicy policy) {\n";
+        s << "    " << clientExpr << ".setRestartPolicy(policy);\n";
+        s << "}\n\n";
+        s << "bool " << className << "::rearmSubscriptions() {\n";
+        s << "    return " << clientExpr << ".rearmSubscriptions();\n";
         s << "}\n\n";
     }
 
@@ -1495,12 +1724,30 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         if (!params.isEmpty()) s << ", ";
         s << "logos::CallError* err, int timeout_ms) {\n";
         emitArgsArray();
-        if (ret == "void") {
-            s << "    " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
-        } else {
-            s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, err, timeout_ms);\n";
+        // Into a LOCAL, not straight into the caller's `err`: `err` is optional
+        // here (it defaults to nullptr) and the fold below needs somewhere to
+        // write regardless. The result is captured even for a `void` return —
+        // a void method can be rejected too, and the rejection object is the
+        // only place that says so.
+        s << "    logos::CallError _err;\n";
+        s << "    nlohmann::json _r = " << clientExpr << ".invoke(\"" << name << "\", _args, &_err, timeout_ms);\n";
+        // A provider that RAN and refused answers the canonical
+        // {"code":"dispatch_failed", …} object as its RESULT, not as a
+        // transport error, so LpClient::invoke reports ok() and the decode
+        // below turns the rejection into a default value — erasing it. Fold it
+        // into the same error channel the caller already reads, exactly as the
+        // Qt sync path does.
+        //
+        // No `else` warning branch, unlike the Qt twin: that one falls back to
+        // qWarning when the caller passed no `err`, and this surface has no
+        // logger to fall back to (a Qt-free wrapper that pulled in <iostream>
+        // to say so would cost every generated TU for a diagnostic nobody
+        // reads). A caller that wants to know passes `&err` — which is the same
+        // deal this surface already offers for transport errors.
+        s << "    if (_err.ok()) logosDispatchRejectionJson(_r, _err);\n";
+        s << "    if (err) *err = _err;\n";
+        if (ret != "void")
             s << "    return " << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ";\n";
-        }
         s << "}\n\n";
 
         // Async
@@ -1521,7 +1768,30 @@ QString makeSourceLp(const QString& moduleName, const QString& className, const 
         }
         s << "    });\n";
         s << "}\n\n";
-        // (No <name>AsyncResult on this surface yet — see makeHeaderLp.)
+
+        // Result-carrying async. Same arg marshalling and the SAME value
+        // decode as `<name>Async` above, so a failed call delivers exactly the
+        // value that one would have delivered — plus the error that explains it.
+        s << "void " << className << "::" << name << "AsyncResult(";
+        emitParams();
+        if (!params.isEmpty()) s << ", ";
+        s << "std::function<void(logos::AsyncResult<" << ret << ">)> callback, "
+          << "int timeout_ms) {\n";
+        s << "    if (!callback) return;\n";
+        emitArgsArray();
+        s << "    " << clientExpr << ".invokeAsyncResult(\"" << name << "\", _args,\n";
+        s << "        [callback](nlohmann::json _r, const logos::CallError& _err) {\n";
+        s << "            logos::AsyncResult<" << ret << "> _res;\n";
+        s << "            _res.error = _err;\n";
+        // Same fold as the sync path above, and for the same reason.
+        s << "            if (_res.error.ok()) logosDispatchRejectionJson(_r, _res.error);\n";
+        if (ret != "void")
+            s << "            _res.value = " << fromWireFor(qtRet, ApiStyle::Lp, rs, "_r", className + "::") << ";\n";
+        else
+            s << "            (void)_r;\n";
+        s << "            callback(_res);\n";
+        s << "        }, timeout_ms);\n";
+        s << "}\n\n";
     }
     return c;
 }

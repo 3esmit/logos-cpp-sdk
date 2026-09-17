@@ -13,13 +13,31 @@ bool lidlIsStdConvertible(const TypeExpr& te);
 
 namespace {
 
+// Keep the generated literal on one physical source line. The ABI checks run
+// unifdef over this file; that tool does not understand multiline raw strings.
+QString cppStringLiteral(const QString& value)
+{
+    QString escaped;
+    escaped.reserve(value.size() + 2);
+    escaped += QLatin1Char('"');
+    for (const QChar ch : value) {
+        if (ch == QLatin1Char('\\')) escaped += QStringLiteral("\\\\");
+        else if (ch == QLatin1Char('"')) escaped += QStringLiteral("\\\"");
+        else if (ch == QLatin1Char('\n')) escaped += QStringLiteral("\\n");
+        else if (ch == QLatin1Char('\r')) escaped += QStringLiteral("\\r");
+        else if (ch == QLatin1Char('\t')) escaped += QStringLiteral("\\t");
+        else escaped += ch;
+    }
+    escaped += QLatin1Char('"');
+    return escaped;
+}
+
 // The cdylib-supported subset: std-convertible LIDL types only — the same
 // Qt-free set the std apiStyle handled, so any universal module that built
 // under std also builds as a header-first cdylib.
 // The records a contract DECLARES. A `Named` type is a record only if it is in
-// here: `void` is not a LIDL builtin, so `-> void` arrives as Named("void") and
-// treating every Named as a record is how the Rust generator once emitted
-// `-> Void`. Same trap, same guard.
+// here. No-return methods have no TypeExpr at all; this set therefore contains
+// only names that can genuinely denote values.
 std::set<std::string> recordNames(const ModuleDecl& module)
 {
     std::set<std::string> out;
@@ -181,7 +199,7 @@ QString jsonArgToStd(const TypeExpr& te, const QString& expr, const QString& pat
 QString stdReturnToJson(const MethodDecl& md, const QString& var,
                         const std::set<std::string>& recs)
 {
-    const TypeExpr& te = md.returnType;
+    const TypeExpr& te = *md.returnType;
     if (md.resultReturn) {
         // StdLogosResult -> the canonical {success, value, error} object
         // (same shape logos_json_convert emits for Qt LogosResult).
@@ -298,7 +316,7 @@ bool moduleUsesOptional(const ModuleDecl& module)
         for (const FieldDecl& f : t.fields)
             if (fieldIsOptional(f) || mentions(f.type)) return true;
     for (const MethodDecl& md : module.methods) {
-        if (mentions(md.returnType)) return true;
+        if (md.returnType && mentions(*md.returnType)) return true;
         for (const ParamDecl& pd : md.params)
             if (mentions(pd.type)) return true;
     }
@@ -409,29 +427,37 @@ void emitRecordCodecs(QTextStream& s, const ModuleDecl& module,
     s << "}}  // namespace logos::detail\n\n";
 }
 
-// The Qt spelling of what actually crosses the Qt boundary.
+// The type name a method's PUBLISHED metadata carries — getMethods()'s
+// `returnType`, `parameters[].type` and `signature`.
 //
-// NOT lidlTypeToQt: that answers the CONSUMER's question ("what type does the
-// caller hold?") and since records became real structs it answers `Blob` /
-// `QList<Blob>`. Those names are correct in a generated consumer wrapper, where
-// the struct exists — but this JSON is the module's getMethods(), read by the
-// host to marshal a QVariant across the plugin boundary, and there is no
-// metatype called `Blob`. Emitting it made the host SIGSEGV on the first call
-// to any record method.
+// It is the LIDL CONTRACT spelling: `tstr`, `uint`, `[Point]`, `{tstr: uint}`,
+// `? tstr`. That is the only vocabulary in which this question has one right
+// answer. A module's published surface is its contract, and every consumer of
+// this JSON — `lm`, `logoscore`'s method listing, basecamp's module inspector —
+// is showing a human what the module offers. Answering in Qt names made a
+// Qt-free cdylib module describe itself in the types of a language it does not
+// use, and answered three different LIDL types (`[uint]`, `[bstr]`, `[any]`)
+// with one word, QVariantList, so the listing could not be read back.
 //
-// A record IS a variant map at that boundary; the struct only exists inside the
-// cdylib.
-QString lidlTypeToQtWire(const TypeExpr& te, const std::set<std::string>& recs)
+// NOT lidlTypeToQt, and no longer a near-copy of it. That function answers the
+// CONSUMER's question — "what C++ type does the caller hold?" — and its answers
+// are now typed C++ spellings (QList<qulonglong>, std::optional<QString>) that
+// are meaningless outside a generated wrapper.
+//
+// WHY THIS IS SAFE, checked rather than assumed. The historical objection was
+// that these strings are read as METATYPES: emitting a record's struct name
+// here once made the host SIGSEGV. Nothing in the current runtime does that.
+// The dispatch paths key on QMetaObject types instead — logos-plugin-qt's
+// QtProviderObject reads `method.returnMetaType()` / `parameterMetaType(i)` and
+// never touches this JSON — and every reader of these fields that remains
+// (logos-module's `lm`, logoscore's `output.cpp`, basecamp's CoreModuleManager,
+// the plain wire's json_mapping round-trip) treats them as opaque text.
+//
+// The `recs` parameter is gone with the Qt spelling: a record publishes its
+// declared NAME, which is what the contract calls it.
+QString lidlTypeToPublishedName(const TypeExpr& te)
 {
-    if (isRecord(te, recs))
-        return "QVariantMap";
-    if (te.kind == TypeExpr::Array && te.elements.size() == 1
-        && isRecord(te.elements[0], recs))
-        return "QVariantList";
-    if (te.kind == TypeExpr::Map && te.elements.size() == 2
-        && isRecord(te.elements[1], recs))
-        return "QVariantMap";
-    return lidlTypeToQt(te);
+    return lidlTypeToLidlText(te);
 }
 
 // True when any event parameter is spelled LogosMap / LogosList, so the sidecar
@@ -468,7 +494,6 @@ bool hasJsonEventParam(const ModuleDecl& module)
 
 void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
 {
-    const std::set<std::string> recs = recordNames(module);
     s << "static nlohmann::json lidlInterfaceJson()\n{\n";
     s << "    nlohmann::json methods = nlohmann::json::array();\n";
     for (const MethodDecl& md : module.methods) {
@@ -481,17 +506,19 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         }
         QString sig = qs(md.name) + "(";
         for (int i = 0; i < md.params.size(); ++i) {
-            sig += lidlTypeToQtWire(md.params[i].type, recs);
+            sig += lidlTypeToPublishedName(md.params[i].type);
             if (i + 1 < md.params.size()) sig += ",";
         }
         sig += ")";
         s << "        obj[\"signature\"] = \"" << sig << "\";\n";
-        s << "        obj[\"returnType\"] = \"" << lidlTypeToQtWire(md.returnType, recs) << "\";\n";
+        s << "        obj[\"returnType\"] = \""
+          << (md.returnType ? lidlTypeToPublishedName(*md.returnType) : QStringLiteral("void"))
+          << "\";\n";
         s << "        obj[\"isInvokable\"] = true;\n";
         if (!md.params.empty()) {
             s << "        nlohmann::json params = nlohmann::json::array();\n";
             for (const ParamDecl& pd : md.params) {
-                s << "        params.push_back({{\"type\", \"" << lidlTypeToQtWire(pd.type, recs)
+                s << "        params.push_back({{\"type\", \"" << lidlTypeToPublishedName(pd.type)
                   << "\"}, {\"name\", \"" << pd.name << "\"}});\n";
             }
             s << "        obj[\"parameters\"] = params;\n";
@@ -509,7 +536,7 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         }
         QString sig = qs(ed.name) + "(";
         for (int i = 0; i < ed.params.size(); ++i) {
-            sig += lidlTypeToQtWire(ed.params[i].type, recs);
+            sig += lidlTypeToPublishedName(ed.params[i].type);
             if (i + 1 < ed.params.size()) sig += ",";
         }
         sig += ")";
@@ -517,7 +544,7 @@ void emitInterfaceJson(QTextStream& s, const ModuleDecl& module)
         if (!ed.params.empty()) {
             s << "        nlohmann::json params = nlohmann::json::array();\n";
             for (const ParamDecl& pd : ed.params) {
-                s << "        params.push_back({{\"type\", \"" << lidlTypeToQtWire(pd.type, recs)
+                s << "        params.push_back({{\"type\", \"" << lidlTypeToPublishedName(pd.type)
                   << "\"}, {\"name\", \"" << pd.name << "\"}});\n";
             }
             s << "        obj[\"parameters\"] = params;\n";
@@ -542,14 +569,8 @@ bool lidlCdylibSupported(const ModuleDecl& module, QString* error)
                 return false;
             }
         }
-        // `void` is not a lidlBuiltinType, so the .lidl parser yields it as a
-        // Named type "void" (the impl-header parser writes "-> void"); an empty
-        // name is the in-memory void from the header path. Treat both as void.
-        const bool voidReturn =
-            md.returnType.name == "void"
-            || (md.returnType.kind == TypeExpr::Primitive && md.returnType.name.empty());
-        if (!voidReturn && !md.jsonReturn && !md.resultReturn
-            && !typeSupported(md.returnType, /*isReturn=*/true, recs)) {
+        if (md.returnType && !md.jsonReturn && !md.resultReturn
+            && !typeSupported(*md.returnType, /*isReturn=*/true, recs)) {
             if (error)
                 *error = QString("method '%1': return type outside the cdylib-supported "
                                  "(Qt-free) subset").arg(qs(md.name));
@@ -614,7 +635,8 @@ QString lidlMakeTypesHeaderCdylib(const ModuleDecl& module)
 
 QString lidlMakeModuleImplExports(const ModuleDecl& module,
                                   const QString& implClass,
-                                  const QString& implHeader)
+                                  const QString& implHeader,
+                                  const QString& lidlDocument)
 {
     const std::set<std::string> recs = recordNames(module);
     QString c;
@@ -632,6 +654,10 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "#include \"logos_protocol.h\"\n";
     s << "#include \"logos_module_context.h\"\n";
     s << "#include \"logos_result.h\"\n";
+    // The caller-of-a-dispatch reader. Unconditional: it is a logos-cpp-sdk
+    // header with no protocol dependency of its own, so it costs nothing on an
+    // older protocol where the export below is not emitted.
+    s << "#include \"logos_caller.h\"\n";
     s << "#include <nlohmann/json.hpp>\n";
     s << "#include <cstdlib>\n";
     s << "#include <cstring>\n";
@@ -656,6 +682,21 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "logos_module_emit_cb g_emitCb = nullptr;\n";
     s << "void* g_emitUd = nullptr;\n";
     s << "std::mutex g_emitMutex;\n";
+    // Guarded on the protocol MINOR that introduced the teardown surface (0.5),
+    // exactly like the trust-root surface below. The emitted module must still
+    // COMPILE against an older logos-protocol, which has neither the callback
+    // typedef nor the two logos_module_impl.h declarations -- a module built
+    // against 0.4 simply has no teardown entry point, which is the same state
+    // as a module that never overrode the hook. Without this an older protocol
+    // is a hard compile error in generated code the author never sees.
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+         "LOGOS_PROTOCOL_VERSION_MINOR >= 5))\n";
+    s << "logos_module_unload_done_cb g_unloadCb = nullptr;\n";
+    s << "void* g_unloadUd = nullptr;\n";
+    s << "std::mutex g_unloadMutex;\n";
+    s << "#endif\n";
     s << "std::mutex g_ctxMutex;\n";
     s << "bool g_ctxStored = false;\n";
     s << "std::string g_ctxPath, g_ctxId, g_ctxPersist;\n";
@@ -794,6 +835,52 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
             s << "                return lidlStrdup(err.dump());\n";
             s << "            }\n";
         }
+        // ...and so is a wrong count in the OTHER direction, which nothing
+        // checked until now: an EXTRA argument was silently dropped and the
+        // call succeeded. `args.size() < minArgs` bounds one side only.
+        //
+        // Arity is the one part of a contract a caller cannot verify for
+        // itself. A method that gains or loses a parameter upstream answered a
+        // stale caller with a plausible value instead of a refusal, and the
+        // caller had no way to tell which contract it had just talked to.
+        //
+        // Emitted UNCONDITIONALLY, including for a zero-parameter method
+        // (`args.size() > 0`). That case is not the lower bound with maxArgs=0
+        // — it is the arm that had no gate at all, and it is the arm the
+        // derived identity methods take: `version("junk")` answered "1.0.0"
+        // with status ok, a correct-looking answer to a call that should have
+        // been refused. This sits ABOVE the `md.derived` branch below so the
+        // generated identity dispatch inherits it rather than needing its own.
+        const size_t maxArgs = md.params.size();
+        s << "            if (args.size() > " << maxArgs << ") {\n";
+        s << "                nlohmann::json err{{\"code\", \"invalid_args\"},\n";
+        s << "                                   {\"message\", \"expected "
+          << (minArgs == maxArgs ? "" : "at most ") << maxArgs
+          << " arguments, got \" + std::to_string(args.size())},\n";
+        s << "                                   {\"origin\", \"" << module.name << "\"}};\n";
+        s << "                return lidlStrdup(err.dump());\n";
+        s << "            }\n";
+        // A derived method (lidl/identity.hpp) has no member on the impl class
+        // to call — the generator owns its body. name()/version()/lidl() answer from
+        // the module declaration; lidl() answers the canonical LIDL document
+        // consumed by this provider. None can drift from the built artifact.
+        if (md.derived && lidl::isIdentityMethod(md.name)) {
+            if (md.name == lidl::kLidl) {
+                const QString document = lidlDocument.isEmpty()
+                    ? lidlSerialize(module) : lidlDocument;
+                s << "            auto result = std::string("
+                  << cppStringLiteral(document) << ");\n";
+            } else {
+                const QString literal = md.name == lidl::kIdentityName
+                    ? qs(module.name)
+                    : (module.version.empty() ? QStringLiteral("1.0.0") : qs(module.version));
+                s << "            auto result = std::string(\"" << literal << "\");\n";
+            }
+            s << "            return lidlStrdup(" << stdReturnToJson(md, "result", recs)
+              << ".dump());\n";
+            s << "        }\n";
+            continue;
+        }
         QString call = "lidlImpl()." + qs(md.name) + "(";
         for (size_t i = 0; i < md.params.size(); ++i) {
             const QString expr = (i < minArgs)
@@ -804,13 +891,7 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
             if (i + 1 < md.params.size()) call += ", ";
         }
         call += ")";
-        // `void` parses as a Named type "void" from a .lidl (it isn't a
-        // lidlBuiltinType); empty name is the header path's in-memory void.
-        const bool voidReturn =
-            md.returnType.name == "void"
-            || (md.returnType.kind == TypeExpr::Primitive && md.returnType.name.empty())
-            || lidlTypeToQt(md.returnType) == "void";
-        if (voidReturn) {
+        if (!md.returnType) {
             s << "            " << call << ";\n";
             s << "            return lidlStrdup(\"true\");\n";
         } else {
@@ -855,13 +936,57 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
 
     s << "int logos_module_accept_token(const char* module_name, const char* token)\n{\n";
     s << "    if (!module_name || !token) return -1;\n";
-    s << "    // Seed the protocol's shared TokenManager so this module's OUTBOUND\n";
-    s << "    // lp_client (modules().<dep>...) can authenticate calls. In\n";
-    s << "    // particular the capability_module bootstrap token the host\n";
-    s << "    // delivers at load lets the automatic requestModule flow fetch a\n";
-    s << "    // per-target token on the first cross-module call. lp_token_save\n";
+    s << "    // THE OUTBOUND DOOR. Seed the protocol's shared TokenManager so this\n";
+    s << "    // module's OUTBOUND lp_client (modules().<dep>...) can authenticate\n";
+    s << "    // calls. In particular the capability_module bootstrap token the\n";
+    s << "    // host delivers at load lets the automatic requestModule flow fetch\n";
+    s << "    // a per-target token on the first cross-module call. lp_token_save\n";
     s << "    // writes the same TokenManager::instance() the lp_client reads.\n";
+    s << "    //\n";
+    s << "    // ONE MEANING ONLY, as of protocol 0.8. The Qt glue used to call\n";
+    s << "    // this from onInit (the module's own anchor -- outbound, correct)\n";
+    s << "    // AND from informModuleToken (a CALLER's token -- inbound, filed\n";
+    s << "    // here as an outbound credential). The caller path now goes through\n";
+    s << "    // logos_module_accept_inbound_token below. Do not merge them.\n";
     s << "    return lp_token_save(module_name, token);\n}\n\n";
+
+    // THE INBOUND DOOR (protocol 0.8). logos-protocol only DECLARES it; this
+    // backend owes the definition, and so does logos-rust-sdk, IN THE SAME
+    // WAVE. A module generated for >= 0.8 whose backend omits this links
+    // cleanly and then fails at dlopen() on ELF with "undefined symbol" --
+    // invisible on macOS, which links plugins -undefined dynamic_lookup. That
+    // has now shipped three times (grant_host_services at 0.3, the teardown
+    // pair at 0.5, set_call_caller at 0.6), every time at perfect version
+    // agreement, because agreeing on the VERSION says nothing about which
+    // SYMBOLS a backend's emitter writes. checks.module-impl-abi is what makes
+    // it fail here instead of at a user's dlopen.
+    //
+    // Guarded MAJOR-aware, not on the MINOR alone, for the reason spelled out
+    // at set_call_caller below: at 1.0 the MINOR resets to 0, a `MINOR >= 8`
+    // guard goes false, and the definition disappears together with the glue's
+    // call -- so nothing fails to build, nothing fails to load, and every
+    // module silently goes back to filing its callers as outbound credentials.
+    // Written expanded because unifdef must be able to evaluate it.
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+         "LOGOS_PROTOCOL_VERSION_MINOR >= 8))\n";
+    s << "int logos_module_accept_inbound_token(const char* caller, const char* token)\n{\n";
+    s << "    if (!caller || !token) return -1;\n";
+    s << "    // THE INBOUND DOOR: `caller` is the module that will CALL US and\n";
+    s << "    // `token` is what it will present. This is NOT a credential this\n";
+    s << "    // module may present to anyone, and lp_token_save_inbound writes a\n";
+    s << "    // key namespace lp_token_get and lp_token_keys cannot read -- which\n";
+    s << "    // is what stops a grant one way from being a grant the other way.\n";
+    s << "    //\n";
+    s << "    // One line, deliberately: the token-registry carve-out (a granted\n";
+    s << "    // registry ALSO gets the outbound entry, because for it the same\n";
+    s << "    // wire message means \"here is X's token, present it when you call\n";
+    s << "    // X\") lives in logos-protocol, where a unit test reaches it by\n";
+    s << "    // value. Logic that lives in emitted text is logic no test ever\n";
+    s << "    // executes, only greps.\n";
+    s << "    return lp_token_save_inbound(caller, token);\n}\n";
+    s << "#endif\n\n";
 
     // Guarded on the protocol MINOR that introduced the trust-root surface
     // (0.3). The emitted module must still COMPILE against an older
@@ -870,7 +995,10 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     // no grant entry point, which is the same fail-closed state as never being
     // granted. Without this an older protocol is a hard compile error in
     // generated code the author never sees.
-    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && LOGOS_PROTOCOL_VERSION_MINOR >= 3\n";
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+         "LOGOS_PROTOCOL_VERSION_MINOR >= 3))\n";
     s << "int logos_module_grant_host_services(const char* services_json)\n{\n";
     s << "    // Route the host's grant into THIS image's gate state.\n";
     s << "    //\n";
@@ -898,6 +1026,75 @@ QString lidlMakeModuleImplExports(const ModuleDecl& module,
     s << "    // it by accident. Isolation between modules rests on process\n";
     s << "    // separation, the auth token and the target's allowedCallers.\n";
     s << "    return lp_grant_host_services(services_json);\n}\n";
+    s << "#endif\n\n";
+
+    // Teardown. The callback is stored under its own mutex rather than reusing
+    // the emit one: it is installed on the host's thread and fired from
+    // whichever thread the module finishes its work on, and those are the same
+    // two threads the emit path already keeps apart.
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+         "LOGOS_PROTOCOL_VERSION_MINOR >= 5))\n";
+    s << "void logos_module_set_unload_done_callback(logos_module_unload_done_cb cb,\n";
+    s << "                                          void* user_data)\n{\n";
+    s << "    std::lock_guard<std::mutex> lock(g_unloadMutex);\n";
+    s << "    g_unloadCb = cb;\n";
+    s << "    g_unloadUd = user_data;\n";
+    s << "}\n\n";
+
+    s << "int logos_module_about_to_unload(void)\n{\n";
+    // Hand the impl a way to say "done" BEFORE asking it to unload: an impl
+    // that finishes inline would otherwise signal into an empty slot and the
+    // host would wait out the whole grace period for a module already done.
+    s << "    _logos_codegen_::maybeSetUnloadFinished(lidlImpl(), [] {\n";
+    s << "        logos_module_unload_done_cb cb = nullptr;\n";
+    s << "        void* ud = nullptr;\n";
+    s << "        {\n";
+    s << "            std::lock_guard<std::mutex> lock(g_unloadMutex);\n";
+    s << "            cb = g_unloadCb;\n";
+    s << "            ud = g_unloadUd;\n";
+    s << "        }\n";
+    s << "        if (cb) cb(ud);\n";
+    s << "    });\n";
+    s << "    return _logos_codegen_::maybeAboutToUnload(lidlImpl())\n";
+    s << "               == LogosShutdown::Asynchronous ? 1 : 0;\n";
+    s << "}\n";
+    s << "#endif\n\n";
+
+    // THE CALLER OF A DISPATCH (protocol 0.6). The glue wraps one
+    // logos_module_dispatch in one push/pop pair on the dispatching thread; a
+    // non-NULL argument pushes, NULL pops the innermost.
+    //
+    // WHY THIS CROSSES THE C ABI AT ALL, since a thread_local the host set
+    // would be so much simpler. It would not be the same object. Measured with
+    // nm on built binaries rather than assumed, on both object formats: the
+    // host image and the module plugin EACH define
+    // ModuleProxy::callRemoteMethod and TokenManager::instance; the
+    // function-local static behind the latter is a LOCAL bss symbol in each,
+    // at a different address; and neither image holds an undefined reference
+    // to the other's copy. The Mach-O plugin is MH_NOUNDEFS | MH_TWOLEVEL. So
+    // the identity has to be handed over explicitly, exactly as the trust-root
+    // grant above is. cpp/logos_caller.h carries the full measurement.
+    //
+    // Guarded MAJOR-aware, not on the MINOR alone. At 1.0 the MINOR resets to
+    // 0 and a `MINOR >= 6` guard would go false, taking the definition and the
+    // generated call away TOGETHER — everything would still build and load,
+    // and modules would just silently stop being able to name their caller.
+    // checks.module-impl-abi resolves this text at one MAJOR up for that
+    // reason. Written expanded rather than behind a function-like macro
+    // because unifdef has to be able to evaluate it.
+    s << "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+         "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+         "LOGOS_PROTOCOL_VERSION_MINOR >= 6))\n";
+    s << "void logos_module_set_call_caller(const char* caller_json)\n{\n";
+    // One line, deliberately. Parsing the document, the per-thread stack and
+    // the nesting rule all live in cpp/logos_caller.h where a unit test can
+    // reach them BY VALUE; logic that lives in emitted text is logic no test
+    // ever executes, only greps.
+    s << "    logos::detail::setCallCaller(caller_json);\n";
+    s << "}\n";
     s << "#endif\n\n";
 
     s << "const char* logos_module_get_protocol_version(void)\n{\n";

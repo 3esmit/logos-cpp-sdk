@@ -83,9 +83,41 @@ TEST(SyncTimeout, LpBodyForwardsTimeoutMs)
 {
     const QString src = lpSource();
     EXPECT_TRUE(src.contains("Mod::add(int64_t p0, int64_t p1, logos::CallError* err, int timeout_ms)"));
-    EXPECT_TRUE(src.contains("m_client.invoke(\"add\", _args, err, timeout_ms);"));
-    EXPECT_TRUE(src.contains("m_client.invoke(\"reset\", _args, err, timeout_ms);"));
-    EXPECT_FALSE(src.contains("_args, err);"));
+    // Into a LOCAL `_err`, then copied out: `err` is optional on this surface,
+    // and the dispatch-rejection fold needs somewhere to write either way.
+    EXPECT_TRUE(src.contains("m_client.invoke(\"add\", _args, &_err, timeout_ms);"));
+    EXPECT_TRUE(src.contains("m_client.invoke(\"reset\", _args, &_err, timeout_ms);"));
+    EXPECT_TRUE(src.contains("if (err) *err = _err;"));
+    // The deadline is still forwarded, never dropped for a fresh default.
+    EXPECT_FALSE(src.contains("_args, &_err);"));
+}
+
+TEST(SyncTimeout, LpSyncFoldsAProviderRejectionIntoTheErrorChannel)
+{
+    // A provider that RAN and refused answers {"code":"dispatch_failed", …} as
+    // its RESULT, so LpClient::invoke reports ok() and the decode erases it.
+    // The Qt sync path has folded this for a while; this surface now does too.
+    const QString src = lpSource();
+    const QString fold = "if (_err.ok()) logosDispatchRejectionJson(_r, _err);";
+    ASSERT_TRUE(src.contains(fold));
+    // Folded BEFORE the value is decoded and before `err` is written out, so a
+    // caller never reads an ok() error next to a default-decoded rejection.
+    const int f = src.indexOf(fold);
+    const int copy = src.indexOf("if (err) *err = _err;");
+    const int ret = src.indexOf("    return (_r.is_number_integer()");
+    ASSERT_NE(copy, -1);
+    ASSERT_NE(ret, -1);
+    EXPECT_LT(f, copy);
+    EXPECT_LT(copy, ret);
+}
+
+TEST(SyncTimeout, LpVoidSyncStillCapturesTheResultSoItCanSeeARejection)
+{
+    // A void method can be rejected too, and the rejection object is the only
+    // place that says so — so the result is captured even where nothing is
+    // returned. `_r` is not unused: the fold reads it.
+    const QString src = lpSource();
+    EXPECT_TRUE(src.contains("nlohmann::json _r = m_client.invoke(\"reset\", _args, &_err, timeout_ms);"));
 }
 
 // ─── 2. Async gains a result-carrying entry point ───────────────────────────
@@ -152,16 +184,149 @@ TEST(AsyncResult, ThePlainAsyncEntryPointIsUnchanged)
     EXPECT_TRUE(src.contains("[callback](QVariant v) {"));
 }
 
-// ─── 4. The Qt-free surface deliberately has no AsyncResult yet ─────────────
+// ─── 4. The Qt-free surface emits its own AsyncResult twin ──────────────────
+//
+// It was withheld for a long time, and for a reason that belonged to the
+// transport rather than to this emitter: lp_invoke_async used to subscribe with
+// the VALUE-ONLY overload and hard-code `cb(1, ...)`, so an AsyncResult built on
+// it would have reported ok() for a call to a module that is not loaded.
+// logos-protocol#40 fixed that (`cb(0, makeErrorJson(...))`) and
+// logos::LpClient::invokeAsyncResult surfaces it in C++, so the twin is honest
+// and is emitted.
 
-TEST(AsyncResult, LpSurfaceDoesNotEmitAsyncResultWhileTheCAbiCannotReportOne)
+TEST(AsyncResult, LpHeaderDeclaresTheDistinctlyNamedEntryPoint)
 {
-    // logos-protocol's lp_invoke_async hard-codes `cb(1, ...)`, so an
-    // AsyncResult here would report ok() on a failed call. See makeHeaderLp.
-    EXPECT_FALSE(lpHeader().contains("AsyncResult"));
-    EXPECT_FALSE(lpSource().contains("AsyncResult"));
-    // ...and the Lp async entry point keeps its exact shape.
-    EXPECT_TRUE(lpHeader().contains("void addAsync(int64_t p0, int64_t p1, std::function<void(int64_t)> callback);"));
+    const QString h = lpHeader();
+    EXPECT_TRUE(h.contains("void addAsyncResult(int64_t p0, int64_t p1, "
+                           "std::function<void(logos::AsyncResult<int64_t>)> callback, "
+                           "int timeout_ms = 0);"));
+    EXPECT_TRUE(h.contains("void nameAsyncResult(std::function<void(logos::AsyncResult<std::string>)> callback, "
+                           "int timeout_ms = 0);"));
+    // Same uniform shape the Qt surface uses for void: the error-only
+    // specialisation, never a bespoke callback.
+    EXPECT_TRUE(h.contains("void resetAsyncResult(std::function<void(logos::AsyncResult<void>)> callback, "
+                           "int timeout_ms = 0);"));
+    // `Timeout` lives in logos_mode.h, which includes <QDebug>. Naming it here
+    // would drag Qt into a translation unit whose whole purpose is not to have
+    // any, so this surface spells deadlines the way the C ABI does.
+    EXPECT_FALSE(h.contains("Timeout timeout"));
+}
+
+TEST(AsyncResult, LpHeaderIncludesTheAsyncResultHeader)
+{
+    EXPECT_TRUE(lpHeader().contains("#include \"logos_async_result.h\""));
+}
+
+TEST(AsyncResult, LpBodyRoutesToTheErrorCarryingClientEntryPoint)
+{
+    const QString src = lpSource();
+    // invokeAsyncResult, NOT invokeAsync: the latter collapses the C ABI's
+    // failure form into a bare JSON null, which is also what a successful call
+    // returning nothing delivers — indistinguishable, which is the whole defect.
+    EXPECT_TRUE(src.contains("m_client.invokeAsyncResult(\"add\", _args,"));
+    EXPECT_TRUE(src.contains("[callback](nlohmann::json _r, const logos::CallError& _err) {"));
+    EXPECT_TRUE(src.contains("logos::AsyncResult<int64_t> _res;"));
+    EXPECT_TRUE(src.contains("_res.error = _err;"));
+    EXPECT_TRUE(src.contains("callback(_res);"));
+    // The void form carries the error and nothing else.
+    EXPECT_TRUE(src.contains("logos::AsyncResult<void> _res;"));
+}
+
+TEST(AsyncResult, LpValueDecodeIsSharedWithThePlainAsyncEntryPoint)
+{
+    // Same decode expression in both, so a failed call delivers exactly the
+    // value `<name>Async` would have delivered — plus the error.
+    const QString src = lpSource();
+    const QString decode = "(_r.is_string() ? _r.get<std::string>() : std::string())";
+    EXPECT_TRUE(src.contains("callback(" + decode + ");"));
+    EXPECT_TRUE(src.contains("_res.value = " + decode + ";"));
+}
+
+TEST(AsyncResult, LpRejectionIsFoldedBeforeTheValueIsDecoded)
+{
+    // Same rule as the sync path: fold before decoding, or this surface reports
+    // success for a refused call — on the one async surface that has somewhere
+    // to say otherwise.
+    const QString src = lpSource();
+    const QString fold = "if (_res.error.ok()) logosDispatchRejectionJson(_r, _res.error);";
+    ASSERT_TRUE(src.contains(fold));
+    const int f = src.indexOf(fold);
+    const int decode = src.indexOf("_res.value = ");
+    const int deliver = src.indexOf("callback(_res);");
+    ASSERT_NE(decode, -1);
+    ASSERT_NE(deliver, -1);
+    EXPECT_LT(f, decode);
+    EXPECT_LT(decode, deliver);
+}
+
+TEST(AsyncResult, LpDispatchRejectionDetectorIsEmittedOnceAndGuarded)
+{
+    // The umbrella (logos_sdk.cpp) textually #includes EVERY generated
+    // <dep>_api.cpp, so a module with more than one dependency puts several of
+    // these in ONE translation unit. Internal linkage handles the separate-TU
+    // case; only the preprocessor handles this one.
+    const QString src = lpSource();
+    EXPECT_EQ(src.count("bool logosDispatchRejectionJson"), 1);
+    EXPECT_TRUE(src.contains("#ifndef LOGOS_GENERATED_DISPATCH_REJECTION_JSON"));
+    EXPECT_TRUE(src.contains("#define LOGOS_GENERATED_DISPATCH_REJECTION_JSON"));
+}
+
+// The two emitters in this repo (this nlohmann one and the QVariant one in
+// test_make_source.cpp) are driven by ONE kRejectionCodes array in
+// generator_lib.cpp, so they cannot drift. These assert the array reached the
+// emitted text on this side too.
+TEST(AsyncResult, LpDispatchRejectionDetectorMatchesTheClosedCodeSet)
+{
+    const QString src = lpSource();
+    EXPECT_TRUE(src.contains(
+        "    if (_code != \"dispatch_failed\"\n"
+        "        && _code != \"invalid_args\"\n"
+        "        && _code != \"unknown_method\") return false;\n"))
+        << src.toStdString();
+    // "invalid_args" is the code that was LIVE and undetected: the cdylib
+    // dispatch (experimental/lidl_gen_cdylib.cpp) and logos-rust-sdk's
+    // args::invalid_args both answer an arity error with it, and a consumer
+    // decoded it as a three-key map. "unknown_method" is inert until providers
+    // emit it; it is here so the detector is ready before they do.
+}
+
+TEST(AsyncResult, LpDispatchRejectionDetectorMatchesNoOtherCode)
+{
+    // The negatives, at the only level this text-emitting generator can pin
+    // them: the guards that make an unrecognised code, a 2- or 4-key object and
+    // a non-string value all stay DATA must still be there. Widening the code
+    // literal into a set must not have loosened the SHAPE.
+    const QString src = lpSource();
+    const int begin = src.indexOf("bool logosDispatchRejectionJson(");
+    ASSERT_NE(begin, -1);
+    const QString body = src.mid(begin, src.indexOf("} // namespace", begin) - begin);
+    EXPECT_TRUE(body.contains("if (!v.is_object() || v.size() != 3) return false;"));
+    EXPECT_TRUE(body.contains(
+        "if (code == v.end() || message == v.end() || origin == v.end()) return false;"));
+    EXPECT_TRUE(body.contains(
+        "if (!code->is_string() || !message->is_string() || !origin->is_string()) return false;"));
+    // Exactly three comparisons, one per code — not a prefix test, not a
+    // "has a code key" shortcut.
+    EXPECT_EQ(body.count("_code != \""), 3) << body.toStdString();
+    EXPECT_LT(body.indexOf("_code != \"unknown_method\""), body.indexOf("return true;"));
+}
+
+TEST(AsyncResult, LpContractWithNoInvokableMethodEmitsNoDetector)
+{
+    // The detector is only reachable from a method body; emitting it anyway is
+    // an unused function in an anonymous namespace, i.e. -Wunused-function.
+    const QString src = makeSource("mod", "Mod", "mod.h", QJsonArray{}, ApiStyle::Lp);
+    EXPECT_FALSE(src.contains("logosDispatchRejectionJson"));
+}
+
+TEST(AsyncResult, LpPlainAsyncEntryPointIsUnchanged)
+{
+    // No timeout was retro-fitted onto it — it has existing callers, and the
+    // twin is where the new capability goes.
+    const QString h = lpHeader();
+    EXPECT_TRUE(h.contains("void addAsync(int64_t p0, int64_t p1, std::function<void(int64_t)> callback);"));
+    EXPECT_TRUE(h.contains("void resetAsync(std::function<void()> callback);"));
+    EXPECT_TRUE(lpSource().contains("m_client.invokeAsync(\"add\", _args, [callback](nlohmann::json _r) {"));
 }
 
 // ─── 5. A REJECTION reaches the surface that can report it ──────────────────

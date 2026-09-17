@@ -13,7 +13,84 @@ QString lidlToPascalCase(const QString& name)
     return out;
 }
 
+// A type "bottoms out at `any`" when its scalar LEAF is `any` — or an
+// unrecognised primitive, which this table has always spelled QVariant too.
+// Optionality and container nesting are transparent to the question:
+// `[[any]]`, `{tstr: [any]}` and `?any` all bottom out at `any`.
+bool lidlQtBottomsOutAtAny(const TypeExpr& te)
+{
+    switch (te.kind) {
+    case TypeExpr::Primitive:
+        return !(te.name == "void" || te.name == "tstr" || te.name == "bstr"
+              || te.name == "int"  || te.name == "uint" || te.name == "float64"
+              || te.name == "bool" || te.name == "result");
+    case TypeExpr::Named:
+        // A record declared by the contract: a real struct, never a blob.
+        return false;
+    case TypeExpr::Array:
+        // A degenerate Array carrying no element (unreachable from the parser,
+        // constructible by hand or over the JSON bridge) keeps the opaque
+        // spelling rather than being described as typed.
+        return te.elements.size() != 1 || lidlQtBottomsOutAtAny(te.elements[0]);
+    case TypeExpr::Map:
+        return te.elements.size() != 2 || lidlQtBottomsOutAtAny(te.elements[1]);
+    case TypeExpr::Optional:
+        // Through optionalValueType(), so `??T` answers for T — optionality is
+        // idempotent under the two-state rule.
+        return te.elements.empty() || lidlQtBottomsOutAtAny(optionalValueType(te));
+    }
+    return true;
+}
+
+bool lidlQtNeedsElementLoop(const TypeExpr& te)
+{
+    if (lidlQtBottomsOutAtAny(te)) return false;   // QVariant / List / Map
+    switch (te.kind) {
+    case TypeExpr::Array:
+        // `[tstr]` is QStringList, which crosses whole (QMetaType::QStringList
+        // is in qvariantToNlohmann's closed set). Every other typed array is
+        // QList<T>, which is not.
+        return !(te.elements[0].kind == TypeExpr::Primitive
+                 && te.elements[0].name == "tstr");
+    case TypeExpr::Map:
+    case TypeExpr::Optional:
+        return true;
+    case TypeExpr::Primitive:
+    case TypeExpr::Named:
+        return false;
+    }
+    return false;
+}
+
+// The LIDL contract spelling. Mirrors logos-lidl's serializeTypeExpr; see the
+// header for why it is a copy and what pins it.
+QString lidlTypeToLidlText(const TypeExpr& te)
+{
+    switch (te.kind) {
+    case TypeExpr::Primitive:
+    case TypeExpr::Named:
+        return QString::fromStdString(te.name);
+    case TypeExpr::Array:
+        if (te.elements.size() != 1) return QStringLiteral("any");
+        return "[" + lidlTypeToLidlText(te.elements[0]) + "]";
+    case TypeExpr::Map:
+        if (te.elements.size() != 2) return QStringLiteral("any");
+        return "{" + lidlTypeToLidlText(te.elements[0]) + ": "
+             + lidlTypeToLidlText(te.elements[1]) + "}";
+    case TypeExpr::Optional:
+        if (te.elements.empty()) return QStringLiteral("any");
+        return "? " + lidlTypeToLidlText(te.elements[0]);
+    }
+    return QStringLiteral("any");
+}
+
 QString lidlTypeToQt(const TypeExpr& te)
+{
+    return lidlTypeToQt(te, [](const QString& n) { return n; });
+}
+
+QString lidlTypeToQt(const TypeExpr& te,
+                     const std::function<QString(const QString&)>& recordName)
 {
     switch (te.kind) {
     case TypeExpr::Primitive:
@@ -31,46 +108,61 @@ QString lidlTypeToQt(const TypeExpr& te)
         if (te.name == "float64") return "double";
         if (te.name == "bool")    return "bool";
         if (te.name == "result")  return "LogosResult";
+        // `any` — KEPT untyped, and it is the only row here that is. QVariant is
+        // the sole Qt type that carries bytes AND an exact uint64 AND arbitrary
+        // nesting, so narrowing it would lose what it was chosen to hold.
         if (te.name == "any")     return "QVariant";
         return "QVariant";
     case TypeExpr::Named:
         // A record declared by the contract: its generated struct. One LIDL
         // type, one type per language — a record is not a QVariant blob.
-        return QString::fromStdString(te.name);
+        return recordName(QString::fromStdString(te.name));
     case TypeExpr::Array:
-        if (te.elements.size() == 1
-            && te.elements[0].kind == TypeExpr::Primitive
+        // `[any]` (and anything else whose leaf is `any`) keeps QVariantList:
+        // there is no narrower Qt list that can hold those elements.
+        if (lidlQtBottomsOutAtAny(te)) return "QVariantList";
+        // `[tstr]` is QStringList — the one typed array Qt has a native
+        // spelling for, and the one this table already produced.
+        if (te.elements[0].kind == TypeExpr::Primitive
             && te.elements[0].name == "tstr") {
             return "QStringList";
         }
-        // A list of records is a typed list: QVariantList could not hold a
-        // record without Q_DECLARE_METATYPE, and the point of a record is that
-        // the consumer gets the struct.
-        if (te.elements.size() == 1 && te.elements[0].kind == TypeExpr::Named)
-            return "QList<" + QString::fromStdString(te.elements[0].name) + ">";
-        return "QVariantList";
+        // Every other `[T]` — including a list of records, which could not ride
+        // a QVariantList without Q_DECLARE_METATYPE — is the typed list. The
+        // element spelling is this same table applied recursively, so
+        // `[[uint]]` is QList<QList<qulonglong>> and `[?tstr]` is
+        // QList<std::optional<QString>>.
+        return "QList<" + lidlTypeToQt(te.elements[0], recordName) + ">";
     case TypeExpr::Map:
-        if (te.elements.size() == 2 && te.elements[1].kind == TypeExpr::Named)
-            return "QMap<QString, " + QString::fromStdString(te.elements[1].name) + ">";
-        return "QVariantMap";
+        if (lidlQtBottomsOutAtAny(te)) return "QVariantMap";
+        // The key is spelled QString unconditionally, as it always has been: a
+        // JSON object key IS a string, so a contract that writes a non-tstr key
+        // does not change what crosses the wire.
+        return "QMap<QString, " + lidlTypeToQt(te.elements[1], recordName) + ">";
     case TypeExpr::Optional:
-        // `?T` on the QT surface, deliberately, and this is the one mapping in
-        // this table that LOSES the value type.
+        // `?T` -> std::optional<T>. This row used to be a bare QVariant and was
+        // the ONE mapping in this table that lost the value type: a Qt consumer
+        // could not tell `?tstr` from `?uint`, while the std surface next door
+        // kept both through std::optional.
         //
-        // Qt has no optional template, and the type this name is read for is a
-        // metatype: the legacy consumer path and the cdylib's getMethods()
-        // introspection both hand it to the host, which marshals a QVariant
-        // across the plugin boundary. There is no metatype called
-        // `std::optional<QString>` — emitting one would fail exactly the way
-        // emitting a record's struct name here once made the host SIGSEGV.
+        // The objection that kept it QVariant was that the name is read as a
+        // METATYPE — the legacy consumer path and getMethods() introspection
+        // both handed it to the host to marshal, and there is no metatype called
+        // `std::optional<QString>`. Both halves of that are now false:
+        // getMethods() publishes the LIDL spelling (lidlTypeToQtWire), and the
+        // string-keyed legacy emitter folds every widened spelling back to the
+        // name it used before (legacyQtBase in generator_lib.cpp). What is left
+        // reading this row is the TypeExpr-driven Qt emitters, which emit
+        // element loops rather than a metatype lookup.
         //
-        // QVariant is at least the RIGHT SHAPE: an invalid QVariant is Qt's
-        // single empty inhabitant, and the wire's `null` becomes precisely
-        // that. So `?T` is two-state here — it is just untyped, in the same way
-        // `any` is, which means a Qt consumer gets no compile-time check on the
-        // value and cannot tell `?tstr` from `?uint`. That is a real gap, not a
-        // finished mapping; see cpp-generator/docs/project.md ("Optionality").
-        return "QVariant";
+        // Recursed through optionalValueType() rather than elements[0], because
+        // optionality is idempotent under the two-state rule: `??T` denotes the
+        // same two states as `?T` and must not become
+        // std::optional<std::optional<T>>. A degenerate Optional carrying no
+        // element keeps the opaque fallback instead of recursing forever
+        // (lidlQtBottomsOutAtAny answers true for it).
+        if (lidlQtBottomsOutAtAny(te)) return "QVariant";
+        return "std::optional<" + lidlTypeToQt(optionalValueType(te), recordName) + ">";
     }
     return "QVariant";
 }

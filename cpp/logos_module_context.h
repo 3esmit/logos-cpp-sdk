@@ -83,6 +83,21 @@
 // `LogosModuleContext::modules()` body below compiles.
 struct LogosModules;
 
+// How a module answers aboutToUnload().
+//
+// Synchronous  — the module is already quiescent; the host may proceed to tear
+//                it down as soon as the call returns.
+// Asynchronous — the module has work to finish first. The host waits, up to a
+//                bounded grace period, until the module calls unloadFinished().
+//
+// Modelled on Qt Creator's IPlugin::aboutToShutdown()/ShutdownFlag, which
+// solves the same problem: a plugin that cannot finish synchronously needs a
+// way to say so, and a way to say when it is done.
+enum class LogosShutdown {
+    Synchronous,
+    Asynchronous,
+};
+
 class LogosModuleContext {
 public:
     virtual ~LogosModuleContext() = default;
@@ -201,6 +216,18 @@ public:
         m_emitEventCallback = std::move(cb);
     }
 
+    // Framework-only — installs the callback `unloadFinished()` fires. Left
+    // empty outside a framework context, which is what makes unloadFinished()
+    // a no-op there rather than a crash.
+    void _logosCoreSetUnloadFinished_(std::function<void()> cb) {
+        m_unloadFinishedCallback = std::move(cb);
+    }
+
+    // Framework-only — drives the hook. Named apart from aboutToUnload() so
+    // the protected override stays the only thing an author sees, and so the
+    // host has an entry point without making the hook itself public.
+    LogosShutdown _logosCoreAboutToUnload_() { return aboutToUnload(); }
+
 protected:
     // Invoked from `<name>_events_cdylib.cpp` (codegen-emitted method
     // bodies) to dispatch a typed event. `args` is the address of a
@@ -224,6 +251,39 @@ protected:
     // hands the context over.
     virtual void onContextReady() {}
 
+    // Hook for derived impls, fired when the host is about to tear this module
+    // down — on an explicit unload and on application shutdown alike. Flush
+    // state, close handles, cancel timers here; the destructor still runs
+    // afterwards, but by then the framework context is gone.
+    //
+    // Return Synchronous (the default) when there is nothing to wait for. A
+    // module that needs to finish work returns Asynchronous and calls
+    // unloadFinished() when it is done — from any thread. The host waits, but
+    // only for a bounded grace period, after which it proceeds anyway: a hung
+    // module delays shutdown, it does not prevent it. Treat the deadline as
+    // real rather than as a courtesy.
+    //
+    // Returning Asynchronous and never calling unloadFinished() is a bug that
+    // costs every teardown of this module the full grace period. Returning
+    // Synchronous while work is still in flight is the other bug, and quieter.
+    //
+    // NOT part of the module's contract: this is framework plumbing, so the
+    // generator's reserved-name filter keeps it out of the derived .lidl and
+    // no consumer can call it.
+    virtual LogosShutdown aboutToUnload() { return LogosShutdown::Synchronous; }
+
+    // Signal that the Asynchronous teardown begun in aboutToUnload() has
+    // finished. Safe from any thread, and safe to call when the host is not
+    // listening (outside a framework context, or after the grace period
+    // elapsed) — a no-op then rather than an error, so a module needs no
+    // special case for being torn down under a deadline it missed.
+    //
+    // Calling it more than once is harmless; the host acts on the first.
+    void unloadFinished() const {
+        if (m_unloadFinishedCallback)
+            m_unloadFinishedCallback();
+    }
+
 private:
     std::string m_moduleName;
     std::string m_modulePath;
@@ -243,6 +303,9 @@ private:
     // when the impl is constructed outside a framework-provisioned
     // context, in which case `emitEventImpl_` becomes a no-op.
     std::function<void(const std::string&, void*)> m_emitEventCallback;
+    // Installed by the host before it calls _logosCoreAboutToUnload_. Empty
+    // outside a framework context; see unloadFinished().
+    std::function<void()> m_unloadFinishedCallback;
 };
 
 // ---------------------------------------------------------------------------
@@ -332,6 +395,37 @@ inline auto maybeSetEmitEvent(T&, std::function<void(const std::string&, void*)>
     -> std::enable_if_t<!std::is_base_of_v<LogosModuleContext, T>>
 {
     // Module impl didn't opt into LogosModuleContext; nothing to do.
+}
+
+// Teardown, for an impl that opted into LogosModuleContext. Same tag-dispatch
+// as the setters above: an impl that did not inherit the context reports
+// Synchronous, which is exactly right -- it has no hook, so there is nothing to
+// wait for and teardown proceeds immediately.
+template<class T>
+inline auto maybeSetUnloadFinished(T& impl, std::function<void()> cb)
+    -> std::enable_if_t<std::is_base_of_v<LogosModuleContext, T>>
+{
+    static_cast<LogosModuleContext&>(impl)._logosCoreSetUnloadFinished_(std::move(cb));
+}
+
+template<class T>
+inline auto maybeSetUnloadFinished(T&, std::function<void()>)
+    -> std::enable_if_t<!std::is_base_of_v<LogosModuleContext, T>>
+{
+}
+
+template<class T>
+inline auto maybeAboutToUnload(T& impl)
+    -> std::enable_if_t<std::is_base_of_v<LogosModuleContext, T>, LogosShutdown>
+{
+    return static_cast<LogosModuleContext&>(impl)._logosCoreAboutToUnload_();
+}
+
+template<class T>
+inline auto maybeAboutToUnload(T&)
+    -> std::enable_if_t<!std::is_base_of_v<LogosModuleContext, T>, LogosShutdown>
+{
+    return LogosShutdown::Synchronous;
 }
 
 } // namespace _logos_codegen_
