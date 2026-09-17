@@ -14,7 +14,9 @@
   # The canonical, language-neutral LIDL frontend (lexer/parser/AST/serializer/
   # validator) the code generator links. Follows our logos-nix so it resolves
   # the identical nixpkgs pin.
-  inputs.logos-lidl.url = "github:logos-co/logos-lidl";
+  # Identity methods are part of the canonical frontend consumed by the
+  # generator backends; keep this input at the revision that publishes them.
+  inputs.logos-lidl.url = "github:logos-co/logos-lidl/2043d8bf94c6bfee3781f96ad088e8c13ec36038";
   inputs.logos-lidl.inputs.logos-nix.follows = "logos-nix";
 
   outputs = { self, nixpkgs, logos-nix, logos-protocol, logos-lidl }:
