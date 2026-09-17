@@ -10,11 +10,13 @@ the headless `logoscore` runtime:
 
 1. Build the `logoscore` CLI, **overriding `logos-cpp-sdk` with the commit
    under test** — and overriding it in the same way for every consumer in
-   `logoscore`'s closure (`logos-liblogos`, `logos-module-client`, and the
-   `capability_module`'s `logos-module-builder`). Because the published flakes
-   pin the SDK independently (there is no single `follows` unifying them), all
-   of these must point at the same commit so the whole runtime is built and
-   linked against one consistent SDK ABI.
+   `logoscore`'s closure (`logos-liblogos` and the `capability_module`'s
+   `logos-module-builder`). Because the published flakes pin the SDK
+   independently (there is no single `follows` unifying them), all of these
+   must point at the same commit so the whole runtime is built and linked
+   against one consistent SDK ABI. Each `logos-qt-sdk` dragged onto the new
+   SDK also gets its sibling `logos-lidl` moved with it — see the note in
+   the first section.
 2. Build the `lgpm` local package manager.
 3. Build the real [`accounts_module`](https://github.com/logos-co/logos-accounts-module)
    as an `.lgx` package straight from its own flake — **also built against the
@@ -61,15 +63,24 @@ Build the `logoscore` CLI from its published flake, but **override
 every consumer that pins the SDK in `logoscore`'s closure. The result is
 symlinked to `./logos/`.
 
-> Unlike a leaf input, the SDK is pinned independently by `logos-liblogos`,
-> `logos-module-client`, and the `capability_module`'s `logos-module-builder`
-> — there is no single `follows` tying them together in the published
-> flakes. So we override it at each of those paths (e.g.
+> Unlike a leaf input, the SDK is pinned independently by `logos-liblogos`
+> and the `capability_module`'s `logos-module-builder` — there is no single
+> `follows` tying them together in the published flakes. So we override it
+> at each of those paths (e.g.
 > `--override-input logos-liblogos/logos-cpp-sdk …`) to keep the whole
 > runtime on one consistent SDK ABI. Each override URL carries a ``
 > placeholder the doc-test runner expands to a concrete ref: locally that is
 > this checkout's `HEAD` (see `run.sh`); in CI it is the commit being
 > tested. With no pin it falls back to latest `master`.
+
+> **Why the `logos-qt-sdk` and `logos-qt-sdk/logos-lidl` overrides.** This SDK installs
+> `share/lidl-frontend/lidl_compat.h`, and `logos-qt-sdk`'s
+> `logos-qt-generator` *compiles* that header against **its own**
+> `logos-lidl` input. `logos-lidl` is a **sibling** of `logos-cpp-sdk`
+> under `logos-qt-sdk`, not a descendant, so overriding the SDK moves the
+> header forward while a locked qt-sdk can keep both its older generator
+> and older lidl. Each `logos-qt-sdk` node therefore needs to move to the
+> compatible generator revision, with its `logos-lidl` moved alongside it.
 
 ### 1.1 Build the CLI with the SDK override
 
@@ -77,8 +88,13 @@ symlinked to `./logos/`.
 nix build 'github:logos-co/logos-logoscore-cli' \
   --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
   --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
-  --override-input logos-module-client/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   --out-link ./logos
 ```
 
@@ -141,6 +157,8 @@ build is slow.)
 #   nix build '.#lgx' --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
 nix build 'path:./logos-accounts-module#lgx' \
   --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
+  --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
   -o accounts-lgx
 ```
 

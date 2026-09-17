@@ -41,7 +41,7 @@ The lexer, parser, AST, serializer, and validator are **no longer embedded here*
 - `lidl::parse(std::string) → ParseResult` (`ModuleDecl` + error/line/column)
 - `lidl::serialize(ModuleDecl) → std::string`
 - `lidl::validate(ModuleDecl) → ValidationResult`
-- the **AST**: `TypeExpr` (`Kind`: Primitive/Array/Map/Optional/Named, `name`, `elements`), `ParamDecl`, `FieldDecl`, `MethodDecl` (name, params, returnType, `description`, `jsonReturn`, `resultReturn`), `EventDecl` (name, params, `description`), `TypeDecl`, `ModuleDecl`. (logos-lidl also exposes an AST↔JSON bridge and a C ABI that the Rust SDK consumes over FFI — not used by this generator.)
+- the **AST**: `TypeExpr` (`Kind`: Primitive/Array/Map/Optional/Named, `name`, `elements`), `ParamDecl`, `FieldDecl`, `MethodDecl` (name, params, optional returnType, `description`, `jsonReturn`, `resultReturn`), `EventDecl` (name, params, `description`), `TypeDecl`, `ModuleDecl`. An absent method returnType means no returned value. (logos-lidl also exposes an AST↔JSON bridge and a C ABI that the Rust SDK consumes over FFI — not used by this generator.)
 
 The `.lidl` grammar (defined in logos-lidl):
 
@@ -52,7 +52,7 @@ metadata   = "version" STRING | "description" STRING | "category" STRING
            | "depends" "[" (IDENT ("," IDENT)*)? "]"
 type_def   = "type" IDENT "{" field* "}"
 field      = "?"? IDENT ":" type_expr
-method_def = "method" IDENT "(" params ")" "->" type_expr ("description" STRING)?
+method_def = "method" IDENT "(" params ")" ("->" type_expr)? ("description" STRING)?
 event_def  = "event" IDENT "(" params ")" ("description" STRING)?
 params     = (IDENT ":" type_expr ("," IDENT ":" type_expr)*)?
 type_expr  = IDENT | "[" type_expr "]" | "{" type_expr ":" type_expr "}"
@@ -169,7 +169,7 @@ Read the array through `dependencyNames()` (`metadata_dependencies.h`) rather th
 
 - `enum class ApiStyle { Qt, Lp }` — passed to every wrapper-emitting function.
 - File-local `mapParamTypeStd` / `mapReturnTypeStd` — the std-side type-mapping table the `lp` surface exposes. Hidden from `generator_lib.h` (not part of the public surface).
-- `makeHeader(moduleName, className, methods, apiStyle, events)` / `makeSource(moduleName, className, headerBaseName, methods, apiStyle, events)` — single entry points that branch on `apiStyle` internally to emit the right include block, signature shape, and conversion bridges. `events` is loaded from a `<name>.lidl` sidecar via `--events-from`; when non-empty, the wrapper also gets one typed `on<EventName>(callback)` adapter per declared event (callback arg types follow `apiStyle`).
+- `makeHeader(moduleName, className, methods, apiStyle, events)` / `makeSource(moduleName, className, headerBaseName, methods, apiStyle, events)` — single entry points that branch on `apiStyle` internally to emit the right include block, signature shape, and conversion bridges. `methods`, `events` and `records` all come from the same `<name>.lidl` contract when the module ships one (loaded via `--events-from`); only a module with no contract is described by its plugin's `QMetaObject`. A non-empty `events` also gives the wrapper one typed `on<EventName>(callback)` adapter per declared event (callback arg types follow `apiStyle`).
 - `makeUmbrellaHeaderFromDeps(deps, interfaceNames, apiStyle, originName, binding)` / `makeUmbrellaSourceFromDeps(deps, interfaceNames)` — the `logos_sdk.{h,cpp}` aggregate above. `binding` is the `UmbrellaBinding` from `--binding api|origin`: `FromApi` emits the `LogosModules(LogosAPI*)` constructor, `ExplicitOrigin` emits a default-constructible umbrella that names `originName` as the call origin and mentions no `LogosAPI` at all. They return the text; `main.cpp`'s `runUmbrellaMode` writes it. That split is what lets the aggregate be asserted on directly, without a filesystem.
 
 Flag plumbing:
@@ -255,9 +255,9 @@ module build. `--general-only` is an exact alias for `--umbrella` (it is what
 `LogosModule.cmake`, `buildPlugin.nix` and `buildHeaders.nix` pass today), and
 both route to the one implementation in `main.cpp`.
 
-### Consumer wrapper with typed event accessors
+### Consumer wrapper from the module's contract
 
-The `--events-from <path>` flag points the `<plugin>.dylib` plugin-introspection codegen at a LIDL sidecar shipped alongside the dep's pre-built headers. When set, the generated `<name>_api.{h,cpp}` gains one typed `on<EventName>(callback)` accessor per declared event (callback arg types match `--api-style`):
+The `--events-from <path>` flag points the `<plugin>.dylib` plugin-introspection codegen at the LIDL sidecar shipped alongside the dep's pre-built headers. The flag keeps its historical name, but the file it names is the module's whole **contract**, and everything the wrapper is generated from comes out of it: the typed methods, the typed `on<EventName>(callback)` accessors, and the record structs. Callback and signature types match `--api-style`.
 
 ```bash
 logos-cpp-generator /path/to/plugin.dylib \
@@ -265,6 +265,16 @@ logos-cpp-generator /path/to/plugin.dylib \
     --events-from /path/to/dep/share/logos/my_module.lidl \
     --output-dir ./generated
 ```
+
+**Contract-first, exactly like the Qt surface.** A module that ships a contract is described by it; only a module that ships none (a handcrafted Qt plugin) is described by its compiled plugin's `QMetaObject`. Both paths end in the same `makeHeader` / `makeSource`, and with a contract this path emits the same wrapper as `--general-only --dep <name>=<name>.lidl` — the path `buildHeaders.nix` already takes under cross-compilation.
+
+The methods used to come from the plugin's published `getMethods()`, and that was a defect rather than a simplification. `generator_lib` is keyed on flat type NAMES with a QVariant fallback (`mapParamType` / `mapReturnType`), so a module whose metadata is spelled in a vocabulary this emitter does not recognise silently produced a wrapper of `QVariant` / `LogosMap` with no diagnostic anywhere. It was measured: when the cdylib backend began publishing the LIDL contract vocabulary (`tstr`, `[uint]`, `? tstr`) instead of Qt type names, every `interface: "universal"` module's lp wrapper collapsed to `LogosMap`. Teaching the reader a second vocabulary is not a fix — `int` is a 32-bit Qt int in one table and a 64-bit LIDL integer in the other, so a merged table mistypes every integer and the reader cannot tell from the string which one it is holding.
+
+Two consequences worth knowing:
+
+- **A named-but-missing sidecar is refused** (exit 2), as is an unreadable or malformed one (exit 4). Falling back to introspection would emit a wrapper that compiles and is wrong in a way nothing downstream can see.
+- **A LIDL-spelled listing with no contract is refused** (exit 7). Only a hand-run invocation can reach that combination — `buildHeaders.nix` always passes the flag when the sidecar exists — and it is the shape this section used to suggest. The check keys on the LIDL primitives Qt has no word for (`tstr`, `bstr`, `uint`, `float64`, `result`, `any`) plus anything starting `[`, `{` or `?`, so it cannot false-fire on a Qt name; the words the two vocabularies share (`int`, `bool`) are in the known table and never reach the fallback.
+- **The plugin is still loaded**, so the dlopen check (exit 3 on an SDK/ABI skew) is unchanged, and the two method NAME sets are compared. A divergence — a stale sidecar — is reported on stderr as a `Note:`; the wrapper follows the contract. Only `isInvokable` entries are compared, because a cdylib publishes its events into the same array.
 
 In Nix builds this is wired automatically: `buildHeaders.nix` looks for `<pluginLib>/share/logos/<name>.lidl` (which `buildPlugin.nix`'s installPhase placed there) and threads it through.
 
@@ -347,7 +357,7 @@ Fixture files in `tests/experimental/fixtures/`:
   two answers. `?bstr` is unaffected either way: the tag lives in the value, not the slot.
 - **A provider REJECTION reaches `…Async`'s callback only as a log line** (but
   `…AsyncResult`'s callback gets it properly). A provider that refuses a call answers the
-  canonical `{"code":"dispatch_failed", "message":…, "origin":…}` object as its RESULT, not
+  canonical `{"code":…, "message":…, "origin":…}` object as its RESULT, not
   as a transport error, and the Qt return table would convert it like any other value —
   erasing it (`_result.toList()` on that map is `[]`). The Qt consumer emitter therefore
   detects it (`logosDispatchRejection`, emitted once per wrapper) and folds it into the
@@ -355,7 +365,20 @@ Fixture files in `tests/experimental/fixtures/`:
   - **sync** — the `logos::CallError*` out-parameter, so `mod.echoUintList(v, &err)` can
     tell a rejection from an empty return;
   - **`…AsyncResult`** — `logos::AsyncResult<T>::error`, so `r.ok()` is false and
-    `r.error.code == "dispatch_failed"` exactly as on the sync path.
+    `r.error.code` carries the provider's code exactly as on the sync path.
+
+  `code` is matched against a **closed set** — `kRejectionCodes` in `generator_lib.cpp`,
+  the single source of truth both emitters build their condition from:
+  `dispatch_failed` (the provider refused the argument VALUES), `invalid_args` (wrong
+  argument COUNT) and `unknown_method`. It was the single literal `dispatch_failed` until
+  the arity code was found to be live and undetected — `experimental/lidl_gen_cdylib.cpp`
+  and logos-rust-sdk's `args::invalid_args` have both emitted `invalid_args` all along,
+  so a missing argument reached a typed consumer as a *successful* call returning a
+  three-key map. `unknown_method` is in the set before any provider emits it: widening a
+  detector is backwards-compatible on its own, whereas a new provider code shipped against
+  narrow detectors would arrive as data. The set stays CLOSED — a method may legitimately
+  return a three-string map, so matching the shape alone would let user data impersonate a
+  refusal.
 
   The historical **`…Async`** overload is the one exception: its callback is
   `std::function<void(T)>`, and adding an error parameter would change a generated public
@@ -364,3 +387,12 @@ Fixture files in `tests/experimental/fixtures/`:
   callback still receives the default-converted value. `…AsyncResult` exists precisely
   because giving async an error channel was an API addition rather than a code-generation
   fix — a caller that needs to SEE the rejection uses it.
+
+  The **Qt-free (`lp`) emitter** folds the same rejection through a `nlohmann::json` twin
+  of the detector (`logosDispatchRejectionJson`, under its own guard macro so both can
+  share a translation unit), into the same two surfaces: the sync `logos::CallError*`
+  out-parameter and `…AsyncResult`. Two differences from the Qt twin, both deliberate:
+  its sync path has no `qWarning` fallback for a caller that passed no `err` (a Qt-free
+  wrapper pulling in `<iostream>` to say so would cost every generated TU for a
+  diagnostic nobody reads), and lp `…Async` is left alone for the same reason the Qt one
+  is — its callback takes the value alone.

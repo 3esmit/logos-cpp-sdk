@@ -10,6 +10,7 @@
 // gen_cdylib) stay here — they are the C++/Qt-specific parts.
 
 #include "lidl/ast.hpp"
+#include "lidl/identity.hpp"
 #include "lidl/parser.hpp"
 #include "lidl/serializer.hpp"
 #include "lidl/validator.hpp"
@@ -69,6 +70,27 @@ inline QString lidlSerialize(const ModuleDecl& module)
 inline lidl::ValidationResult lidlValidate(const ModuleDecl& module)
 {
     return lidl::validate(module);
+}
+
+// Add the derived module built-ins — name(), version(), and lidl() — to a
+// ModuleDecl that is about to have CODE emitted from it. Returns false and
+// fills `error` when the module declares one of those reserved names with an
+// incompatible signature.
+//
+// Emission only. Never call this before serializing a .lidl: the published
+// contract stays the canonical serialization of the authored API, and the
+// provider and every consumer each add the built-ins from this one function,
+// so the two sides cannot disagree about them. Injecting into the artifact would
+// make `--header-to-lidl` and `--from-header` disagree about the same module,
+// and would make the built-ins indistinguishable from author-declared methods.
+inline bool lidlInjectIdentity(ModuleDecl& module, QString* error)
+{
+    const lidl::IdentityInjection r = lidl::injectIdentityMethods(module);
+    if (r.hasError()) {
+        if (error) *error = qs(r.error);
+        return false;
+    }
+    return true;
 }
 
 // A record whose ONLY field is a `tstr` named `_bytes` is indistinguishable on

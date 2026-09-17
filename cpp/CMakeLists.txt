@@ -20,7 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #               generated <dep>_api.{h,cpp} wrappers and their logos_sdk.h
 #               umbrella, which the module builder emits per build.
 #
-#   ::provider  logos_module_context.h, logos_host_services.h
+#   ::provider  logos_module_context.h, logos_caller.h, logos_host_services.h
 #               IMPLEMENTING a module. LogosModuleContext is the seam the
 #               generated provider injects into; logos_host_services.h is the
 #               veneer a module uses for services the HOST granted it. (It is
@@ -110,6 +110,7 @@ install(FILES
     logos_module_context.h
     logos_json.h
     logos_result.h
+    logos_caller.h
     logos_lp_client.h
     logos_async_result.h
     logos_host_services.h

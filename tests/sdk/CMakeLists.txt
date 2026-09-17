@@ -6,15 +6,22 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../cpp ${CMAKE_CURRENT_BINARY_DI
 
 add_executable(sdk_tests
     test_logos_module_context.cpp
+    test_logos_caller.cpp
     test_logos_host_services.cpp
     test_logos_host_core.cpp
+    test_lp_client.cpp
 )
 
 # logos_host_services.h is a veneer over the lp_* C ABI, so this suite needs
 # logos-protocol's HEADERS. It deliberately does not need its LIBRARY: the
 # functions that call lp_* are `inline` and never ODR-used by these tests, so
 # nothing references a protocol symbol at link time. If a future test does call
-# one, this will fail to LINK rather than silently pull the library in.
+# one, this will fail to LINK rather than silently pull the library in — unless
+# it supplies its own definition, which is exactly what test_lp_client.cpp does:
+# it stubs lp_client_create/lp_client_destroy/lp_get_methods/lp_invoke_async so
+# it can count clients, widen the create window, and drive each documented C ABI
+# outcome — none of which the real library exposes. Stubs keep the no-library
+# rule intact; adding the library here would not.
 # LOGOS_PROTOCOL_ROOT is the logos-protocol SOURCE tree here (nix/tests.nix
 # passes the flake input, not the built package), so the headers are under
 # cpp/ — a package would put them under include/. Accept either rather than

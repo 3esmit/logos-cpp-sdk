@@ -76,10 +76,21 @@ void   logos_core_start();
 void   logos_core_cleanup();
 char** logos_core_get_loaded_modules();
 char** logos_core_get_known_modules();
-int    logos_core_load_module(const char* module_name, bool with_dependencies);
+// How far logos_core_load_module walks the graph. The first two values are
+// pinned to the `bool with_dependencies` this replaced — under C linkage the
+// symbol mangles the same either way, so a mirror that went stale would link
+// silently and pass a bool where an enum is read. Do not renumber.
+typedef enum {
+    LOGOS_LOAD_MODULE_ONLY = 0,
+    LOGOS_LOAD_REQUIRED_DEPS = 1,
+    LOGOS_LOAD_REQUIRED_AND_OPTIONAL = 2,
+} LogosLoadDeps;
+int    logos_core_load_module(const char* module_name, LogosLoadDeps deps);
 int    logos_core_unload_module(const char* module_name, bool with_dependents);
 char** logos_core_get_module_dependencies(const char* module_name, bool recursive);
 char** logos_core_get_module_dependents(const char* module_name, bool recursive);
+char** logos_core_get_module_optional_dependencies(const char* module_name);
+char*  logos_core_optional_load_report(const char* module_name);
 char*  logos_core_get_modules_info();
 char*  logos_core_process_module(const char* module_path);
 char*  logos_core_get_token(const char* key);
@@ -104,7 +115,12 @@ namespace host {
 struct ModuleStats {
     std::string name;
     double      cpuPercent = 0.0;
-    long long   memoryBytes = 0;
+    double      cpuTimeSeconds = 0.0;
+    // MEGABYTES, not bytes — that is what the producer emits
+    // (process-stats/src/process_stats.h: `double memoryMB`). This member was
+    // `long long memoryBytes` and read a key that does not exist, so it was
+    // both the wrong unit and always zero.
+    double      memoryMb = 0.0;
     // The raw entry, so a host can read fields this struct does not model
     // without waiting for the SDK to grow them.
     nlohmann::json raw;
@@ -214,12 +230,24 @@ public:
 
     // ── Module lifecycle ────────────────────────────────────────────────────
 
-    // Returns true on success. `withDependencies` resolves and loads the
-    // module's declared dependency graph first, which is what a host almost
-    // always wants — hence the default.
-    bool loadModule(const std::string& name, bool withDependencies = true)
+    // Returns true on success. The default resolves and loads the module's
+    // REQUIRED dependency graph first, which is what a host almost always
+    // wants. LOGOS_LOAD_REQUIRED_AND_OPTIONAL additionally brings up whichever
+    // optional dependencies are installed — none of which can fail this call,
+    // so ask optionalLoadReport() below which ones were left out.
+    bool loadModule(const std::string& name,
+                    LogosLoadDeps deps = LOGOS_LOAD_REQUIRED_DEPS)
     {
-        return logos_core_load_module(name.c_str(), withDependencies) == 1;
+        return logos_core_load_module(name.c_str(), deps) == 1;
+    }
+
+    // Which optional dependencies LOGOS_LOAD_REQUIRED_AND_OPTIONAL would leave
+    // out for `name`, and why, as liblogos' JSON. "[]" when it would leave out
+    // none. Worth asking after such a load: a skipped module keeps whatever
+    // state it had, so nothing else distinguishes it from one nobody wanted.
+    std::optional<std::string> optionalLoadReportJson(const std::string& name) const
+    {
+        return detail::drainCString(logos_core_optional_load_report(name.c_str()));
     }
 
     // Returns true on success. `withDependents` cascades to modules that depend
@@ -264,6 +292,20 @@ public:
             logos_core_get_module_dependents(name.c_str(), recursive));
     }
 
+    // The module's optional dependencies: concrete names it may call and does
+    // not require. Direct only — there is no recursive form, because the set
+    // a caller can act on is the one this module declares, and an optional
+    // dependency's own optional dependencies are its business.
+    //
+    // Worth pairing with loadModule(name, LOGOS_LOAD_REQUIRED_AND_OPTIONAL):
+    // this says what could come up, and optionalLoadReportJson says what will
+    // not.
+    std::vector<std::string> optionalDependencies(const std::string& name) const
+    {
+        return detail::drainCStringArray(
+            logos_core_get_module_optional_dependencies(name.c_str()));
+    }
+
     // Full metadata for every known module, as liblogos' JSON.
     std::optional<std::string> modulesInfoJson() const
     {
@@ -298,8 +340,13 @@ public:
             if (!entry.is_object()) continue;
             ModuleStats s;
             s.name = entry.value("name", std::string{});
-            s.cpuPercent = entry.value("cpu", 0.0);
-            s.memoryBytes = entry.value("memory", 0LL);
+            // Key names are process-stats' (src/process_stats.cpp:157-161):
+            // name, cpu_percent, cpu_time_seconds, memory_mb. This read "cpu"
+            // and "memory", which are emitted by nothing, so every host that
+            // adopted this façade would have silently reported 0 for both.
+            s.cpuPercent     = entry.value("cpu_percent", 0.0);
+            s.cpuTimeSeconds = entry.value("cpu_time_seconds", 0.0);
+            s.memoryMb       = entry.value("memory_mb", 0.0);
             s.raw = entry;
             out.push_back(std::move(s));
         }

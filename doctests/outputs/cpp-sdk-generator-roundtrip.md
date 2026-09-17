@@ -258,10 +258,15 @@ cat provider/sensor_module_events_cdylib.cpp
 The consumer side. From the same contract, `--module-only` emits the typed
 wrapper a *consumer* compiles against to call `sensor_module`. Each LIDL
 `method` becomes a synchronous caller plus an `…Async` variant, and each
-`event` an `on(...)` subscription. The type mapping is the Qt caller style:
+`event` an `on(...)` subscription. The type mapping is the Qt caller style,
+and it is **lossless** — one LIDL type, one C++ spelling:
 `float64`→`double`, `tstr`→`QString`, `int`→`qlonglong`, `uint`→
-`qulonglong`, `bstr`→`QByteArray`, `[tstr]`→`QStringList`, other
-arrays→`QVariantList`, and `result`→`LogosResult`.
+`qulonglong`, `bstr`→`QByteArray`, `result`→`LogosResult`, and each
+container carries its element type through — `[tstr]`→`QStringList`,
+every other `[T]`→`QList<T>` (so `[uint]` is `QList<qulonglong>`).
+Only `any` stays `QVariant`: it is the one Qt type that holds bytes *and*
+an exact `uint64` *and* arbitrary nesting, so narrowing it would lose what
+it was chosen to carry.
 
 The integer spellings are 64-bit, and unsigned stays unsigned: LIDL
 `int`/`uint` are `int64_t`/`uint64_t` in every other binding, so spelling
@@ -293,10 +298,14 @@ A **record becomes a real C++ struct**: a `type Point { … }` in the contract
 generates `struct Point` plus the conversions, so a caller writes
 `Point p = client.translate(q, 1, 2)` instead of digging fields out of a
 `QVariantMap`. `[Point]` is a `QList<Point>` and `{tstr: Point}` a
-`QMap<QString, Point>`. Maps of `any`, optionals (`?T`) and `any` itself
-still cross as untyped JSON and stay `QVariantMap` / `QVariant` — a record
-has a declared shape, those do not. Here is a contract that uses all of
-them, taken straight to a consumer header.
+`QMap<QString, Point>`. An **optional** `?T` is a
+`std::optional<T>` — two-state in the type system, so an absent value is
+not spelled the same way as a present default, and `?uint` is
+distinguishable from `?tstr`. Only `any` — and any container whose element
+type bottoms out at `any`, such as `{tstr: any}` — stays untyped, as
+`QVariant` / `QVariantMap`: a record has a declared shape and an `any` does
+not. Here is a contract that uses all of them, taken straight to a consumer
+header.
 
 ### 6.1 geometry_module.lidl
 
@@ -331,9 +340,14 @@ logos-cpp-generator --lidl geometry_module.lidl \
 
 `Point` is generated as a struct, so a record parameter is taken by
 const-ref and a record return comes back typed. An array-of-records is a
-`QList<Point>`. A map of `any`, an optional and a bare `any` stay
-`QVariantMap` / `QVariant` — the untyped carriers for JSON whose shape
-the contract does not declare.
+`QList<Point>`. `nearest` shows both halves of the optional mapping in
+one signature — `?uint` in, `?Point` out — as
+`std::optional<qulonglong>` and `std::optional<Point>`: the caller can
+ask `limit.has_value()` and the return can be *nothing* without
+colliding with a legitimate `Point{0, 0}`. Only `attributes` and
+`describe` stay `QVariantMap` / `QVariant`: `{tstr: any}` and `any` are
+the untyped carriers for JSON whose shape the contract does not
+declare.
 
 ```bash
 grep -E 'class|translate|bounds|attributes|nearest' geometry/geometry_module_api.h

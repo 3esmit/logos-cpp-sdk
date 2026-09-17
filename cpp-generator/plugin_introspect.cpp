@@ -12,6 +12,8 @@
 #include <QByteArrayList>
 #include <QFile>
 #include <QRegularExpression>
+#include <QSet>
+#include <QStringList>
 #include <QtGlobal>
 #include "logos_provider_interface.h"
 #include "generator_lib.h"
@@ -19,19 +21,51 @@
 #include "experimental/lidl_compat.h"
 #include "lidl_to_json.h"   // ModuleDecl -> the JSON surface generator_lib consumes
 
-// Load events from a `.lidl` sidecar shipped alongside a module's
-// pre-built headers. Returns a JSON array of
-//   { name, params: [ { name, type } ] }
-// using Qt-typed type names — same shape generator_lib's makeHeader /
-// makeSource already consume for methods.
-static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err,
-                                     QJsonArray* outRecords = nullptr)
+// The `.lidl` sidecar a module ships beside its built plugin
+// (`<lib>/share/logos/<name>.lidl`) — its CONTRACT, parsed into the three JSON
+// arrays generator_lib's makeHeader / makeSource consume.
+//
+// ─── Why the METHODS come from here and not from the plugin ──────────────
+//
+// This used to load events (and records) only; the methods came from the
+// plugin's published `getMethods()`. That made the wrapper's whole type
+// surface depend on the VOCABULARY a module happens to publish its metadata
+// in, and generator_lib is keyed on flat type NAMES with a QVariant fallback
+// (mapParamType / mapReturnType) — so a module that spells its metadata any
+// way this emitter does not recognise gets a wrapper of QVariant / LogosMap
+// with no diagnostic at all. It is a machine reader of a human-facing
+// listing, and it degrades silently.
+//
+// It measurably broke: when the cdylib backend started publishing the LIDL
+// contract vocabulary (`tstr`, `[uint]`, `? tstr`) instead of Qt type names,
+// every `interface: "universal"` module's lp wrapper turned into LogosMap.
+// Teaching this reader a second vocabulary is not a fix — `int` means a
+// 32-bit Qt int in one and a 64-bit LIDL integer in the other, so a merged
+// table silently mistypes every integer, and the reader cannot tell from the
+// string which table it is holding.
+//
+// The contract has no such ambiguity: it is a TypeExpr tree, and
+// lidl_to_json is the one place it is flattened. So when a module publishes a
+// contract, that is what the wrapper is generated from — which also makes
+// this path emit byte-identical output to `--general-only --dep
+// <name>=<name>.lidl` (main.cpp's generateInterfaceWrappers), the path
+// buildHeaders.nix already takes under cross-compilation and for the whole Qt
+// surface. Introspection is what is left over for a module that publishes NO
+// contract (a handcrafted Qt plugin), where the QMetaObject's Qt type names
+// are the only description of its API that exists.
+//
+// A sidecar that is present but unreadable or malformed is FATAL. Returning
+// empty and carrying on is what let a broken sidecar ship a wrapper with no
+// typed event accessors and (now) no typed methods — the same silently-empty
+// shape generate-module-headers.sh exists to refuse.
+static bool loadContractFromLidl(const QString& lidlPath, QTextStream& err,
+                                 QJsonArray* outMethods, QJsonArray* outEvents,
+                                 QJsonArray* outRecords)
 {
-    QJsonArray result;
     QFile f(lidlPath);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        err << "Failed to open events sidecar: " << lidlPath << "\n";
-        return result;
+        err << "Failed to open contract sidecar: " << lidlPath << "\n";
+        return false;
     }
     QString source = QString::fromUtf8(f.readAll());
     f.close();
@@ -40,12 +74,83 @@ static QJsonArray loadEventsFromLidl(const QString& lidlPath, QTextStream& err,
     if (pr.hasError()) {
         err << lidlPath << ":" << pr.errorLine << ":" << pr.errorColumn
             << ": " << pr.error << "\n";
-        return result;
+        return false;
     }
 
-    noteOptionalPositionalSlots(pr.module, lidlPath, err);
-    if (outRecords) *outRecords = moduleRecordsToJson(pr.module);
-    return moduleEventsToJson(pr.module);
+    ModuleDecl mod = pr.module;
+    {
+        QString recErr;
+        if (!lidlCheckRecords(mod, &recErr)) {
+            err << lidlPath << ": " << recErr << "\n";
+            return false;
+        }
+    }
+    {
+        // Consumers see name()/version()/lidl() on every dependency. Added
+        // after parsing: the published .lidl is the canonical authored API,
+        // while the provider derives the same built-ins from the same frontend
+        // (main.cpp's --backend cdylib path).
+        QString idErr;
+        if (!lidlInjectIdentity(mod, &idErr)) {
+            err << lidlPath << ": " << idErr << "\n";
+            return false;
+        }
+    }
+
+    noteOptionalPositionalSlots(mod, lidlPath, err);
+    if (outMethods) *outMethods = moduleMethodsToJson(mod);
+    if (outEvents)  *outEvents  = moduleEventsToJson(mod);
+    if (outRecords) *outRecords = moduleRecordsToJson(mod);
+    return true;
+}
+
+// Is this published type name spelled in the LIDL CONTRACT vocabulary rather
+// than in Qt type names?
+//
+// The two vocabularies are not distinguishable in general — `int` and `bool`
+// are words in both, at different widths — which is exactly why this emitter
+// must not try to read both. But it does not have to: those overlapping words
+// are all in mapParamType/mapReturnType's known table, so they never reach the
+// fallback. What reaches the fallback and is UNAMBIGUOUS is the LIDL half that
+// Qt has no word for at all: the primitive names below, and any container or
+// optional, which start with a character no C++ type name starts with.
+//
+// Deliberately NOT a second type table. The answer is only ever used to REFUSE
+// — see below — so a false negative degrades to the old behaviour and a false
+// positive is impossible: no Qt type is called `tstr`, and none begins with
+// `[`, `{` or `?`.
+static bool looksLikeLidlSpelling(const QString& raw)
+{
+    const QString t = raw.trimmed();
+    if (t.isEmpty()) return false;
+    if (t.startsWith('[') || t.startsWith('{') || t.startsWith('?')) return true;
+    static const QSet<QString> unambiguous = {
+        QStringLiteral("tstr"),  QStringLiteral("bstr"), QStringLiteral("uint"),
+        QStringLiteral("float64"), QStringLiteral("result"), QStringLiteral("any"),
+    };
+    return unambiguous.contains(t);
+}
+
+// Every LIDL-spelled type name in a published listing, as "method: type" for a
+// diagnostic. Empty when the listing is in Qt names, which is the only
+// vocabulary this emitter can read.
+static QStringList lidlSpelledSlots(const QJsonArray& methods)
+{
+    QStringList out;
+    for (const QJsonValue& mv : methods) {
+        if (!mv.isObject()) continue;
+        const QJsonObject mo = mv.toObject();
+        const QString name = mo.value("name").toString();
+        const QString ret = mo.value("returnType").toString();
+        if (looksLikeLidlSpelling(ret))
+            out << (name + "() -> " + ret);
+        for (const QJsonValue& pv : mo.value("parameters").toArray()) {
+            const QString pt = pv.toObject().value("type").toString();
+            if (looksLikeLidlSpelling(pt))
+                out << (name + "(" + pv.toObject().value("name").toString() + ": " + pt + ")");
+        }
+    }
+    return out;
 }
 
 // The interface/dependency wrapper machinery (InterfaceSpec, parseSpecFlags,
@@ -104,7 +209,10 @@ static QJsonArray enumerateMethods(QObject* moduleInstance)
 
 // makeSource -> generator_lib.h/cpp
 
-static int generateFromPlugin(const QString& pluginInputPath, const QString& outputDir, ApiStyle apiStyle, const QJsonArray& events, QTextStream& out, QTextStream& err, const QJsonArray& records = {})
+// `contractMethods` is the module's own contract, when it ships one; empty
+// when it does not. Non-empty wins over whatever the plugin publishes — see
+// loadContractFromLidl for why the published metadata is not a type source.
+static int generateFromPlugin(const QString& pluginInputPath, const QString& outputDir, ApiStyle apiStyle, const QJsonArray& events, QTextStream& out, QTextStream& err, const QJsonArray& records = {}, const QJsonArray& contractMethods = {})
 {
     QFileInfo fi(pluginInputPath);
     if (!fi.exists()) {
@@ -142,20 +250,101 @@ static int generateFromPlugin(const QString& pluginInputPath, const QString& out
         }
     }
 
-    QJsonArray methods;
+    // What the PLUGIN says about itself. Still read even when a contract is
+    // present: loading the plugin is the dlopen check this path exists to
+    // perform (exit 3 on an SDK/ABI skew), and comparing the two name sets is
+    // the only place a stale sidecar can be noticed at all.
+    QJsonArray publishedMethods;
     LogosProviderPlugin* providerPlugin = qobject_cast<LogosProviderPlugin*>(instance);
     if (providerPlugin) {
         LogosProviderObject* provider = providerPlugin->createProviderObject();
         if (provider) {
-            methods = provider->getMethods();
+            publishedMethods = provider->getMethods();
             out << "Detected new-API plugin (LogosProviderPlugin), using getMethods() — "
-                << methods.size() << " methods\n";
+                << publishedMethods.size() << " methods\n";
             delete provider;
         } else {
             err << "LogosProviderPlugin::createProviderObject() returned null\n";
         }
     } else {
-        methods = enumerateMethods(instance);
+        publishedMethods = enumerateMethods(instance);
+    }
+
+    // Contract-first. The published listing is a HUMAN-facing description
+    // whose vocabulary is the publisher's choice; the contract is the typed
+    // one. Only a module that ships no contract is described by its plugin.
+    QJsonArray methods = publishedMethods;
+    if (contractMethods.isEmpty()) {
+        // No contract, so the listing is the only description there is — and
+        // it has to be one this emitter can READ. It is keyed on Qt type names
+        // with a QVariant fallback, so a listing in the LIDL contract
+        // vocabulary produces a wrapper of QVariant / LogosMap that compiles
+        // and has lost every type. That is not hypothetical: it is what
+        // happened to every `interface: "universal"` module when the cdylib
+        // backend switched its published metadata to LIDL names.
+        //
+        // REFUSED, not warned. The build systems always pass --events-from for
+        // a module that ships a contract, so reaching here with LIDL names
+        // means either a hand-run invocation that omitted the flag (the shape
+        // the docs used to suggest) or a caller that lost it — and in both
+        // cases the wrapper would be silently untyped. The message names the
+        // flag, because the fix is always the same one file.
+        const QStringList lidlSlots = lidlSpelledSlots(publishedMethods);
+        if (!lidlSlots.isEmpty()) {
+            err << "Error: '" << moduleName << "' publishes its metadata in the LIDL\n"
+                << "       contract vocabulary, and no --events-from contract was given.\n"
+                << "       Offending slots (up to 8): [" << lidlSlots.mid(0, 8).join(", ")
+                << "]\n"
+                << "       This emitter reads Qt type names and falls back to QVariant\n"
+                << "       (LogosMap on the lp surface) for anything else, so generating\n"
+                << "       from this listing would emit a wrapper that compiles and has\n"
+                << "       lost every type — with no diagnostic anywhere downstream.\n"
+                << "       Pass --events-from <path>/share/logos/" << moduleName
+                << ".lidl, the contract\n"
+                << "       the module installs beside its plugin. buildHeaders.nix does\n"
+                << "       this automatically; a hand-run invocation has to say it.\n";
+            loader.unload();
+            return 7;
+        }
+    } else {
+        methods = contractMethods;
+        out << "Using the module's LIDL contract for the method surface — "
+            << methods.size() << " methods (the plugin's published listing is a "
+            << "description, not a type source)\n";
+
+        // A stale sidecar is the one way this can now be wrong, and it is
+        // otherwise invisible: the wrapper would compile and simply not have
+        // the method. Reported, not fatal — the two sets legitimately differ
+        // for a plugin whose QMetaObject carries Qt-only slots.
+        // INVOKABLE entries only, on both sides. A cdylib publishes its
+        // events into the same array, tagged `"type": "event"` and with no
+        // `isInvokable` — makeHeader/makeSourceLp already skip those, and
+        // counting them here would report a divergence for every module that
+        // declares an event.
+        auto namesOf = [](const QJsonArray& a) {
+            QSet<QString> n;
+            for (const QJsonValue& v : a) {
+                if (!v.isObject()) continue;
+                const QJsonObject o = v.toObject();
+                if (!o.value("isInvokable").toBool()) continue;
+                n.insert(o.value("name").toString());
+            }
+            return n;
+        };
+        const QSet<QString> fromContract = namesOf(contractMethods);
+        const QSet<QString> fromPlugin = namesOf(publishedMethods);
+        const QStringList onlyContract = QStringList(QList<QString>((fromContract - fromPlugin).begin(), (fromContract - fromPlugin).end()));
+        const QStringList onlyPlugin = QStringList(QList<QString>((fromPlugin - fromContract).begin(), (fromPlugin - fromContract).end()));
+        if (!onlyContract.isEmpty() || !onlyPlugin.isEmpty()) {
+            err << "Note: the contract and the built plugin list different methods for '"
+                << moduleName << "'.";
+            if (!onlyContract.isEmpty())
+                err << " Contract only: [" << onlyContract.join(", ") << "].";
+            if (!onlyPlugin.isEmpty())
+                err << " Plugin only: [" << onlyPlugin.join(", ") << "].";
+            err << " The wrapper follows the CONTRACT; a method listed only by the "
+                   "plugin is not reachable through it.\n";
+        }
     }
 
     QString className = toPascalCase(moduleName);
@@ -170,9 +359,11 @@ static int generateFromPlugin(const QString& pluginInputPath, const QString& out
     // passed --api-style=lp (typically because it's `interface:
     // "universal"` or `"cdylib"`).
     // Both produce the same filename and class name, so the umbrella
-    // doesn't need to know which style was picked. `events` (loaded
-    // from a sibling `.lidl` sidecar via --events-from) adds typed
-    // `on<EventName>(callback)` accessors next to the existing methods.
+    // doesn't need to know which style was picked. `methods`, `events` and
+    // `records` all come from the same sibling `.lidl` sidecar
+    // (--events-from) when the module ships one — that is one contract in,
+    // one wrapper out, and it is what makes this path agree with
+    // `--general-only --dep <name>=<name>.lidl`.
     QString header = makeHeader(moduleName, className, methods, apiStyle, events, BindMode::Static, records);
     QString source = makeSource(moduleName, className, headerRel, methods, apiStyle, events, BindMode::Static, records);
 
@@ -335,11 +526,20 @@ int runPluginIntrospectMode(int argc, char* argv[])
         return 1;
     }
 
-    // --events-from <path>: load typed event prototypes from a LIDL
-    // sidecar shipped alongside a dep's pre-built headers. When set,
-    // the consumer wrapper (<name>_api.{h,cpp}) gains typed
-    // `on<EventName>(callback)` accessors next to the existing
-    // generic `onEvent(name, callback)` channel.
+    // --events-from <path>: the module's `.lidl` CONTRACT, shipped beside its
+    // built plugin. The flag keeps its name — generate-module-headers.sh and
+    // buildHeaders.nix in logos-plugin-qt pass it, and logos-plugin-qt's
+    // test-header-generator-guard asserts the spelling — but the file it
+    // names has always been the whole contract, and everything the wrapper is
+    // generated from now comes out of it: the typed methods, the typed
+    // `on<EventName>(callback)` accessors, and the record structs.
+    //
+    // Absent (a handcrafted Qt module publishes no contract) means the
+    // wrapper is generated from the plugin's QMetaObject, exactly as before.
+    // NAMED BUT MISSING is a refusal rather than a fallback: silently
+    // introspecting instead would emit a wrapper that compiles and is wrong
+    // in a way nothing downstream can see.
+    QJsonArray methodsFromSidecar;
     QJsonArray eventsFromSidecar;
     QJsonArray recordsFromSidecar;
     {
@@ -355,11 +555,24 @@ int runPluginIntrospectMode(int argc, char* argv[])
                 }
             }
         }
-        if (!evPath.isEmpty() && QFileInfo(evPath).exists()) {
-            eventsFromSidecar = loadEventsFromLidl(evPath, err, &recordsFromSidecar);
+        if (!evPath.isEmpty()) {
+            if (!QFileInfo(evPath).exists()) {
+                err << "Error: --events-from names a contract that does not exist: "
+                    << evPath << "\n"
+                    << "       The wrapper's methods, events and records all come from\n"
+                    << "       this file. Generating from the plugin's published metadata\n"
+                    << "       instead would emit a wrapper of untyped QVariant / LogosMap\n"
+                    << "       that compiles and silently loses every type.\n";
+                return 2;
+            }
+            if (!loadContractFromLidl(evPath, err, &methodsFromSidecar,
+                                      &eventsFromSidecar, &recordsFromSidecar)) {
+                return 4;
+            }
         }
     }
 
     QString argPath = args.at(1);
-    return generateFromPlugin(argPath, outputDir, apiStyle, eventsFromSidecar, out, err, recordsFromSidecar);
+    return generateFromPlugin(argPath, outputDir, apiStyle, eventsFromSidecar, out, err,
+                              recordsFromSidecar, methodsFromSidecar);
 }

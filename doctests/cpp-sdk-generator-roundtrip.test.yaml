@@ -274,10 +274,14 @@ sections:
       variant that hands it a `logos::AsyncResult<T>` (`{value, error}`) so a
       failed call is distinguishable from a legitimately default-valued one —
       and each `event` an `on(...)` subscription. The type mapping is the Qt
-      caller style:
+      caller style, and it is **lossless** — one LIDL type, one C++ spelling:
       `float64`→`double`, `tstr`→`QString`, `int`→`qlonglong`, `uint`→
-      `qulonglong`, `bstr`→`QByteArray`, `[tstr]`→`QStringList`, other
-      arrays→`QVariantList`, and `result`→`LogosResult`.
+      `qulonglong`, `bstr`→`QByteArray`, `result`→`LogosResult`, and each
+      container carries its element type through — `[tstr]`→`QStringList`,
+      every other `[T]`→`QList<T>` (so `[uint]` is `QList<qulonglong>`).
+      Only `any` stays `QVariant`: it is the one Qt type that holds bytes *and*
+      an exact `uint64` *and* arbitrary nesting, so narrowing it would lose what
+      it was chosen to carry.
 
       The integer spellings are 64-bit, and unsigned stays unsigned: LIDL
       `int`/`uint` are `int64_t`/`uint64_t` in every other binding, so spelling
@@ -302,7 +306,7 @@ sections:
           - "double temperature("
           - "qlonglong record(qulonglong id, double value, const QString& note, bool valid"
           - "QByteArray firmware(const QByteArray& image"
-          - "QStringList labels(const QVariantList& ids"
+          - "QStringList labels(const QList<qulonglong>& ids"
           - "LogosResult reset(const QString& id"
       - title: "The three call surfaces per method"
         text: |
@@ -334,10 +338,14 @@ sections:
       generates `struct Point` plus the conversions, so a caller writes
       `Point p = client.translate(q, 1, 2)` instead of digging fields out of a
       `QVariantMap`. `[Point]` is a `QList<Point>` and `{tstr: Point}` a
-      `QMap<QString, Point>`. Maps of `any`, optionals (`?T`) and `any` itself
-      still cross as untyped JSON and stay `QVariantMap` / `QVariant` — a record
-      has a declared shape, those do not. Here is a contract that uses all of
-      them, taken straight to a consumer header.
+      `QMap<QString, Point>`. An **optional** `?T` is a
+      `std::optional<T>` — two-state in the type system, so an absent value is
+      not spelled the same way as a present default, and `?uint` is
+      distinguishable from `?tstr`. Only `any` — and any container whose element
+      type bottoms out at `any`, such as `{tstr: any}` — stays untyped, as
+      `QVariant` / `QVariantMap`: a record has a declared shape and an `any` does
+      not. Here is a contract that uses all of them, taken straight to a consumer
+      header.
     steps:
       - title: "geometry_module.lidl"
         file:
@@ -374,10 +382,15 @@ sections:
         text: |
           `Point` is generated as a struct, so a record parameter is taken by
           const-ref and a record return comes back typed. An array-of-records is a
-          `QList<Point>`. A map of `any`, an optional and a bare `any` stay
-          `QVariantMap` / `QVariant` — the untyped carriers for JSON whose shape
-          the contract does not declare.
-        run: "grep -E 'class GeometryModule|struct Point|Point translate|QList<Point>|QVariantMap attributes|QVariant nearest' geometry/geometry_module_api.h"
+          `QList<Point>`. `nearest` shows both halves of the optional mapping in
+          one signature — `?uint` in, `?Point` out — as
+          `std::optional<qulonglong>` and `std::optional<Point>`: the caller can
+          ask `limit.has_value()` and the return can be *nothing* without
+          colliding with a legitimate `Point{0, 0}`. Only `attributes` and
+          `describe` stay `QVariantMap` / `QVariant`: `{tstr: any}` and `any` are
+          the untyped carriers for JSON whose shape the contract does not
+          declare.
+        run: "grep -E 'class GeometryModule|struct Point|Point translate|QList<Point>|QVariantMap attributes|std::optional<Point> nearest' geometry/geometry_module_api.h"
         code_block: |
           grep -E 'class|translate|bounds|attributes|nearest' geometry/geometry_module_api.h
         expect_contains:
@@ -386,4 +399,4 @@ sections:
           - "Point translate(const Point& p, double dx, double dy"
           - "Point bounds(const QList<Point>& points"
           - "QVariantMap attributes(const QVariantMap& tags"
-          - "QVariant nearest(const Point& p, QVariant limit"
+          - "std::optional<Point> nearest(const Point& p, const std::optional<qulonglong>& limit"

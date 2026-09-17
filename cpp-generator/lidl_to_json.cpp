@@ -9,16 +9,8 @@
 // metaobject-introspection path produces for methods, so generator_lib
 // can consume both via one code path).
 //
-// ONE Qt type mapper. This used to be a near-duplicate of `lidlTypeToQt`
-// (experimental/lidl_emit_common.cpp) and the two disagreed: this copy had no
-// `void` case, so a `-> void` method reaching it as Primitive("void") from the
-// impl-header parser fell through to QVariant and generated
-// `QVariant doVoid(...)`. (The .lidl parser spells the same thing
-// Named("void"), which survived only by accident — mapReturnType's
-// `base == "void"` early-out.) The lp/std tables are DERIVED from this name, so
-// the same bug produced `LogosMap doVoid(...)` on the Qt-free surface: not a
-// Qt-only defect, a front-end one. It is now a delegation, so there is one
-// table to disagree with.
+// ONE Qt type mapper. No-return is handled at the MethodDecl level before this
+// function is called; a TypeExpr always denotes an actual value type.
 QString lidlTypeExprToQtTypeName(const TypeExpr& te)
 {
     return lidlTypeToQt(te);
@@ -31,15 +23,15 @@ QString lidlTypeExprToQtTypeName(const TypeExpr& te)
 // Qt surface, std::optional<T> on the Lp one). What is still flattened is every
 // POSITIONAL slot — a method parameter, a return type, an event parameter.
 // Those have no name to hang a flag on, so they only ever had the type-kind
-// spelling and there is no spelling divergence to fix; what they lose is the
-// value TYPE, exactly as `lidlTypeToQt` documents (`?T` -> QVariant, and via
-// the derived std table -> LogosMap). Two-stateness survives — an invalid
-// QVariant / a JSON null is the empty inhabitant — but the consumer gets no
-// compile-time check on the value and cannot tell `?tstr` from `?uint`.
+// spelling and there is no spelling divergence to fix.
 //
-// Widening those means changing the generated method SIGNATURES, which is a
-// source break for every existing caller and buys nothing for the
-// one-declaration-two-spellings rule. So they stay flattened, and say so.
+// `lidlTypeToQt` DOES now answer `?T` with std::optional<T>. This path cannot
+// keep it: generator_lib is keyed on flat type NAMES and folds every widened
+// spelling back (legacyQtBase), because encoding one correctly needs an element
+// loop it has no tree to derive. So the loss is this emitter's, not the
+// mapping's — the TypeExpr-driven Qt consumer emitters keep the value type —
+// and the note says which surface is affected rather than claiming the table
+// still flattens.
 void noteOptionalPositionalSlots(const ModuleDecl& mod, const QString& where,
                                  QTextStream& err)
 {
@@ -48,7 +40,7 @@ void noteOptionalPositionalSlots(const ModuleDecl& mod, const QString& where,
         for (const ParamDecl& pd : md.params)
             if (paramIsOptional(pd))
                 optSlots << (qs(md.name) + "(" + qs(pd.name) + ")");
-        if (typeIsOptional(md.returnType))
+        if (md.returnType && typeIsOptional(*md.returnType))
             optSlots << (qs(md.name) + "() return");
     }
     for (const EventDecl& ed : mod.events)
@@ -58,11 +50,13 @@ void noteOptionalPositionalSlots(const ModuleDecl& mod, const QString& where,
     if (optSlots.isEmpty()) return;
     err << "Note: " << where << ": optional positional slot(s) ["
         << optSlots.join(", ")
-        << "] are generated as untyped QVariant (LogosMap on the lp surface). A "
-           "positional slot has no name to carry an optional flag, so `?T` keeps "
-           "its two states (an invalid QVariant / a JSON null is the empty one) "
-           "but loses T. Record fields are unaffected — they carry optionality "
-           "through.\n";
+        << "] are generated as untyped QVariant (LogosMap on the lp surface) by "
+           "THIS emitter, which is keyed on flat type names and folds "
+           "std::optional<T> back to QVariant. `?T` keeps its two states (an "
+           "invalid QVariant / a JSON null is the empty one) but loses T here. "
+           "The TypeExpr-driven Qt consumer emitters keep it as "
+           "std::optional<T>; record fields are unaffected on every surface — "
+           "they carry optionality through.\n";
 }
 
 // Build a getMethods()-shaped QJsonArray (the surface makeHeader/makeSource
@@ -73,7 +67,9 @@ QJsonArray moduleMethodsToJson(const ModuleDecl& mod)
     for (const MethodDecl& m : mod.methods) {
         QJsonObject o;
         o["name"] = qs(m.name);
-        o["returnType"] = lidlTypeExprToQtTypeName(m.returnType);
+        o["returnType"] = m.returnType
+            ? lidlTypeExprToQtTypeName(*m.returnType)
+            : QStringLiteral("void");
         o["isInvokable"] = true;
         QJsonArray params;
         for (const ParamDecl& p : m.params) {

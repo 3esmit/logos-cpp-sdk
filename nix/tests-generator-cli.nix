@@ -81,6 +81,36 @@ pkgs.runCommand "${common.pname}-generator-cli-tests"
     [ -s ./gen/logos_sdk.h ] || fail "--general-only emitted no logos_sdk.h"
     echo "OK: --general-only still emits the umbrella"
 
+    # ── `optional_dependencies` reach the umbrella like required ones ──
+    #
+    # With no `--dep` flag this is the metadata fallback — the raw dev-shell
+    # path, where LogosModule.cmake invokes with `--metadata` alone. Only the
+    # binary can answer it: a builder that resolved the key correctly would still
+    # emit an umbrella without the member if the generator did not union the two
+    # arrays here.
+    cat > optional_metadata.json <<'EOF'
+    {
+      "name": "cli_optional_module",
+      "version": "1.0.0",
+      "type": "core",
+      "dependencies": ["hard_dep"],
+      "optional_dependencies": ["opt_dep", {"name": "opt_obj_dep", "version": "^1.0.0"}]
+    }
+    EOF
+
+    logos-cpp-generator --metadata ./optional_metadata.json --general-only       --api-style qt --output-dir ./gen-optional       >/dev/null 2>optional.err       || { cat optional.err >&2; fail "a module with optional_dependencies was refused"; }
+    [ -s ./gen-optional/logos_sdk.h ] || fail "optional_dependencies emitted no logos_sdk.h"
+
+    # One member per name, whatever list it came from and whichever entry form
+    # it used. The kinds differ in LIFETIME, which a wrapper cannot express.
+    for member in hard_dep opt_dep opt_obj_dep; do
+      grep -q "OptDep\|$member" ./gen-optional/logos_sdk.h         || { cat ./gen-optional/logos_sdk.h >&2
+             fail "umbrella is missing a member for '$member'"; }
+      grep -q "#include \"$member""_api.h\"" ./gen-optional/logos_sdk.h         || { cat ./gen-optional/logos_sdk.h >&2
+             fail "umbrella does not include the wrapper header for '$member'"; }
+    done
+    echo "OK: optional_dependencies get the same umbrella member as required ones"
+
     # ── `--binding origin`: the umbrella a module with no LogosAPI needs ──
     #
     # Emitter-level assertions live in the gtest suite; these are the ones only
@@ -147,6 +177,120 @@ pkgs.runCommand "${common.pname}-generator-cli-tests"
     [ "$status" -ne 0 ] || fail "--binding origin accepted metadata with no name"
     grep -q "asserted" anon.err       || { cat anon.err >&2; fail "the anonymous-origin refusal does not explain itself"; }
     echo "OK: --binding origin refuses a module that cannot name itself"
+
+    # ── --events-from names the CONTRACT, and a missing one is refused ────
+    #
+    # On the plugin path the wrapper's typed methods, records and event
+    # accessors all come out of the file this flag names. Shrugging off a
+    # missing one and introspecting instead would emit a wrapper that compiles
+    # and has lost every type — the same silently-empty shape
+    # generate-module-headers.sh exists to refuse, one layer down.
+    #
+    # No plugin is needed to assert it: the contract is loaded BEFORE the
+    # plugin is opened, so a missing sidecar is reported even for a plugin path
+    # that does not exist. The control below is what makes that meaningful —
+    # with a readable contract the SAME command gets as far as the plugin and
+    # fails on the plugin instead.
+    printf 'module cli_probe_module {\n  version "1.0.0"\n  method ping() -> tstr\n}\n' > probe.lidl
+
+    set +e
+    logos-cpp-generator ./nonexistent_plugin.dylib --module-only --api-style lp \
+      --events-from ./nonexistent.lidl --output-dir ./gen-nosidecar \
+      >nosidecar.out 2>nosidecar.err
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || fail "--events-from accepted a contract that does not exist"
+    grep -q -- '--events-from names a contract that does not exist' nosidecar.err \
+      || { cat nosidecar.err >&2; fail "a missing contract failed without saying why"; }
+    echo "OK: --events-from refuses a contract that does not exist"
+
+    set +e
+    logos-cpp-generator ./nonexistent_plugin.dylib --module-only --api-style lp \
+      --events-from ./probe.lidl --output-dir ./gen-sidecar \
+      >sidecar.out 2>sidecar.err
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || fail "control: a nonexistent plugin exited 0"
+    grep -q 'Plugin file does not exist' sidecar.err \
+      || { cat sidecar.err >&2; fail "control: a READABLE contract did not get as far as the plugin"; }
+    echo "OK: control — a readable contract is accepted and the run reaches the plugin"
+
+    # ── `--dep` flags decide the umbrella, not metadata.json ──────────────
+    #
+    # The two agree in every nix build, which is exactly why a disagreement has
+    # to be constructed to see which one is consulted. metadata.json names a
+    # dependency the flags do not, and vice versa: the flag's name must be the
+    # one with a member.
+    printf 'module flag_dep {\n  version "1.0.0"\n  method ping() -> tstr\n}\n' > flag_dep.lidl
+    cat > flagwins_metadata.json <<'EOF'
+    {
+      "name": "cli_flagwins_module",
+      "version": "1.0.0",
+      "type": "core",
+      "dependencies": ["metadata_only_dep"]
+    }
+    EOF
+
+    logos-cpp-generator --metadata ./flagwins_metadata.json --general-only \
+      --api-style qt --dep flag_dep=./flag_dep.lidl --output-dir ./gen-flagwins \
+      >/dev/null 2>flagwins.err \
+      || { cat flagwins.err >&2; fail "a --dep flag with a disagreeing metadata.json was refused"; }
+
+    grep -q 'flag_dep' ./gen-flagwins/logos_sdk.h \
+      || { cat ./gen-flagwins/logos_sdk.h >&2
+           fail "the umbrella has no member for the --dep flag's module"; }
+    grep -q 'metadata_only_dep' ./gen-flagwins/logos_sdk.h \
+      && { cat ./gen-flagwins/logos_sdk.h >&2
+           fail "the umbrella still took its members from metadata.json"; }
+    echo "OK: the --dep flags decide the umbrella when there are any"
+
+    # ── authored contracts normalize to the canonical serializer form ───
+    cat > authored.lidl <<'EOF'
+    ; formatting and comments are author concerns, not published bytes
+    module   canonical_probe{
+      version "3.2.1"
+      depends[dep_one,dep_two]
+      method ping( value:tstr)->tstr
+    }
+    EOF
+    cat > expected.lidl <<'EOF'
+    module canonical_probe {
+      version "3.2.1"
+      depends [dep_one, dep_two]
+
+      method ping(value: tstr) -> tstr
+    }
+    EOF
+
+    logos-cpp-generator --normalize-lidl authored.lidl -o normalized.lidl \
+      >/dev/null 2>normalize.err \
+      || { cat normalize.err >&2; fail "--normalize-lidl refused a valid authored contract"; }
+    cmp expected.lidl normalized.lidl \
+      || { diff -u expected.lidl normalized.lidl >&2
+           fail "--normalize-lidl did not use the canonical serializer"; }
+
+    logos-cpp-generator --normalize-lidl normalized.lidl -o normalized-again.lidl \
+      >/dev/null 2>normalize-again.err \
+      || { cat normalize-again.err >&2; fail "normalizing canonical LIDL failed"; }
+    cmp normalized.lidl normalized-again.lidl \
+      || fail "LIDL normalization is not byte-idempotent"
+    echo "OK: authored LIDL normalizes canonically and idempotently"
+
+    cat > authored-lidl-method.lidl <<'EOF'
+    module canonical_probe {
+      depends []
+      method lidl() -> tstr
+    }
+    EOF
+    set +e
+    logos-cpp-generator --normalize-lidl authored-lidl-method.lidl \
+      >reserved.out 2>reserved.err
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || fail "an authored lidl() method was accepted"
+    grep -q 'generator-owned' reserved.err \
+      || { cat reserved.err >&2; fail "authored lidl() failed without the ownership diagnostic"; }
+    echo "OK: lidl() is reserved for the canonical built-in"
 
     mkdir -p "$out"
     echo "logos-cpp-generator CLI argument-surface tests passed" > "$out/result.txt"

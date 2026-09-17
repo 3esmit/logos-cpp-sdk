@@ -770,7 +770,7 @@ static std::set<std::string> keepOnlyReferencedRecords(ModuleDecl& module)
 
     std::set<std::string> referenced;
     for (const MethodDecl& md : module.methods) {
-        mention(md.returnType, referenced);
+        if (md.returnType) mention(*md.returnType, referenced);
         for (const ParamDecl& pd : md.params) mention(pd.type, referenced);
     }
     for (const EventDecl& ed : module.events)
@@ -857,9 +857,13 @@ static bool parseMethodLine(const QString& line, MethodDecl& out,
         return false;
     out.name = methodName.toStdString();
     QString retTypeStr = stripDeclarationSpecifiers(prefix.left(nameStart).trimmed());
-    out.returnType = cppTypeToLidl(
-        retTypeStr, QString("%1 '%2': return type").arg(kind, methodName), retTypeStr,
-        QString(), /*nameEmitted=*/kind == "event");
+    if (retTypeStr == "void") {
+        out.returnType.reset();
+    } else {
+        out.returnType = cppTypeToLidl(
+            retTypeStr, QString("%1 '%2': return type").arg(kind, methodName), retTypeStr,
+            QString(), /*nameEmitted=*/kind == "event");
+    }
     // Flag methods whose impl returns LogosMap / LogosList so the generator
     // can emit nlohmann→Qt conversion code in the glue layer.
     out.jsonReturn = (retTypeStr == "LogosMap" || retTypeStr == "LogosList");
@@ -960,9 +964,14 @@ ImplParseResult parseImplHeader(const QString& headerPath,
         result.module.version = obj.value("version").toString().toStdString();
         result.module.description = obj.value("description").toString().toStdString();
         result.module.category = obj.value("category").toString().toStdString();
-        const QJsonArray deps = obj.value("dependencies").toArray();
-        for (const QString& depName : dependencyNames(deps))
+        // Two lists, kept apart all the way through. They differ in LIFETIME —
+        // an optional dependency is never auto-loaded and its absence is not an
+        // error — so a contract that merged them would hand the other side back
+        // a REQUIRED dependency.
+        for (const QString& depName : dependencyNames(obj.value("dependencies").toArray()))
             result.module.depends.push_back(depName.toStdString());
+        for (const QString& depName : dependencyNames(obj.value("optional_dependencies").toArray()))
+            result.module.optional_depends.push_back(depName.toStdString());
 
         // Events declared in metadata.json. Only READ here — their parameter
         // types are C++ spellings like any other, and typing them requires the
@@ -1267,7 +1276,15 @@ ImplParseResult parseImplHeader(const QString& headerPath,
                     // methods. Skip the reserved names regardless of access.
                     static const QSet<QString> reserved = {
                         "onContextReady", "modules", "modulePath",
-                        "instanceId", "instancePersistencePath"
+                        "instanceId", "instancePersistencePath",
+                        // Teardown plumbing, same rule as onContextReady: an
+                        // impl overriding aboutToUnload() (or calling
+                        // unloadFinished()) is talking to the framework, not
+                        // publishing API. Leaking either would generate a
+                        // consumer wrapper for a lifecycle hook, and
+                        // aboutToUnload's LogosShutdown return has no LIDL
+                        // type anyway.
+                        "aboutToUnload", "unloadFinished"
                     };
                     if (!reserved.contains(qs(md.name))) {
                         md.description = joinDocLines(pendingDoc).toStdString();

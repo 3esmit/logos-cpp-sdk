@@ -40,6 +40,76 @@ static QString qtToVariantExpr(const TypeExpr& te, const QString& expr);
 static QString qtFromVariantExpr(const TypeExpr& te, const QString& expr);
 static QString returnConversionFor(const TypeExpr& te, const QString& qt);
 
+// A field's `?T` as a TypeExpr, whichever of the two spellings the author used
+// (`? name: T` sets the flag and leaves the type T; `name: ?T` makes the type
+// an Optional). Building one shape here is what makes the two emit identical
+// code — the rule fieldIsOptional()/fieldValueType() exist to enforce.
+static TypeExpr fieldOptionalType(const FieldDecl& f)
+{
+    if (f.type.kind == TypeExpr::Optional) return f.type;
+    TypeExpr o;
+    o.kind = TypeExpr::Optional;
+    o.elements.push_back(f.type);
+    return o;
+}
+
+// Does this slot need a generator-emitted ELEMENT LOOP rather than a whole-value
+// QVariant hop?
+//
+// Two reasons a slot can need one, and they are now the same question:
+//   * it mentions a RECORD — a struct with no Q_DECLARE_METATYPE, so
+//     QVariant::fromValue of it is a blob nothing can read back;
+//   * its Qt spelling is a TYPED container or a std::optional —
+//     QList<qulonglong>, QMap<QString, QByteArray>, std::optional<QString> —
+//     which QVariant handles even worse than a record: qvariantToNlohmann
+//     matches a CLOSED userType() set and answers null for it, and
+//     qvariant_cast back yields an EMPTY container. Silently, both ways.
+//
+// QStringList, QVariantList and QVariantMap are NOT in this set: they are in
+// that closed set and cross whole, exactly as they always did.
+static bool holdsRecordType(const TypeExpr& te)
+{
+    return lidlIsRecord(te)
+        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
+        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
+}
+
+static bool needsElementLoop(const TypeExpr& te)
+{
+    return holdsRecordType(te) || lidlQtNeedsElementLoop(te);
+}
+
+// Does any slot in the contract materialise a std::optional on this surface?
+// Gates the generated `#include <optional>`, so a contract with no optional (or
+// one whose only optionals are `?any`) keeps its header byte-for-byte.
+static bool typeUsesStdOptional(const TypeExpr& te)
+{
+    if (te.kind == TypeExpr::Optional)
+        return lidlQtNeedsElementLoop(te)
+            || (!te.elements.empty() && typeUsesStdOptional(optionalValueType(te)));
+    for (const TypeExpr& e : te.elements)
+        if (typeUsesStdOptional(e)) return true;
+    return false;
+}
+
+static bool moduleUsesStdOptional(const ModuleDecl& m)
+{
+    for (const TypeDecl& t : m.types)
+        for (const FieldDecl& f : t.fields) {
+            // The field's EFFECTIVE type: the optional wrapper when either
+            // spelling makes it optional, the written type otherwise.
+            const TypeExpr eff = fieldIsOptional(f) ? fieldOptionalType(f) : f.type;
+            if (typeUsesStdOptional(eff)) return true;
+        }
+    for (const MethodDecl& md : m.methods) {
+        if (md.returnType && typeUsesStdOptional(*md.returnType)) return true;
+        for (const ParamDecl& p : md.params) if (typeUsesStdOptional(p.type)) return true;
+    }
+    for (const EventDecl& ed : m.events)
+        for (const ParamDecl& p : ed.params) if (typeUsesStdOptional(p.type)) return true;
+    return false;
+}
+
 static QString returnConversion(const QString& qt)
 {
     if (qt == "bool")        return "return _result.toBool();";
@@ -58,15 +128,14 @@ static QString returnConversion(const QString& qt)
     return "return _result;";
 }
 
-// Records (and containers holding them) decode through the generated
-// conversions; everything else keeps the historical QVariant accessor.
+// Records, containers holding them, and every TYPED container / optional decode
+// through a generated element loop; everything else keeps the historical
+// QVariant accessor. `[tstr]` and `[any]` stay on the accessor: QStringList and
+// QVariantList are QVariant-native, so `.toStringList()` / `.toList()` is both
+// correct and what shipped.
 static QString returnConversionFor(const TypeExpr& te, const QString& qt)
 {
-    const bool holdsRecord =
-        lidlIsRecord(te)
-        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
-        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
-    if (holdsRecord)
+    if (needsElementLoop(te))
         return "return " + qtFromVariantExpr(te, "_result") + ";";
     return returnConversion(qt);
 }
@@ -82,11 +151,7 @@ static QString returnConversionFor(const TypeExpr& te, const QString& qt)
 // the caller reached for.
 static QString asyncReturnConversionFor(const TypeExpr& te, const QString& qt)
 {
-    const bool holdsRecord =
-        lidlIsRecord(te)
-        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
-        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
-    if (holdsRecord)
+    if (needsElementLoop(te))
         return qtFromVariantExpr(te, "v");
     return "qvariant_cast<" + qt + ">(v)";
 }
@@ -123,20 +188,43 @@ static bool lidlIsRecord(const TypeExpr& te)
 }
 
 // value expression of the Qt type -> QVariant
+//
+// The loop is emitted whenever the surface type is not QVariant-native — for a
+// record (a struct with no metatype) and now equally for every TYPED container
+// and optional. `QVariant::fromValue(QList<qulonglong>)` is not a compile
+// error and not a runtime warning; it produces a QVariant that
+// qvariantToNlohmann answers `null` for, because that function matches a CLOSED
+// userType() set. So the whole value must never cross — only its elements, one
+// at a time, each of which IS in that set.
 static QString qtToVariantExpr(const TypeExpr& te, const QString& expr)
 {
     if (lidlIsRecord(te))
         return qs(te.name) + "ToVariant(" + expr + ")";
-    if (te.kind == TypeExpr::Array && te.elements.size() == 1
-        && (lidlIsRecord(te.elements[0]) || te.elements[0].kind != TypeExpr::Primitive)) {
-        return "[&]{ QVariantList __l; for (const auto& __e : " + expr + ") __l.append("
-             + qtToVariantExpr(te.elements[0], "__e") + "); return QVariant(__l); }()";
+    // THE SOURCE IS A LAMBDA PARAMETER, never a local bound inside the body.
+    // These loops nest — `[[uint]]` puts one inside another — and every level
+    // wants the same short names, so a body-local (or a range-for over a name
+    // the loop itself declares) would be self-referential: it compiles, and it
+    // reads uninitialised memory. An ARGUMENT is evaluated in the ENCLOSING
+    // scope, before the inner names exist.
+    if (te.kind == TypeExpr::Array && te.elements.size() == 1 && needsElementLoop(te)) {
+        return "[&](const auto& __c){ QVariantList __l; for (const auto& __e : __c) __l.append("
+             + qtToVariantExpr(te.elements[0], "__e") + "); return QVariant(__l); }("
+             + expr + ")";
     }
-    if (te.kind == TypeExpr::Map && te.elements.size() == 2
-        && (lidlIsRecord(te.elements[1]) || te.elements[1].kind != TypeExpr::Primitive)) {
-        return "[&]{ QVariantMap __m; for (auto __it = " + expr + ".begin(); __it != " + expr
-             + ".end(); ++__it) __m.insert(__it.key(), "
-             + qtToVariantExpr(te.elements[1], "__it.value()") + "); return QVariant(__m); }()";
+    if (te.kind == TypeExpr::Map && te.elements.size() == 2 && needsElementLoop(te)) {
+        return "[&](const auto& __c){ QVariantMap __m; for (auto __it = __c.begin(); "
+               "__it != __c.end(); ++__it) __m.insert(__it.key(), "
+             + qtToVariantExpr(te.elements[1], "__it.value()") + "); return QVariant(__m); }("
+             + expr + ")";
+    }
+    // `?T` -> std::optional<T>: EMPTY is the invalid QVariant, which is Qt's
+    // single empty inhabitant and what the wire's `null` becomes. `?any` never
+    // reaches here (it is still spelled QVariant, so needsElementLoop is false)
+    // and rides the fromValue below unchanged.
+    if (te.kind == TypeExpr::Optional && needsElementLoop(te)) {
+        const TypeExpr& v = optionalValueType(te);
+        return "[&](const auto& __c){ return __c.has_value() ? " + qtToVariantExpr(v, "*__c")
+             + " : QVariant(); }(" + expr + ")";
     }
     return "QVariant::fromValue(" + expr + ")";
 }
@@ -155,16 +243,29 @@ static QString qtFromVariantExpr(const TypeExpr& te, const QString& expr)
         if (n == "float64") return expr + ".toDouble()";
         if (n == "bool")    return expr + ".toBool()";
     }
+    // Source as a lambda PARAMETER, for the reason given on the encode side.
     if (te.kind == TypeExpr::Array && te.elements.size() == 1) {
         const TypeExpr& e = te.elements[0];
-        return "[&]{ " + lidlTypeToQt(te) + " __acc; for (const QVariant& __e : " + expr
-             + ".toList()) __acc.append(" + qtFromVariantExpr(e, "__e") + "); return __acc; }()";
+        return "[&](const QVariant& __s){ " + lidlTypeToQt(te)
+             + " __acc; for (const QVariant& __e : __s.toList()) __acc.append("
+             + qtFromVariantExpr(e, "__e") + "); return __acc; }(" + expr + ")";
     }
     if (te.kind == TypeExpr::Map && te.elements.size() == 2) {
         const TypeExpr& v = te.elements[1];
-        return "[&]{ " + lidlTypeToQt(te) + " __acc; const QVariantMap __mm = " + expr
-             + ".toMap(); for (auto __it = __mm.begin(); __it != __mm.end(); ++__it) __acc.insert("
-             + "__it.key(), " + qtFromVariantExpr(v, "__it.value()") + "); return __acc; }()";
+        return "[&](const QVariant& __s){ " + lidlTypeToQt(te)
+             + " __acc; const QVariantMap __mm = __s.toMap(); "
+               "for (auto __it = __mm.begin(); __it != __mm.end(); ++__it) __acc.insert("
+             + "__it.key(), " + qtFromVariantExpr(v, "__it.value()") + "); return __acc; }("
+             + expr + ")";
+    }
+    // `?T`: an invalid (or null) QVariant is the empty state — absent and
+    // explicit-null are the SAME state, as the two-state rule requires — and
+    // anything else is a present T decoded by this same table.
+    if (te.kind == TypeExpr::Optional && needsElementLoop(te)) {
+        const TypeExpr& v = optionalValueType(te);
+        const QString opt = lidlTypeToQt(te);
+        return "[&](const QVariant& __s){ if (!__s.isValid() || __s.isNull()) return " + opt
+             + "(); return " + opt + "(" + qtFromVariantExpr(v, "__s") + "); }(" + expr + ")";
     }
     return expr;
 }
@@ -173,23 +274,27 @@ static QString qtFromVariantExpr(const TypeExpr& te, const QString& expr)
 // else goes through unchanged (packVariantList wraps with QVariant::fromValue).
 static QString qtArgExpr(const TypeExpr& te, const QString& name)
 {
-    const bool holdsRecord =
-        lidlIsRecord(te)
-        || (te.kind == TypeExpr::Array && te.elements.size() == 1 && lidlIsRecord(te.elements[0]))
-        || (te.kind == TypeExpr::Map && te.elements.size() == 2 && lidlIsRecord(te.elements[1]));
-    return holdsRecord ? qtToVariantExpr(te, name) : name;
+    return needsElementLoop(te) ? qtToVariantExpr(te, name) : name;
 }
 
 // A record field's Qt type, honouring BOTH optionality spellings.
 //
-// `?T` is QVariant on the Qt surface — Qt has no optional template, and an
-// invalid QVariant is its single empty inhabitant. The point of routing through
-// fieldIsOptional() is that `? name: T` and `name: ?T` are the same declaration:
-// reading `f.type` alone made the flag spelling emit a bare `T` (which cannot be
-// empty at all) while the type spelling emitted QVariant, from one contract.
+// `?T` is std::optional<T>, the same answer every other slot gets — a Qt
+// consumer's `Profile.nickname` is now a std::optional<QString> rather than a
+// QVariant it has to guess the payload type of, which is what the std surface
+// next door has always given (Codec<std::optional<T>>). `?any` stays QVariant:
+// `any` is the one row the widened table keeps untyped, and QVariant already
+// has exactly one empty inhabitant, so wrapping it would spell EMPTY twice and
+// make a two-state slot three-state.
+//
+// Routing through fieldIsOptional()/fieldOptionalType() is what makes the two
+// spellings identical: reading `f.type` alone made the flag spelling emit a
+// bare `T` (which cannot be empty at all) while the type spelling emitted an
+// optional, from one contract.
 static QString lidlFieldTypeQt(const FieldDecl& f)
 {
-    return fieldIsOptional(f) ? QString("QVariant") : lidlTypeToQt(f.type);
+    return fieldIsOptional(f) ? lidlTypeToQt(fieldOptionalType(f))
+                              : lidlTypeToQt(f.type);
 }
 
 static void emitRecords(QTextStream& s, const ModuleDecl& module)
@@ -211,10 +316,23 @@ static void emitRecords(QTextStream& s, const ModuleDecl& module)
         for (const FieldDecl& f : t.fields) {
             if (fieldIsOptional(f)) {
                 // A record field is a NAMED slot: empty is spelled by OMITTING
-                // the key, not by inserting an invalid QVariant. Same rule the
+                // the key, not by inserting an empty value. Same rule the
                 // cdylib record codec follows, on the other surface.
-                s << "    if (v." << qs(f.name) << ".isValid())\n";
-                s << "        __m.insert(\"" << qs(f.name) << "\", v." << qs(f.name) << ");\n";
+                //
+                // The emptiness TEST follows the field's own spelling —
+                // `.has_value()` for a std::optional, `.isValid()` for the
+                // `?any` slot that stays a QVariant — because those are the two
+                // types this surface can produce for an optional field.
+                const QString fv = "v." + qs(f.name);
+                const TypeExpr ot = fieldOptionalType(f);
+                if (lidlQtNeedsElementLoop(ot)) {
+                    s << "    if (" << fv << ".has_value())\n";
+                    s << "        __m.insert(\"" << qs(f.name) << "\", "
+                      << qtToVariantExpr(fieldValueType(f), "*" + fv) << ");\n";
+                } else {
+                    s << "    if (" << fv << ".isValid())\n";
+                    s << "        __m.insert(\"" << qs(f.name) << "\", " << fv << ");\n";
+                }
                 continue;
             }
             s << "    __m.insert(\"" << qs(f.name) << "\", "
@@ -228,10 +346,14 @@ static void emitRecords(QTextStream& s, const ModuleDecl& module)
         for (const FieldDecl& f : t.fields) {
             if (fieldIsOptional(f)) {
                 // Absent and null both arrive as an invalid QVariant — the same
-                // state, as the contract requires. Converting (`.toString()` on
-                // a flag-optional `tstr`) would have turned "empty" into "",
-                // which is a VALUE.
-                s << "    __out." << qs(f.name) << " = __m.value(\"" << qs(f.name) << "\");\n";
+                // state, as the contract requires — and the optional decode
+                // below turns exactly that into the empty optional. A bare
+                // conversion (`.toString()` on a flag-optional `tstr`) would
+                // have turned "empty" into "", which is a VALUE.
+                s << "    __out." << qs(f.name) << " = "
+                  << qtFromVariantExpr(fieldOptionalType(f),
+                                       "__m.value(\"" + qs(f.name) + "\")")
+                  << ";\n";
                 continue;
             }
             s << "    __out." << qs(f.name) << " = "
@@ -260,6 +382,7 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "#include <QVariantMap>\n";
     s << "#include <functional>\n";
     s << "#include <utility>\n";
+    if (moduleUsesStdOptional(module)) s << "#include <optional>\n";
     s << "#include \"logos_types.h\"\n";
     s << "#include \"logos_api.h\"\n";
     s << "#include \"logos_api_client.h\"\n";
@@ -282,7 +405,7 @@ QString lidlMakeHeader(const ModuleDecl& module, BindMode bindMode)
     s << "    bool on(const QString& eventName, EventCallback callback);\n";
 
     for (const MethodDecl& md : module.methods) {
-        QString ret = lidlTypeToQt(md.returnType);
+        QString ret = md.returnType ? lidlTypeToQt(*md.returnType) : QStringLiteral("void");
         s << "    " << ret << " " << md.name << "(";
         for (int i = 0; i < md.params.size(); ++i) {
             emitParam(s, lidlTypeToQt(md.params[i].type), md.params[i].name);
@@ -415,7 +538,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
 
 
     for (const MethodDecl& md : module.methods) {
-        QString ret = lidlTypeToQt(md.returnType);
+        QString ret = md.returnType ? lidlTypeToQt(*md.returnType) : QStringLiteral("void");
         int nParams = md.params.size();
 
         s << ret << " " << className << "::" << md.name << "(";
@@ -452,7 +575,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
           << ": remote call failed:\" << QString::fromStdString(_err.message);\n";
 
         if (ret != "void")
-            s << "    " << returnConversionFor(md.returnType, ret) << "\n";
+            s << "    " << returnConversionFor(*md.returnType, ret) << "\n";
         s << "}\n\n";
 
         // Shared between the two async entry points so they cannot drift in how
@@ -478,7 +601,7 @@ QString lidlMakeSource(const ModuleDecl& module, BindMode bindMode)
         auto asyncDecodeExpr = [&](const QString& var) -> QString {
             if (ret == "void") return QString();
             if (ret == "QVariant") return var;
-            return var + ".isValid() ? " + asyncReturnConversionFor(md.returnType, ret)
+            return var + ".isValid() ? " + asyncReturnConversionFor(*md.returnType, ret)
                  + " : " + asyncDefaultVal(ret);
         };
 
@@ -537,6 +660,14 @@ QString lidlGenerateMetadataJson(const ModuleDecl& module)
     for (const std::string& d : module.depends)
         deps.append(qs(d));
     obj["dependencies"] = deps;
+    // Emitted only when there are any, so a contract carrying none produces the
+    // same metadata.json it always did.
+    if (!module.optional_depends.empty()) {
+        QJsonArray optionalDeps;
+        for (const std::string& d : module.optional_depends)
+            optionalDeps.append(qs(d));
+        obj["optional_dependencies"] = optionalDeps;
+    }
     QJsonDocument doc(obj);
     return doc.toJson(QJsonDocument::Indented);
 }

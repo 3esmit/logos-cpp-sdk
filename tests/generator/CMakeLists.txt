@@ -18,6 +18,10 @@ add_executable(generator_tests
     test_make_umbrella.cpp
     test_records.cpp
     test_async_result.cpp
+    # The lp emitter's EVENT surface, which had no coverage at all: every other
+    # generator test passes methods and no events. Pins the SubHandle return and
+    # the per-module (not per-event) subscription state surface.
+    test_lp_event_options.cpp
     test_optional_spellings.cpp
 )
 

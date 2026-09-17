@@ -2,7 +2,7 @@
 
 ## Overall Description
 
-The experimental code generator extends `logos-cpp-generator` with two new capabilities: a lightweight Interface Definition Language (LIDL) for declaring module contracts, and a C++header parser that can infer module interfaces directly from pure C++ implementation classes. Both paths produce the same output: the **Qt-free** `logos_module_*` C-ABI provider glue that bridges pure C++ module implementations to the runtime. (It used to emit the Qt plugin glue directly; turning the C ABI into a Qt plugin is now a downstream step, `logos-qt-host-generator --backend cdylib` in logos-plugin-qt, and that seam is what lets the Rust and JS providers target the same ABI.)
+The experimental code generator extends `logos-cpp-generator` with a lightweight Interface Definition Language (LIDL) for declaring module contracts, a C++ header parser that can infer module interfaces directly from pure C++ implementation classes, and a normalization mode for authored contracts. Both authoring paths converge on the same validated AST and canonical serializer before producing the **Qt-free** `logos_module_*` C-ABI provider glue that bridges pure C++ module implementations to the runtime. (It used to emit the Qt plugin glue directly; turning the C ABI into a Qt plugin is now a downstream step, `logos-qt-host-generator --backend cdylib` in logos-plugin-qt, and that seam is what lets the Rust and JS providers target the same ABI.)
 
 The goal is to decouple module business logic from the Qt framework. Module authors write standard C++ using `std::string`, `int64_t`, `std::vector<T>`, and the build system generates all Qt boilerplate (`QObject`, `Q_PLUGIN_METADATA`, `QString` conversions, method dispatch) automatically.
 
@@ -58,6 +58,12 @@ logos-lidl with the rest of the frontend, behind `lidl::parse`.)
 
 Both paths converge at `ModuleDecl`, the shared AST. From there, the same generation functions produce identical output regardless of the input format.
 
+`logos-cpp-generator --normalize-lidl <file> [-o <file>]` exposes the shared
+parse → validate → serialize pass directly. Module-builder uses it for authored
+contracts before publishing `.#lidl`, embedding `lidl()`, or staging
+`share/logos/<name>.lidl`; formatting and comments from the source therefore do
+not leak into any external representation.
+
 ### LIDL Language
 
 LIDL is a minimal interface definition language. A module declaration contains metadata, type definitions, method signatures, and event signatures:
@@ -101,7 +107,6 @@ Built-in primitive types:
 | `bool`    | Boolean                                 | `bool`        | `bool`                 |
 | `result`  | Structured result (success/value/error) | `LogosResult` | `LogosResult`          |
 | `any`     | Untyped value                           | `QVariant`    | `QVariant`             |
-| `void`    | No return value                         | `void`        | `void`                 |
 
 
 Composite types:
@@ -125,7 +130,7 @@ The `--from-header` mode parses a C++implementation header to extract public met
 | `int64_t`                            | `int`                                                              |
 | `uint64_t`                           | `uint`                                                             |
 | `double`                             | `float64`                                                          |
-| `void`                               | `void`                                                             |
+| `void`                               | no return clause                                                    |
 | `std::vector<std::string>`           | `[tstr]`                                                           |
 | `std::vector<uint8_t>`               | `bstr`                                                             |
 | `std::vector<int64_t>`               | `[int]`                                                            |
@@ -279,7 +284,7 @@ logos_events:                                     // expands to `public:`; recog
 
    (Was a `<name>_qt_glue.h` lambda forwarding to `LogosProviderBase::emitEvent(QString, QVariantList)`; that glue is the retired shape described under *Generated Output* below.)
 
-3. **`<name>.lidl` sidecar** — a serialised view of the module's declared events (using `lidlSerialize`, which since the frontend extraction is `lidl::serialize` in the logos-lidl library, re-exported by `experimental/lidl_compat.h`; the `lidl_serializer.cpp` that used to hold it is gone from this repo):
+3. **`<name>.lidl` sidecar** — the canonical serialization of the module's authored interface (using `lidlSerialize`, which since the frontend extraction is `lidl::serialize` in the logos-lidl library, re-exported by `experimental/lidl_compat.h`; the `lidl_serializer.cpp` that used to hold it is gone from this repo):
 
    ```
    module my_module {
@@ -288,7 +293,12 @@ logos_events:                                     // expands to `public:`; recog
    }
    ```
 
-   `buildPlugin.nix` ships this at `$out/share/logos/<name>.lidl`. `buildHeaders.nix` passes it to the consumer-side codegen via `--events-from`, which adds typed `on<EventName>(callback)` accessors to the generated `<Module>` wrapper (one per declared event, callback-arg types respect `--api-style`).
+   `buildPlugin.nix` ships this at `$out/share/logos/<name>.lidl`; `nix-bundle-lgx` maps that to root-level `assets/lidl/<name>.lidl`. `buildHeaders.nix` passes it to the consumer-side codegen via `--events-from`, and it is the whole CONTRACT, not only the events: the generated `<Module>` wrapper takes its typed methods, its record structs and its typed `on<EventName>(callback)` accessors from this one file (callback-arg and signature types respect `--api-style`). The generated `lidl() -> tstr` built-in returns these exact bytes. Only a module that ships no contract is described instead by its compiled plugin's `QMetaObject`.
+
+   The built-ins `name()`, `version()`, and `lidl()` are injected only for code
+   emission and introspection; `derived` methods are omitted by the serializer.
+   Consequently the document describes the authored API and does not contain a
+   recursive `lidl()` declaration. Authors may not declare `lidl()` themselves.
 
 Module metadata (name, version, description, dependencies) still comes from `metadata.json`, not from the header.
 
@@ -370,8 +380,8 @@ of the embedded copy that was deleted.
 
 1. **Lexer** — tokenizes source into keywords, identifiers, string literals, symbols (internal to `lidl::parse`)
 2. **Parser** (`lidlParse` → `lidl::parse`) — recursive descent parser producing a `ModuleDecl` AST
-3. **Validator** (`lidlValidate` → `lidl::validate`) — checks for duplicate names, unknown type references, builtin shadowing, duplicate parameters
-4. **Serializer** (`lidlSerialize` → `lidl::serialize`) — pretty-prints a `ModuleDecl` back to LIDL text (useful for roundtrip testing)
+3. **Validator** (`lidlValidate` → `lidl::validate`) — checks for duplicate names, unknown type references, builtin shadowing, and duplicate parameters; no-return is represented by an absent return clause rather than a type
+4. **Serializer** (`lidlSerialize` → `lidl::serialize`) — emits the canonical LIDL document. `--normalize-lidl` exposes this full pipeline for authored files; serialization is byte-idempotent
 
 ### Impl Header Pipeline
 
@@ -391,4 +401,3 @@ Conversion helpers are only emitted when needed:
 
 - **String vector helpers** (`lidlToQStringList`, `lidlToStdStringVector`) — emitted when the module uses `[tstr]` parameters or return types
 - **nlohmann→Qt helper** (`nlohmannToQVariant`) — emitted when any method has `jsonReturn = true` (i.e., the impl returns `LogosMap` or `LogosList`). This recursive function converts `nlohmann::json` objects, arrays, strings, numbers, and booleans to their `QVariant` equivalents.
-

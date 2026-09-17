@@ -74,35 +74,39 @@ sections:
       > this checkout's `HEAD` (see `run.sh`); in CI it is the commit being
       > tested. With no pin it falls back to latest `master`.
 
-      > **Why the `logos-qt-sdk/logos-lidl` overrides.** This SDK installs
+      > **Why the `logos-qt-sdk` and `logos-qt-sdk/logos-lidl` overrides.** This SDK installs
       > `share/lidl-frontend/lidl_compat.h`, and `logos-qt-sdk`'s
       > `logos-qt-generator` *compiles* that header against **its own**
       > `logos-lidl` input. `logos-lidl` is a **sibling** of `logos-cpp-sdk`
       > under `logos-qt-sdk`, not a descendant, so overriding the SDK moves the
-      > header forward while qt-sdk keeps its older lidl — and the generator
-      > fails to compile the shim. Each `logos-qt-sdk` node that ends up on the
-      > SDK under test therefore needs its `logos-lidl` moved with it.
+      > header forward while a locked qt-sdk can keep both its older generator
+      > and older lidl. Each `logos-qt-sdk` node therefore needs to move to the
+      > compatible generator revision, with its `logos-lidl` moved alongside it.
     steps:
       - title: "Build the CLI with the SDK override"
         run: |
           nix build 'github:logos-co/logos-logoscore-cli{release}' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
-            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-liblogos/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
             --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
             --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
             --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli' \
             --override-input logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
-            --override-input logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-liblogos/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-liblogos/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
             --override-input logos-liblogos/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --override-input logos-capability-module/logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-capability-module/logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
             --override-input logos-capability-module/logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
+            --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
             --override-input logos-capability-module/logos-module-builder/logos-test-framework/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             --out-link ./logos
         check_file: "logos/bin/logoscore"
@@ -157,6 +161,7 @@ sections:
           nix build 'path:./logos-accounts-module#lgx' \
             --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
             --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o accounts-lgx
         code_block: |
@@ -164,6 +169,7 @@ sections:
           #   nix build '.#lgx' --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk'
           nix build 'path:./logos-accounts-module#lgx' \
             --override-input logos-module-builder/logos-cpp-sdk 'github:logos-co/logos-cpp-sdk' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
             --override-input logos-module-builder/logos-qt-sdk/logos-lidl 'github:logos-co/logos-lidl' \
             -o accounts-lgx
         post_text: "The `.lgx` package is now under `./accounts-lgx/`:"

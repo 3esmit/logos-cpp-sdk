@@ -46,3 +46,12 @@ jobs:
         run: ./result/bin/experimental_tests
         env:
           FIXTURES_DIR: ./result/fixtures
+
+      # The module-impl C ABI: does the cdylib backend still DEFINE every
+      # export logos-protocol DECLARES? Not implied by `.#tests` above — the
+      # gtest suite never leaves the generator's internals — and not catchable
+      # downstream either: a module missing an export links clean and dies at
+      # dlopen(). Runs here, on Linux, where that would actually happen.
+      # --no-link so the `result` symlink the steps above use is left alone.
+      - name: Check the module-impl C ABI is fully defined
+        run: nix build --no-link '.#checks.x86_64-linux.module-impl-abi'

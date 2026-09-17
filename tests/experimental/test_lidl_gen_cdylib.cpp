@@ -280,8 +280,8 @@ TEST(LidlGenCdylib, NonStringMapKeyIsRejected)
 }
 
 // A record the contract declares is admitted and spelled as its struct; an
-// UNDECLARED Named type is not. `void` is the reason that distinction has to
-// exist — it is not a LIDL builtin, so `-> void` arrives as Named("void").
+// UNDECLARED Named type is not. No-return is structural and never reaches this
+// record-name path.
 TEST(LidlGenCdylib, OnlyDeclaredRecordsAreRecords)
 {
     ModuleDecl m;
@@ -531,12 +531,37 @@ TEST(LidlGenCdylib, WrongArgumentCountReportsInvalidArgs)
     EXPECT_TRUE(src.contains("return lidlStrdup(err.dump());")) << src.toStdString();
     // The silent reply is gone from the arity path.
     EXPECT_FALSE(src.contains("if (args.size() < 2) return nullptr;")) << src.toStdString();
-    EXPECT_FALSE(src.contains("args.size() > ")) << src.toStdString();
+    // ...and the count is bounded on BOTH sides. An extra argument used to be
+    // dropped and the call to succeed. With no optional parameters the two
+    // bounds coincide, so the message stays the plain "expected 2".
+    EXPECT_TRUE(src.contains("if (args.size() > 2) {")) << src.toStdString();
+    EXPECT_FALSE(src.contains("expected at most 2 arguments")) << src.toStdString();
+}
+
+// A trailing optional makes the accepted arity a RANGE, and the upper bound is
+// the declared parameter count, not the required one — otherwise supplying the
+// optional would be rejected as an overflow.
+TEST(LidlGenCdylib, OptionalArgumentWidensTheUpperBound)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.methods.push_back(method("f", prim("tstr"),
+                               {param("required", prim("tstr")),
+                                param("maybe", opt(prim("tstr")))}));
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("if (args.size() < 1) {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (args.size() > 2) {")) << src.toStdString();
+    // The two bounds differ, so the message says so rather than claiming an
+    // exact count the method does not require.
+    EXPECT_TRUE(src.contains("\"expected at most 2 arguments, got \"")) << src.toStdString();
 }
 
 // `args.size()` is unsigned, so `< 0` never fires: a zero-argument method
-// carried a dead branch. The Rust generator has always skipped it; now both do.
-TEST(LidlGenCdylib, ZeroArgumentMethodEmitsNoArityGate)
+// carries no LOWER gate. It does carry an upper one. This test used to assert
+// the arm emitted no `invalid_args` at all, which is precisely the defect --
+// `ping("junk")` dropped the argument and answered normally.
+TEST(LidlGenCdylib, ZeroArgumentMethodStillRejectsExtraArguments)
 {
     ModuleDecl m;
     m.name = "o_module";
@@ -544,8 +569,29 @@ TEST(LidlGenCdylib, ZeroArgumentMethodEmitsNoArityGate)
 
     const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
     EXPECT_FALSE(src.contains("args.size() < 0")) << src.toStdString();
-    EXPECT_FALSE(src.contains("invalid_args")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (args.size() > 0) {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("{\"code\", \"invalid_args\"}")) << src.toStdString();
     EXPECT_TRUE(src.contains("lidlImpl().ping()")) << src.toStdString();
+}
+
+// The generated identity dispatch (name/version) is answered by the generator
+// itself and returns BEFORE any impl call, so it needs the bound to sit above
+// the `derived` branch. `version("junk")` answering "1.0.0" with status ok was
+// worse than answering nothing: a correct-looking reply to a refused call.
+TEST(LidlGenCdylib, DerivedIdentityMethodRejectsExtraArguments)
+{
+    ModuleDecl m;
+    m.name = "o_module";
+    m.version = "2.3.4";
+    MethodDecl v = method("version", prim("tstr"), {});
+    v.derived = true;
+    m.methods.push_back(v);
+
+    const QString src = lidlMakeModuleImplExports(m, "OImpl", "o_impl.h");
+    EXPECT_TRUE(src.contains("if (args.size() > 0) {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("{\"code\", \"invalid_args\"}")) << src.toStdString();
+    // The literal is still answered for a well-formed call.
+    EXPECT_TRUE(src.contains("std::string(\"2.3.4\")")) << src.toStdString();
 }
 
 // R4. Optional widens the accepted domain by exactly ONE inhabitant (empty); a
@@ -693,4 +739,369 @@ TEST(LidlGenCdylib, GrantExportIsEmittedForEveryModuleNotJustPrivilegedOnes)
     const QString src = lidlMakeModuleImplExports(plain, "PlainImpl", "plain_impl.h");
 
     EXPECT_TRUE(src.contains("logos_module_grant_host_services")) << src.toStdString();
+}
+
+// --- Module identity ---------------------------------------------------------
+//
+// name()/version()/lidl() are injected into the contract by the frontend
+// (lidl/identity.hpp) and marked `derived`. The dispatch must answer them from
+// the module DECLARATION -- the impl class has no such member, so delegating
+// would not compile, and reading anything else would let the reported value
+// drift from the metadata the module was built with.
+
+namespace {
+
+ModuleDecl moduleWithIdentity(const char* name, const char* version)
+{
+    ModuleDecl m;
+    m.name = name;
+    m.version = version;
+    lidl::injectIdentityMethods(m);
+    return m;
+}
+
+QString implExportsFor(const ModuleDecl& m)
+{
+    return lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+}
+
+} // namespace
+
+TEST(LidlGenCdylib, IdentityMethodsAnswerFromTheModuleDeclaration)
+{
+    const QString src = implExportsFor(moduleWithIdentity("weather_module", "2.4.1"));
+
+    // The literal is the module's OWN version, not a default. A generator that
+    // fell back to "1.0.0" here would be indistinguishable from a correct one
+    // on the many modules that happen to be at 1.0.0.
+    EXPECT_TRUE(src.contains("if (m == \"name\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("std::string(\"weather_module\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (m == \"version\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("std::string(\"2.4.1\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("if (m == \"lidl\")")) << src.toStdString();
+
+    // ...and never through the impl class, which has no such member.
+    EXPECT_FALSE(src.contains("lidlImpl().name(")) << src.toStdString();
+    EXPECT_FALSE(src.contains("lidlImpl().version(")) << src.toStdString();
+    EXPECT_FALSE(src.contains("lidlImpl().lidl(")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, LidlMethodAnswersTheCanonicalDocument)
+{
+    ModuleDecl m = moduleWithIdentity("weather_module", "2.4.1");
+    const QString document = QStringLiteral(
+        "module weather_module {\n"
+        "  version \"2.4.1\"\n"
+        "  depends []\n"
+        "}\n");
+    const QString src = lidlMakeModuleImplExports(
+        m, "SomeImpl", "some_impl.h", document);
+
+    EXPECT_TRUE(src.contains("if (m == \"lidl\")")) << src.toStdString();
+    EXPECT_TRUE(src.contains("module weather_module {")) << src.toStdString();
+    EXPECT_TRUE(src.contains("version \\\"2.4.1\\\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("depends []")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, IdentityMethodsAreListedForIntrospection)
+{
+    // `lm methods` and every untyped caller read this listing, so an identity
+    // method that dispatches but is not advertised is only half present.
+    const QString src = implExportsFor(moduleWithIdentity("weather_module", "2.4.1"));
+    EXPECT_TRUE(src.contains("obj[\"name\"] = \"name\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"name\"] = \"version\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"name\"] = \"lidl\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"signature\"] = \"name()\"")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, AnAuthorsOwnIdentityMethodStillReachesTheImpl)
+{
+    // A module MAY implement name() itself (logos-delivery-module does). It is
+    // then not `derived`, so it must dispatch like any other author method --
+    // silently shadowing it with a generated literal would change behaviour.
+    ModuleDecl m;
+    m.name = "delivery_module";
+    m.version = "1.0.0";
+    MethodDecl mine;
+    mine.name = "name";
+    mine.returnType = prim("tstr");
+    m.methods.push_back(mine);
+    lidl::injectIdentityMethods(m);
+
+    const QString src = implExportsFor(m);
+    EXPECT_TRUE(src.contains("lidlImpl().name(")) << src.toStdString();
+    EXPECT_FALSE(src.contains("std::string(\"delivery_module\")")) << src.toStdString();
+    // version() was still injected, and is still generated.
+    EXPECT_TRUE(src.contains("std::string(\"1.0.0\")")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, AVersionlessModuleFallsBackRatherThanEmittingEmpty)
+{
+    // A ModuleDecl with no version reaches here from a synthetic/interface
+    // contract. Emitting "" would make version() answer the empty string,
+    // which reads as a failure rather than as "unversioned".
+    ModuleDecl m;
+    m.name = "bare_module";
+    lidl::injectIdentityMethods(m);
+    EXPECT_TRUE(implExportsFor(m).contains("std::string(\"1.0.0\")"))
+        << implExportsFor(m).toStdString();
+}
+
+// --- Teardown exports --------------------------------------------------------
+//
+// The module ABI's unload pair is OPTIONAL by construction: the glue is
+// generated alongside the module, so a cdylib built before this existed emits
+// neither symbol and its consumer emits no calls. These pin what a module built
+// WITH it looks like.
+
+TEST(LidlGenCdylib, EmitsTheOptionalTeardownExports)
+{
+    ModuleDecl m;
+    m.name = "weather_module";
+    m.version = "1.0.0";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("int logos_module_about_to_unload(void)")) << src.toStdString();
+    EXPECT_TRUE(src.contains("void logos_module_set_unload_done_callback(")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, InstallsTheCompletionCallbackBeforeAskingTheImpl)
+{
+    // Ordering is the whole correctness of the async path. An impl that
+    // finishes INLINE -- does its work and calls unloadFinished() before
+    // returning Asynchronous -- would otherwise signal into a slot that is
+    // still empty, and the host would wait out its entire grace period for a
+    // module that was already done.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    const int install = src.indexOf("maybeSetUnloadFinished");
+    const int ask     = src.indexOf("maybeAboutToUnload");
+    ASSERT_GE(install, 0) << src.toStdString();
+    ASSERT_GE(ask, 0) << src.toStdString();
+    EXPECT_LT(install, ask) << "completion callback installed after the unload request";
+}
+
+TEST(LidlGenCdylib, TeardownEmissionIsGuardedOnTheProtocolThatCarriesIt)
+{
+    // The teardown pair arrived in logos-protocol 0.5. A module built against
+    // an older protocol has neither the callback typedef nor the two
+    // declarations, so unguarded emission is a hard compile error in generated
+    // code the author never wrote and cannot see -- which is exactly what
+    // happened before this guard existed. Same shape as the 0.3 trust-root
+    // guard a few lines below it in the emitter.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("LOGOS_PROTOCOL_VERSION_MINOR >= 5")) << src.toStdString();
+
+    // Both the statics and the exports must sit inside a guard: the typedef is
+    // what is missing on an older header, and it is named by the statics.
+    EXPECT_EQ(src.count("LOGOS_PROTOCOL_VERSION_MINOR >= 5"), 2) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, TeardownGoesThroughTheSfinaeHelpersNotTheImplDirectly)
+{
+    // An impl that never inherited LogosModuleContext has no hook at all. The
+    // helpers resolve that to Synchronous at compile time; calling the impl
+    // directly would simply not compile for those modules.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("_logos_codegen_::maybeAboutToUnload(lidlImpl())"))
+        << src.toStdString();
+    EXPECT_FALSE(src.contains("lidlImpl().aboutToUnload(")) << src.toStdString();
+}
+
+// ── The caller of a dispatch (protocol 0.6) ────────────────────────────────
+//
+// logos_module_set_call_caller() carries WHO is calling into the module image
+// for the duration of one dispatch. It has to cross the C ABI rather than being
+// a thread_local the host sets, for the same measured reason the grant does:
+// the host binary and the module plugin each link their own logos-protocol, so
+// each has its own copy of the object a naive implementation would write.
+//
+// These land BEFORE the protocol bump that declares the symbol. At the current
+// pin the guard below is false and nothing is emitted — the assertions here are
+// on the emitter's TEXT, which is exactly the thing that is version-independent.
+
+TEST(LidlGenCdylib, EmitsTheCallCallerExport)
+{
+    ModuleDecl m;
+    m.name = "weather_module";
+    m.version = "1.0.0";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("void logos_module_set_call_caller(const char* caller_json)"))
+        << src.toStdString();
+}
+
+TEST(LidlGenCdylib, CallCallerEmissionIsGuardedOnTheProtocolThatCarriesIt)
+{
+    // 0.6. Unguarded emission is a hard compile error against an older
+    // logos-protocol, in generated code the author never wrote — which is what
+    // happened at 0.3 and again at 0.5 before those guards existed.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("LOGOS_PROTOCOL_VERSION_MINOR >= 6")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, TheCallCallerGuardIsMajorAwareNotMinorOnly)
+{
+    // A MINOR-only guard goes FALSE at 1.0, because the MINOR resets to 0 —
+    // and does so silently, since the generated call is guarded the same way
+    // and vanishes with the definition. Nothing links wrong and nothing fails
+    // to load; modules just quietly stop being able to name their caller.
+    //
+    // checks.module-impl-abi's next-MAJOR probe is the other half of this;
+    // this test is the one that names the surface.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    const int guard = src.indexOf("LOGOS_PROTOCOL_VERSION_MINOR >= 6");
+    ASSERT_GE(guard, 0) << src.toStdString();
+
+    // The whole conditional, spelled with the arithmetic expanded. Expanded and
+    // not behind a function-like macro because unifdef has to evaluate it: the
+    // ABI check resolves this text with -D flags and treats an expression it
+    // cannot evaluate as "not conditional at all".
+    EXPECT_TRUE(src.contains(
+        "#if defined(LOGOS_PROTOCOL_VERSION_MINOR) && "
+        "(LOGOS_PROTOCOL_VERSION_MAJOR > 0 || "
+        "(LOGOS_PROTOCOL_VERSION_MAJOR == 0 && "
+        "LOGOS_PROTOCOL_VERSION_MINOR >= 6))\n")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, TheCallCallerExportDelegatesToTheSdkHeaderNotInlineLogic)
+{
+    // The body is one call into cpp/logos_caller.h. Parsing, the per-thread
+    // stack and the nesting rule live there, where tests/sdk/test_logos_caller
+    // .cpp can reach them by VALUE — generated text can only ever be asserted
+    // on as strings, so any logic that lives here is logic nothing executes.
+    ModuleDecl m;
+    m.name = "weather_module";
+    const QString src = lidlMakeModuleImplExports(m, "SomeImpl", "some_impl.h");
+
+    EXPECT_TRUE(src.contains("logos::detail::setCallCaller(caller_json)")) << src.toStdString();
+    EXPECT_TRUE(src.contains("#include \"logos_caller.h\"")) << src.toStdString();
+    // No hand-rolled parse in emitted text.
+    EXPECT_FALSE(src.contains("\"kind\"")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, TheCallCallerExportIsEmittedForEveryModuleNotJustOnesWithMethods)
+{
+    // The module-impl exports are a FIXED surface, not something accumulated
+    // per method — the shape most likely to lose a symbol to an emitter that
+    // writes only what it thinks it needs. checks.module-impl-abi asserts the
+    // same thing on the zero-method fixture; this says it at the unit level.
+    ModuleDecl empty;
+    empty.name = "empty_module";
+    const QString src = lidlMakeModuleImplExports(empty, "EmptyImpl", "empty_impl.h");
+
+    EXPECT_TRUE(src.contains("void logos_module_set_call_caller(")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, TheEventsSidecarDoesNotDefineTheCallCallerExport)
+{
+    // Two TUs defining one export is a duplicate-symbol link error, and the
+    // ABI check's own sidecar probe is currently vacuous (it passes its file
+    // in the argument slot that resolved_symbols shifts away), so this is the
+    // live assertion that the symbol lives in the exports TU alone.
+    ModuleDecl m;
+    m.name = "delivery_module";
+    EventDecl e;
+    e.name = "blobStored";
+    m.events.push_back(e);
+
+    const QString events = lidlMakeEventsSourceCdylib(m, "DeliveryImpl", "delivery_impl.h");
+    EXPECT_FALSE(events.contains("logos_module_set_call_caller")) << events.toStdString();
+}
+
+// ---------------------------------------------------------------------------
+// getMethods() publishes the CONTRACT vocabulary
+//
+// `returnType`, `parameters[].type` and `signature` used to be Qt type names,
+// which made a Qt-free cdylib module describe itself in the types of a language
+// it does not use — and answered three different LIDL types (`[uint]`,
+// `[bstr]`, `[any]`) with one word, QVariantList, so the listing could not be
+// read back. Every consumer of these fields (`lm`, logoscore's method listing,
+// basecamp's inspector) is showing a human what the module offers; the
+// dispatch paths key on QMetaObject types and never touch this JSON.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+TypeExpr arrOf(const TypeExpr& e) { return TypeExpr{ TypeExpr::Array, "", { e } }; }
+TypeExpr mapOf(const TypeExpr& v)
+{
+    return TypeExpr{ TypeExpr::Map, "", { prim("tstr"), v } };
+}
+TypeExpr optionalOf(const TypeExpr& e) { return TypeExpr{ TypeExpr::Optional, "", { e } }; }
+
+}  // namespace
+
+TEST(LidlGenCdylib, PublishedTypesAreTheLidlSpelling)
+{
+    ModuleDecl m = moduleWithMethod(method("echo_uints", arrOf(prim("uint")),
+                                           { param("v", arrOf(prim("uint"))) }));
+    const QString src = implExportsFor(m);
+    EXPECT_TRUE(src.contains("obj[\"returnType\"] = \"[uint]\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"signature\"] = \"echo_uints([uint])\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("{\"type\", \"[uint]\"}")) << src.toStdString();
+    // The Qt vocabulary is GONE from the published surface.
+    EXPECT_FALSE(src.contains("\"QVariantList\"")) << src.toStdString();
+}
+
+// Three LIDL types that all used to publish as QVariantList now publish as
+// themselves. That distinction is the whole point: the listing is a contract.
+TEST(LidlGenCdylib, PublishedTypesDistinguishWhatQtCollapsed)
+{
+    const QString uints = implExportsFor(
+        moduleWithMethod(method("m", arrOf(prim("uint")), {})));
+    const QString blobs = implExportsFor(
+        moduleWithMethod(method("m", arrOf(prim("bstr")), {})));
+    const QString anys = implExportsFor(
+        moduleWithMethod(method("m", arrOf(prim("any")), {})));
+    EXPECT_TRUE(uints.contains("obj[\"returnType\"] = \"[uint]\""));
+    EXPECT_TRUE(blobs.contains("obj[\"returnType\"] = \"[bstr]\""));
+    EXPECT_TRUE(anys.contains("obj[\"returnType\"] = \"[any]\""));
+}
+
+// A record publishes its DECLARED NAME — what the contract calls it — not
+// QVariantMap. The historical objection was that these strings were read as
+// metatypes; nothing in the runtime does that any more.
+TEST(LidlGenCdylib, PublishedRecordTypesUseTheDeclaredName)
+{
+    ModuleDecl m = moduleWithMethod(
+        method("bounds", TypeExpr{ TypeExpr::Named, "Blob", {} },
+               { param("points", arrOf(TypeExpr{ TypeExpr::Named, "Blob", {} })) }));
+    TypeDecl t;
+    t.name = "Blob";
+    FieldDecl f;
+    f.name = "payload";
+    f.type = prim("bstr");
+    t.fields.push_back(f);
+    m.types.push_back(t);
+
+    const QString src = implExportsFor(m);
+    EXPECT_TRUE(src.contains("obj[\"returnType\"] = \"Blob\"")) << src.toStdString();
+    EXPECT_TRUE(src.contains("obj[\"signature\"] = \"bounds([Blob])\"")) << src.toStdString();
+}
+
+TEST(LidlGenCdylib, PublishedTypesSpellMapsAndOptionals)
+{
+    const QString maps = implExportsFor(
+        moduleWithMethod(method("m", mapOf(prim("uint")), {})));
+    EXPECT_TRUE(maps.contains("obj[\"returnType\"] = \"{tstr: uint}\"")) << maps.toStdString();
+
+    const QString opts = implExportsFor(moduleWithMethod(
+        method("m", prim("bool"), { param("id", optionalOf(prim("tstr"))) })));
+    EXPECT_TRUE(opts.contains("obj[\"signature\"] = \"m(? tstr)\"")) << opts.toStdString();
+    EXPECT_TRUE(opts.contains("{\"type\", \"? tstr\"}")) << opts.toStdString();
 }
